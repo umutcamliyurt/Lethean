@@ -45,6 +45,10 @@ const duressBtn = $('duress-btn');
 const lightbox = $('lightbox');
 const toasts = $('toasts');
 
+let lightboxMediaList = [];
+let lightboxIndex = -1;
+let lightboxNavLock = false;
+
 
 const LS_SETUP_KEY = 'vault.setupComplete';
 const LS_DURESS_KEY = 'vault.duress';
@@ -115,6 +119,9 @@ function icon(name) {
     trash: '<path d="M4 6h14M9 6V4.5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V6M6 6l.7 12a1 1 0 0 0 1 .9h6.6a1 1 0 0 0 1-.9L16 6" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/>',
     download: '<path d="M10 3v10m0 0l-4-4m4 4l4-4M4 16v2a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-2" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
     close: '<path d="M5 5l14 14M19 5L5 19" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
+    chevronLeft: '<path d="M12.5 4.5L6 11l6.5 6.5" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
+    chevronRight: '<path d="M7.5 4.5L14 11l-6.5 6.5" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
+    expand: '<path d="M7 3H4a1 1 0 0 0-1 1v3M14 3h3a1 1 0 0 1 1 1v3M21 14v3a1 1 0 0 1-1 1h-3M3 14v3a1 1 0 0 0 1 1h3" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
   };
   return `<svg width="18" height="18" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">${icons[name] || ''}</svg>`;
 }
@@ -610,17 +617,22 @@ async function getDecryptedUrl(record) {
 }
 
 
+function mediaRecords() {
+  return visibleRecords().filter((r) => fileKind(metaCache.get(r.id)?.mime) !== 'other');
+}
+
 async function openTile(fileId) {
   const record = records.find((r) => r.id === fileId);
   const meta = metaCache.get(fileId);
   if (!record || !meta) return;
 
-  const tileEl = boxGrid.querySelector(`[data-id="${fileId}"]`);
-  tileEl?.classList.add('opening');
-
   const kind = fileKind(meta.mime);
 
   if (kind === 'other') {
+    lightboxMediaList = [];
+    lightboxIndex = -1;
+    const tileEl = boxGrid.querySelector(`[data-id="${fileId}"]`);
+    tileEl?.classList.add('opening');
     showLightbox(`
       <div class="lightbox-generic">
         ${icon('file')}
@@ -630,27 +642,56 @@ async function openTile(fileId) {
       </div>
     `);
     $('lightbox-download').addEventListener('click', () => downloadAndSave(record, meta));
+    tileEl?.classList.remove('opening');
     return;
   }
 
+  const list = mediaRecords();
+  const index = list.findIndex((r) => r.id === fileId);
+  await openMediaAt(list, index >= 0 ? index : 0);
+}
+
+async function openMediaAt(list, index) {
+  if (!list.length) return;
+  index = ((index % list.length) + list.length) % list.length;
+  const record = list[index];
+  const meta = metaCache.get(record.id);
+  if (!record || !meta) return;
+
+  lightboxMediaList = list;
+  lightboxIndex = index;
+
+  const tileEl = boxGrid.querySelector(`[data-id="${record.id}"]`);
   tileEl?.classList.add('decrypting');
-  showLightbox(`<div class="lightbox-content"><div class="spinner" style="width:32px;height:32px"></div></div>`);
+  showLightbox(`<div class="lightbox-content"><div class="spinner" style="width:32px;height:32px"></div></div>`, { keepMedia: true });
 
   try {
     const url = await getDecryptedUrl(record);
+    const kind = fileKind(meta.mime);
     const inner = kind === 'image'
-      ? `<img src="${url}" alt="${escapeHtml(meta.name)}">`
-      : `<video src="${url}" controls autoplay></video>`;
+      ? `<img src="${url}" alt="${escapeHtml(meta.name)}" id="lightbox-media">`
+      : `<video src="${url}" controls autoplay id="lightbox-media"></video>`;
+    const showNav = lightboxMediaList.length > 1;
     showLightbox(`
       <div class="lightbox-content">
+        ${showNav ? `<button class="btn-icon lightbox-nav lightbox-nav-prev" id="lightbox-prev" aria-label="Previous">${icon('chevronLeft')}</button>` : ''}
         ${inner}
+        ${showNav ? `<button class="btn-icon lightbox-nav lightbox-nav-next" id="lightbox-next" aria-label="Next">${icon('chevronRight')}</button>` : ''}
         <div class="lightbox-meta">
-          <span class="fname">${escapeHtml(meta.name)}</span>
+          <span class="fname">${escapeHtml(meta.name)}${showNav ? ` \u00b7 ${lightboxIndex + 1}/${lightboxMediaList.length}` : ''}</span>
+          <button class="btn-icon" id="lightbox-fullscreen" title="Full screen" aria-label="Full screen">${icon('expand')}</button>
           <button class="btn-icon" id="lightbox-download" title="Download" aria-label="Download">${icon('download')}</button>
         </div>
       </div>
-    `);
+    `, { keepMedia: true });
+
     $('lightbox-download').addEventListener('click', () => downloadAndSave(record, meta, url));
+    $('lightbox-fullscreen').addEventListener('click', () => {
+      const mediaEl = $('lightbox-media');
+      if (mediaEl?.requestFullscreen) mediaEl.requestFullscreen().catch(() => {});
+    });
+    $('lightbox-prev')?.addEventListener('click', () => navigateLightbox(-1));
+    $('lightbox-next')?.addEventListener('click', () => navigateLightbox(1));
   } catch (err) {
     showToast("Couldn't decrypt that file. " + err.message, 'error');
     closeLightbox();
@@ -659,12 +700,23 @@ async function openTile(fileId) {
   }
 }
 
-function showLightbox(innerHtml) {
+function navigateLightbox(delta) {
+  if (lightboxMediaList.length < 2 || lightboxIndex < 0) return;
+  openMediaAt(lightboxMediaList, lightboxIndex + delta);
+}
+
+function showLightbox(innerHtml, { keepMedia = false } = {}) {
+  if (!keepMedia) {
+    lightboxMediaList = [];
+    lightboxIndex = -1;
+  }
   lightbox.innerHTML = `
     <button class="btn-icon lightbox-close" id="lightbox-close" aria-label="Close">${icon('close')}</button>
     ${innerHtml}
   `;
   lightbox.classList.remove('hidden');
+  lightbox.tabIndex = -1;
+  lightbox.focus({ preventScroll: true });
   $('lightbox-close').addEventListener('click', closeLightbox);
   lightbox.addEventListener('click', (e) => { if (e.target === lightbox) closeLightbox(); }, { once: true });
 }
@@ -672,13 +724,45 @@ function showLightbox(innerHtml) {
 function closeLightbox() {
   const video = lightbox.querySelector('video');
   if (video) video.pause();
+  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
   lightbox.classList.add('hidden');
   lightbox.innerHTML = '';
+  lightboxMediaList = [];
+  lightboxIndex = -1;
 }
 
 document.addEventListener('keydown', (e) => {
-  if (e.key === 'Escape' && !lightbox.classList.contains('hidden')) closeLightbox();
+  if (lightbox.classList.contains('hidden')) return;
+  if (e.key === 'Escape') { closeLightbox(); return; }
+  if (e.key === 'ArrowLeft') { e.preventDefault(); navigateLightbox(-1); }
+  else if (e.key === 'ArrowRight') { e.preventDefault(); navigateLightbox(1); }
 });
+
+lightbox.addEventListener('wheel', (e) => {
+  if (lightboxMediaList.length < 2) return;
+  if (Math.abs(e.deltaX) <= Math.abs(e.deltaY) || Math.abs(e.deltaX) < 24) return;
+  e.preventDefault();
+  if (lightboxNavLock) return;
+  lightboxNavLock = true;
+  navigateLightbox(e.deltaX > 0 ? 1 : -1);
+  setTimeout(() => { lightboxNavLock = false; }, 350);
+}, { passive: false });
+
+let touchStartX = null;
+let touchStartY = null;
+lightbox.addEventListener('touchstart', (e) => {
+  if (e.touches.length !== 1) return;
+  touchStartX = e.touches[0].clientX;
+  touchStartY = e.touches[0].clientY;
+}, { passive: true });
+lightbox.addEventListener('touchend', (e) => {
+  if (touchStartX == null || lightboxMediaList.length < 2) { touchStartX = null; return; }
+  const touch = e.changedTouches[0];
+  const dx = touch.clientX - touchStartX;
+  const dy = touch.clientY - touchStartY;
+  touchStartX = null;
+  if (Math.abs(dx) > 60 && Math.abs(dx) > Math.abs(dy)) navigateLightbox(dx < 0 ? 1 : -1);
+}, { passive: true });
 
 async function downloadAndSave(record, meta, existingUrl) {
   let url = existingUrl;
@@ -739,6 +823,7 @@ depositSlot.addEventListener('drop', (e) => {
 });
 
 const MAX_VISIBLE_UPLOADS = 10;
+const MAX_CONCURRENT_UPLOADS = 3;
 let uploadRows = [];
 let uploadMoreIndicator = null;
 
@@ -768,23 +853,37 @@ function syncUploadQueueView() {
 }
 
 async function handleFiles(files) {
-  for (const file of files) uploadOne(file);
+  const queue = files.map((file) => ({ file, rowItem: createUploadRow(file) }));
+  const workerCount = Math.min(MAX_CONCURRENT_UPLOADS, queue.length);
+  await Promise.all(Array.from({ length: workerCount }, () => runUploadWorker(queue)));
 }
 
-async function uploadOne(file) {
+async function runUploadWorker(queue) {
+  let item;
+  while ((item = queue.shift())) {
+    await uploadOne(item.file, item.rowItem);
+  }
+}
+
+function createUploadRow(file) {
   const row = document.createElement('div');
   row.className = 'upload-row';
   row.innerHTML = `
     <span class="name">${escapeHtml(file.name)}</span>
-    <span class="status">Encrypting\u2026</span>
+    <span class="status">Queued\u2026</span>
     <div class="bar"><div class="bar-fill" style="width:0%"></div></div>
   `;
   const rowItem = { el: row };
   uploadRows.push(rowItem);
   syncUploadQueueView();
+  return rowItem;
+}
 
+async function uploadOne(file, rowItem) {
+  const row = rowItem.el;
   const statusEl = row.querySelector('.status');
   const barEl = row.querySelector('.bar-fill');
+  statusEl.textContent = 'Encrypting\u2026';
 
   const removeRow = () => {
     uploadRows = uploadRows.filter((r) => r !== rowItem);
