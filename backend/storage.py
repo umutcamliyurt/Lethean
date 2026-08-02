@@ -30,6 +30,30 @@ def write_blob(path: str, data: bytes) -> None:
         os.fsync(f.fileno())
 
 
+async def write_blob_streamed(path: str, upload, limit: int, chunk_size: int = 4 * 1024 * 1024) -> int:
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    total = 0
+    try:
+        with os.fdopen(fd, "wb") as f:
+            while True:
+                chunk = await upload.read(chunk_size)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > limit:
+                    raise ValueError(f"upload exceeds max size of {limit} bytes")
+                f.write(chunk)
+            f.flush()
+            os.fsync(f.fileno())
+    except Exception:
+        try:
+            os.remove(path)
+        except FileNotFoundError:
+            pass
+        raise
+    return total
+
+
 def read_blob(path: str) -> bytes:
     with open(path, "rb") as f:
         return f.read()

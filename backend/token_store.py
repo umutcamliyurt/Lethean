@@ -29,15 +29,26 @@ def _save(data: dict) -> None:
     os.chmod(TOKENS_PATH, 0o600)
 
 
+def _find_token(data: dict, token: str) -> str | None:
+    match = None
+    for existing_token in data:
+        if hmac.compare_digest(existing_token, token):
+            match = existing_token
+    return match
+
+
 def get_record(token: str) -> dict | None:
     with _lock:
-        return _load().get(token)
+        data = _load()
+        matched = _find_token(data, token)
+        return data.get(matched) if matched is not None else None
 
 
 def bind_to_vault(token: str, vault_id: str) -> dict | None:
     with _lock:
         data = _load()
-        record = data.get(token)
+        matched_token = _find_token(data, token)
+        record = data.get(matched_token) if matched_token is not None else None
         if record is None:
             return None
         existing_vault_id = record.get("vault_id")
@@ -67,9 +78,10 @@ def create_token(label: str | None = None, quota_bytes: int | None = None, vault
 def revoke_token(token: str) -> bool:
     with _lock:
         data = _load()
-        if token not in data:
+        matched_token = _find_token(data, token)
+        if matched_token is None:
             return False
-        del data[token]
+        del data[matched_token]
         _save(data)
         return True
 
