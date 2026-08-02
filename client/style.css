@@ -263,13 +263,70 @@ main.vault {
 .upload-row.done .status { color: var(--text); }
 .upload-row.error .status { text-decoration: underline; }
 
+.upload-more {
+  text-align: center;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+  padding: 4px 0 2px;
+}
+
 .section-label {
   font-family: var(--font-mono);
   font-size: 0.7rem;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--dim);
-  margin: 0 0 12px;
+  margin: 0;
+}
+
+.grid-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+
+.search-bar {
+  position: relative;
+  display: flex;
+  align-items: center;
+  width: 100%;
+  max-width: 260px;
+  margin-left: auto;
+}
+.search-bar .search-icon {
+  position: absolute;
+  left: 11px;
+  color: var(--faint);
+  pointer-events: none;
+}
+.search-bar input[type=text] {
+  padding: 8px 34px 8px 32px;
+  font-size: 0.85rem;
+  min-height: 36px;
+}
+.search-bar input[type=text]:focus {
+  border-color: var(--dim);
+}
+.search-bar .search-clear {
+  position: absolute;
+  right: 2px;
+  width: 30px;
+  height: 30px;
+  color: var(--faint);
+}
+.search-bar .search-clear:hover { color: var(--text); }
+
+.grid-sentinel {
+  text-align: center;
+  color: var(--faint);
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  padding: 18px 0 4px;
 }
 
 .box-grid {
@@ -286,9 +343,14 @@ main.vault {
   border-radius: var(--radius);
   overflow: hidden;
   cursor: pointer;
-  transition: border-color 0.12s ease;
+  transition: border-color 0.12s ease, transform 0.12s ease, box-shadow 0.12s ease;
 }
-.box-tile:hover { border-color: var(--dim); }
+.box-tile:hover {
+  border-color: var(--dim);
+  transform: translateY(-1px);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+}
+.box-tile:active { transform: translateY(0); }
 
 .box-body {
   position: absolute;
@@ -477,6 +539,8 @@ main.vault {
   main.vault { padding: 16px 12px 50px; }
   .box-grid { grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 8px; }
   .deposit-slot { padding: 18px 14px; }
+  .grid-toolbar { gap: 10px; }
+  .search-bar { max-width: 100%; }
   #lightbox { padding: 14px; }
   .lightbox-close { top: 10px; right: 10px; }
   .lightbox-meta { flex-wrap: wrap; justify-content: center; text-align: center; }

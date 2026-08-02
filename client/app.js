@@ -9,6 +9,13 @@ const metaCache = new Map();
 const objectUrlCache = new Map();
 let records = [];
 
+const PAGE_SIZE = 24;
+let pageOffset = 0;
+let hasMorePages = true;
+let isLoadingPage = false;
+let searchQuery = '';
+let gridObserver = null;
+
 const $ = (id) => document.getElementById(id);
 const authScreen = $('auth-screen');
 const appScreen = $('app-screen');
@@ -27,6 +34,9 @@ const uploadQueue = $('upload-queue');
 const boxGrid = $('box-grid');
 const emptyState = $('empty-state');
 const gridLabel = $('grid-label');
+const searchInput = $('search-input');
+const searchClearBtn = $('search-clear');
+const gridSentinel = $('grid-sentinel');
 const usagePill = $('usage-pill');
 const vaultFingerprint = $('vault-fingerprint');
 const logoutBtn = $('logout-btn');
@@ -248,10 +258,14 @@ async function enterApp() {
 function clearRenderedGrid() {
   for (const url of objectUrlCache.values()) URL.revokeObjectURL(url);
   objectUrlCache.clear();
+  if (gridObserver) { gridObserver.disconnect(); gridObserver = null; }
   boxGrid.innerHTML = '';
   emptyState.classList.add('hidden');
   gridLabel.textContent = '';
   usagePill.textContent = '\u2014 items \u00b7,';
+  if (searchInput) searchInput.value = '';
+  searchQuery = '';
+  searchClearBtn?.classList.add('hidden');
 }
 
 function leaveApp() {
@@ -386,14 +400,40 @@ function openDuressPanel() {
 
 
 async function refreshGallery() {
+  records = [];
+  pageOffset = 0;
+  hasMorePages = true;
   try {
-    const [list, usage] = await Promise.all([api.listFiles(), api.getUsage()]);
-    records = list;
-    usagePill.textContent = usage.quota_bytes != null
-      ? `${formatBytes(usage.total_bytes)} / ${formatBytes(usage.quota_bytes)} \u00b7 ${usage.file_count} item${usage.file_count === 1 ? '' : 's'}`
-      : `${usage.file_count} item${usage.file_count === 1 ? '' : 's'} \u00b7 ${formatBytes(usage.total_bytes)}`;
+    const usage = await api.getUsage();
+    updateUsagePill(usage);
+  } catch (err) {
+    showToast(err.message, 'error');
+  }
+  renderGrid();
+  await loadNextPage();
+  setupGridSentinel();
+}
 
-    for (const record of records) {
+function updateUsagePill(usage) {
+  usagePill.textContent = usage.quota_bytes != null
+    ? `${formatBytes(usage.total_bytes)} / ${formatBytes(usage.quota_bytes)} \u00b7 ${usage.file_count} item${usage.file_count === 1 ? '' : 's'}`
+    : `${usage.file_count} item${usage.file_count === 1 ? '' : 's'} \u00b7 ${formatBytes(usage.total_bytes)}`;
+}
+
+async function loadNextPage() {
+  if (isLoadingPage || !hasMorePages) return;
+  isLoadingPage = true;
+  gridSentinel.classList.remove('hidden');
+  gridSentinel.textContent = 'Loading\u2026';
+  try {
+    const page = await api.listFiles({ offset: pageOffset, limit: PAGE_SIZE });
+    const known = new Set(records.map((r) => r.id));
+    const fresh = page.filter((r) => !known.has(r.id));
+
+    if (page.length < PAGE_SIZE || fresh.length === 0) hasMorePages = false;
+    pageOffset += page.length || PAGE_SIZE;
+
+    for (const record of fresh) {
       if (!fileKeyCache.has(record.id)) {
         try {
           const fileKeyRaw = await C.unwrapFileKey(wrappingKeyRaw, record.wrapped_file_key, record.wrap_iv);
@@ -406,21 +446,103 @@ async function refreshGallery() {
       }
     }
 
-    renderGrid();
+    records = records.concat(fresh);
+    appendTiles(fresh);
   } catch (err) {
     showToast(err.message, 'error');
+    hasMorePages = false;
+  } finally {
+    isLoadingPage = false;
+    gridSentinel.classList.toggle('hidden', !hasMorePages);
   }
+}
+
+async function loadAllPagesForSearch() {
+  while (hasMorePages) {
+    await loadNextPage();
+  }
+}
+
+function setupGridSentinel() {
+  if (gridObserver) gridObserver.disconnect();
+  gridObserver = new IntersectionObserver((entries) => {
+    if (entries[0].isIntersecting) loadNextPage();
+  }, { rootMargin: '400px' });
+  gridObserver.observe(gridSentinel);
+}
+
+function visibleRecords() {
+  if (!searchQuery) return records;
+  const q = searchQuery.toLowerCase();
+  return records.filter((r) => (metaCache.get(r.id)?.name || '').toLowerCase().includes(q));
 }
 
 function renderGrid() {
   boxGrid.innerHTML = '';
-  emptyState.classList.toggle('hidden', records.length > 0);
-  gridLabel.textContent = records.length ? `Files \u00b7 ${records.length}` : '';
+  const shown = visibleRecords();
+  const searching = !!searchQuery;
 
-  for (const record of records) {
+  updateEmptyState(shown, searching);
+  updateGridLabel(shown, searching);
+
+  for (const record of shown) {
     boxGrid.appendChild(renderTile(record));
   }
 }
+
+function appendTiles(newRecords) {
+  const searching = !!searchQuery;
+  const q = searchQuery.toLowerCase();
+  const toShow = searching
+    ? newRecords.filter((r) => (metaCache.get(r.id)?.name || '').toLowerCase().includes(q))
+    : newRecords;
+
+  const shown = visibleRecords();
+  updateEmptyState(shown, searching);
+  updateGridLabel(shown, searching);
+
+  const fragment = document.createDocumentFragment();
+  for (const record of toShow) {
+    fragment.appendChild(renderTile(record));
+  }
+  boxGrid.appendChild(fragment);
+}
+
+function updateEmptyState(shown, searching) {
+  emptyState.classList.toggle('hidden', shown.length > 0);
+  emptyState.querySelector('h3').textContent = searching ? 'No matches' : 'No files yet';
+  emptyState.querySelector('p').textContent = searching
+    ? `Nothing matches "${searchQuery}".`
+    : 'Upload something above to see it here.';
+}
+
+function updateGridLabel(shown, searching) {
+  gridLabel.textContent = shown.length
+    ? `Files \u00b7 ${shown.length}${searching ? ` of ${records.length}` : ''}`
+    : '';
+}
+
+let searchDebounce = null;
+searchInput?.addEventListener('input', () => {
+  clearTimeout(searchDebounce);
+  searchClearBtn.classList.toggle('hidden', !searchInput.value);
+  searchDebounce = setTimeout(async () => {
+    searchQuery = searchInput.value.trim();
+    if (searchQuery && hasMorePages) {
+      gridSentinel.textContent = 'Loading all files to search\u2026';
+      await loadAllPagesForSearch();
+    }
+    renderGrid();
+  }, 180);
+});
+
+searchClearBtn?.addEventListener('click', () => {
+  searchInput.value = '';
+  searchQuery = '';
+  searchClearBtn.classList.add('hidden');
+  renderGrid();
+  searchInput.focus();
+});
 
 function renderTile(record) {
   const meta = metaCache.get(record.id) || { name: '\u2026', mime: '' };
@@ -616,6 +738,35 @@ depositSlot.addEventListener('drop', (e) => {
   if (files.length) handleFiles(files);
 });
 
+const MAX_VISIBLE_UPLOADS = 10;
+let uploadRows = [];
+let uploadMoreIndicator = null;
+
+function getUploadMoreIndicator() {
+  if (!uploadMoreIndicator) {
+    uploadMoreIndicator = document.createElement('div');
+    uploadMoreIndicator.className = 'upload-more';
+  }
+  return uploadMoreIndicator;
+}
+
+function syncUploadQueueView() {
+  const visible = uploadRows.slice(0, MAX_VISIBLE_UPLOADS);
+  const hiddenCount = uploadRows.length - visible.length;
+  const indicator = getUploadMoreIndicator();
+
+  for (const item of visible) {
+    if (!item.el.isConnected) uploadQueue.insertBefore(item.el, indicator.isConnected ? indicator : null);
+  }
+
+  if (hiddenCount > 0) {
+    indicator.textContent = `\u2026 +${hiddenCount} more`;
+    if (!indicator.isConnected) uploadQueue.appendChild(indicator);
+  } else if (indicator.isConnected) {
+    indicator.remove();
+  }
+}
+
 async function handleFiles(files) {
   for (const file of files) uploadOne(file);
 }
@@ -628,9 +779,18 @@ async function uploadOne(file) {
     <span class="status">Encrypting\u2026</span>
     <div class="bar"><div class="bar-fill" style="width:0%"></div></div>
   `;
-  uploadQueue.appendChild(row);
+  const rowItem = { el: row };
+  uploadRows.push(rowItem);
+  syncUploadQueueView();
+
   const statusEl = row.querySelector('.status');
   const barEl = row.querySelector('.bar-fill');
+
+  const removeRow = () => {
+    uploadRows = uploadRows.filter((r) => r !== rowItem);
+    row.remove();
+    syncUploadQueueView();
+  };
 
   try {
     const encrypted = await C.encryptFile(wrappingKeyRaw, file);
@@ -642,7 +802,7 @@ async function uploadOne(file) {
 
     row.classList.add('done');
     statusEl.textContent = 'Done';
-    setTimeout(() => row.remove(), 1800);
+    setTimeout(removeRow, 1800);
 
     await refreshGallery();
   } catch (err) {

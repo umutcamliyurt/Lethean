@@ -71,8 +71,12 @@ export async function uploadFile(encrypted, onProgress) {
   });
 }
 
-export async function listFiles() {
-  const res = await fetch(`${BASE_URL}/files`, { headers: authHeaders(), credentials: 'omit' });
+export async function listFiles({ offset = 0, limit = null } = {}) {
+  const params = new URLSearchParams();
+  if (offset) params.set('offset', String(offset));
+  if (limit != null) params.set('limit', String(limit));
+  const qs = params.toString();
+  const res = await fetch(`${BASE_URL}/files${qs ? `?${qs}` : ''}`, { headers: authHeaders(), credentials: 'omit' });
   await checkOk(res, 'Could not load files');
   return res.json();
 }

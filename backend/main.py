@@ -181,13 +181,26 @@ async def upload_file(
 
 
 @app.get("/files", response_model=list[FileMetaResponse])
-def list_files(db: Session = Depends(get_db), vault_id: str = Depends(get_vault_id)):
-    return (
+def list_files(
+    db: Session = Depends(get_db),
+    vault_id: str = Depends(get_vault_id),
+    offset: int = 0,
+    limit: int | None = None,
+):
+    if offset < 0:
+        raise HTTPException(status_code=400, detail="offset must be >= 0")
+    if limit is not None and not (1 <= limit <= 500):
+        raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
+
+    query = (
         db.query(EncryptedFile)
         .filter(EncryptedFile.vault_id == vault_id)
-        .order_by(EncryptedFile.created_at.desc())
-        .all()
+        .order_by(EncryptedFile.created_at.desc(), EncryptedFile.id.asc())
+        .offset(offset)
     )
+    if limit is not None:
+        query = query.limit(limit)
+    return query.all()
 
 
 @app.get("/usage", response_model=UsageResponse)

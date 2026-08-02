@@ -96,7 +96,22 @@
 
     <div class="upload-queue" id="upload-queue"></div>
 
-    <p class="section-label" id="grid-label">Files</p>
+    <div class="grid-toolbar">
+      <p class="section-label" id="grid-label">Files</p>
+      <div class="search-bar">
+        <svg width="15" height="15" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg" class="search-icon">
+          <circle cx="8" cy="8" r="5.5" stroke="currentColor" stroke-width="1.4"/>
+          <path d="M12.2 12.2L16 16" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+        </svg>
+        <input type="text" id="search-input" placeholder="Search files&hellip;" autocomplete="off" spellcheck="false" aria-label="Search files">
+        <button type="button" class="btn-icon search-clear hidden" id="search-clear" aria-label="Clear search" title="Clear search">
+          <svg width="14" height="14" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M5 5l10 10M15 5L5 15" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+
     <div class="box-grid" id="box-grid"></div>
 
     <div class="empty-state hidden" id="empty-state">
@@ -107,6 +122,8 @@
       <h3>No files yet</h3>
       <p>Upload something above to see it here.</p>
     </div>
+
+    <div class="grid-sentinel hidden" id="grid-sentinel">Loading&hellip;</div>
   </main>
 </div>
 
