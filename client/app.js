@@ -871,6 +871,7 @@ function createUploadRow(file) {
   row.innerHTML = `
     <span class="name">${escapeHtml(file.name)}</span>
     <span class="status">Queued\u2026</span>
+    <button type="button" class="btn-icon upload-cancel hidden" aria-label="Cancel upload" title="Cancel upload">${icon('close')}</button>
     <div class="bar"><div class="bar-fill" style="width:0%"></div></div>
   `;
   const rowItem = { el: row };
@@ -879,11 +880,35 @@ function createUploadRow(file) {
   return rowItem;
 }
 
+const RETRY_BASE_MS = 1000;
+const RETRY_MAX_MS = 30000;
+
+function retryDelay(attempt) {
+  return Math.min(RETRY_BASE_MS * 2 ** (attempt - 1), RETRY_MAX_MS);
+}
+
+async function waitWithCountdown(ms, statusEl, isCancelled, reason) {
+  const end = Date.now() + ms;
+  statusEl.title = reason || '';
+  while (Date.now() < end) {
+    if (isCancelled()) return;
+    const secsLeft = Math.max(1, Math.ceil((end - Date.now()) / 1000));
+    statusEl.textContent = `Retry in ${secsLeft}s\u2026`;
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+
 async function uploadOne(file, rowItem) {
   const row = rowItem.el;
   const statusEl = row.querySelector('.status');
   const barEl = row.querySelector('.bar-fill');
-  statusEl.textContent = 'Encrypting\u2026';
+  const cancelBtn = row.querySelector('.upload-cancel');
+
+  const controller = new AbortController();
+  let cancelled = false;
+  const cancelUpload = () => { cancelled = true; controller.abort(); };
+  cancelBtn.classList.remove('hidden');
+  cancelBtn.addEventListener('click', cancelUpload);
 
   const removeRow = () => {
     uploadRows = uploadRows.filter((r) => r !== rowItem);
@@ -891,22 +916,57 @@ async function uploadOne(file, rowItem) {
     syncUploadQueueView();
   };
 
-  try {
-    const encrypted = await C.encryptFile(wrappingKeyRaw, file);
-
-    statusEl.textContent = 'Uploading\u2026';
-    await api.uploadFile(encrypted, (fraction) => {
-      barEl.style.width = `${Math.round(fraction * 100)}%`;
-    });
-
-    row.classList.add('done');
-    statusEl.textContent = 'Done';
+  const finishCancelled = () => {
+    row.classList.add('error');
+    statusEl.textContent = 'Cancelled';
+    statusEl.removeAttribute('title');
+    cancelBtn.classList.add('hidden');
     setTimeout(removeRow, 1800);
+  };
 
-    await refreshGallery();
+  statusEl.textContent = 'Encrypting\u2026';
+  let encrypted;
+  try {
+    encrypted = await C.encryptFile(wrappingKeyRaw, file);
   } catch (err) {
     row.classList.add('error');
     statusEl.textContent = 'Failed';
-    showToast(`Couldn't upload "${file.name}". ${err.message}`, 'error');
+    cancelBtn.classList.add('hidden');
+    showToast(`Couldn't encrypt "${file.name}". ${err.message}`, 'error');
+    return;
+  }
+
+  if (cancelled) { finishCancelled(); return; }
+
+  let attempt = 0;
+  for (;;) {
+    try {
+      statusEl.textContent = attempt === 0 ? 'Uploading\u2026' : `Retrying\u2026 (attempt ${attempt + 1})`;
+      statusEl.removeAttribute('title');
+      barEl.style.width = '0%';
+      await api.uploadFile(encrypted, (fraction) => {
+        barEl.style.width = `${Math.round(fraction * 100)}%`;
+      }, controller.signal);
+
+      row.classList.remove('error');
+      row.classList.add('done');
+      statusEl.textContent = 'Done';
+      cancelBtn.classList.add('hidden');
+      setTimeout(removeRow, 1800);
+
+      await refreshGallery();
+      return;
+    } catch (err) {
+      if (cancelled || err.name === 'AbortError') { finishCancelled(); return; }
+
+      attempt++;
+      row.classList.add('error');
+      if (attempt === 1) {
+        showToast(`Upload of "${file.name}" failed. Retrying automatically\u2026`, 'error');
+      }
+      await waitWithCountdown(retryDelay(attempt), statusEl, () => cancelled, err.message);
+      if (cancelled) { finishCancelled(); return; }
+      row.classList.remove('error');
+    }
   }
 }

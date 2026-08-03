@@ -258,6 +258,8 @@ main.vault {
 }
 .upload-row .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .upload-row .status { color: var(--dim); font-family: var(--font-mono); font-size: 0.72rem; min-width: 80px; text-align: right; }
+.upload-row .upload-cancel { width: 26px; height: 26px; flex-shrink: 0; }
+.upload-row .upload-cancel svg { width: 13px; height: 13px; }
 .upload-row .bar { height: 2px; background: var(--border); border-radius: 2px; overflow: hidden; position: absolute; left: 0; right: 0; bottom: 0; }
 .upload-row .bar-fill { height: 100%; background: var(--text); transition: width 0.2s ease; }
 .upload-row.done .status { color: var(--text); }

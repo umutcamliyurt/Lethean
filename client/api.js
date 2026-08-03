@@ -41,7 +41,7 @@ async function checkOk(res, label) {
   return res;
 }
 
-export async function uploadFile(encrypted, onProgress) {
+export async function uploadFile(encrypted, onProgress, signal) {
   const form = new FormData();
   form.append('content_iv', encrypted.contentIv);
   form.append('encrypted_metadata', encrypted.encryptedMetadata);
@@ -66,6 +66,11 @@ export async function uploadFile(encrypted, onProgress) {
         reject(new Error(detail));
       }
     };
+    xhr.onabort = () => reject(new DOMException('Upload cancelled', 'AbortError'));
+    if (signal) {
+      if (signal.aborted) { xhr.abort(); return; }
+      signal.addEventListener('abort', () => xhr.abort());
+    }
     xhr.onerror = () => reject(new Error('network error'));
     xhr.send(form);
   });
