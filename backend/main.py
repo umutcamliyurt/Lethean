@@ -26,12 +26,20 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Lethean API", docs_url=None, redoc_url=None)
 
+_ALLOWED_ORIGINS = ["tauri://localhost", "https://tauri.localhost"]
+_extra_origins = os.environ.get("EXTRA_CORS_ORIGINS", "")
+if _extra_origins:
+    _ALLOWED_ORIGINS.extend(o.strip() for o in _extra_origins.split(",") if o.strip())
+
 if os.environ.get("DEV_CORS", "0") == "1":
+    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+else:
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_origins=_ALLOWED_ORIGINS,
+        allow_methods=["GET", "POST", "DELETE"],
+        allow_headers=["Authorization", "X-Access-Token", "Content-Type"],
+        allow_credentials=False,
     )
 
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(5 * 1024**3)))
