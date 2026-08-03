@@ -14,6 +14,7 @@ fully decrypted in memory, the server only ever sees ciphertext.
 
 - No user account required
 - AES-256-GCM for client-side encryption
+- Ciphertext padding to hide file size metadata
 - Argon2id for key derivation
 - Duress code for wiping the vault under coercion
 

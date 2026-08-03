@@ -609,7 +609,7 @@ async function getDecryptedUrl(record) {
   const fileKeyRaw = fileKeyCache.get(record.id);
   const ciphertext = await api.downloadContent(record.id);
   const meta = metaCache.get(record.id);
-  const bytes = await C.decryptContent(fileKeyRaw, record.content_iv, ciphertext, meta.compressed);
+  const bytes = await C.decryptContent(fileKeyRaw, record.content_iv, ciphertext, meta.compressed, meta.unpaddedSize);
   const blob = new Blob([bytes], { type: meta.mime });
   const url = URL.createObjectURL(blob);
   objectUrlCache.set(record.id, url);
@@ -770,7 +770,7 @@ async function downloadAndSave(record, meta, existingUrl) {
     if (!url) {
       const fileKeyRaw = fileKeyCache.get(record.id);
       const ciphertext = await api.downloadContent(record.id);
-      const bytes = await C.decryptContent(fileKeyRaw, record.content_iv, ciphertext, meta.compressed);
+      const bytes = await C.decryptContent(fileKeyRaw, record.content_iv, ciphertext, meta.compressed, meta.unpaddedSize);
       const blob = new Blob([bytes], { type: meta.mime });
       url = URL.createObjectURL(blob);
     }

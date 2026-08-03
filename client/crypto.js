@@ -59,6 +59,42 @@ function timingSafeEqualHex(aHex, bHex) {
 }
 
 
+const PADDING_BUCKETS = [
+  16 * 1024,
+  64 * 1024,
+  256 * 1024,
+  1024 * 1024,
+  4 * 1024 * 1024,
+  16 * 1024 * 1024,
+  64 * 1024 * 1024,
+  256 * 1024 * 1024,
+  1024 * 1024 * 1024,
+];
+const PADDING_STEP_BEYOND_MAX = 256 * 1024 * 1024;
+
+function paddedSize(n) {
+  for (const bucket of PADDING_BUCKETS) {
+    if (n <= bucket) return bucket;
+  }
+  return Math.ceil(n / PADDING_STEP_BEYOND_MAX) * PADDING_STEP_BEYOND_MAX;
+}
+
+function padToBucket(bytes) {
+  const target = paddedSize(bytes.length);
+  if (target === bytes.length) return bytes;
+  const padded = new Uint8Array(target);
+  padded.set(bytes);
+  return padded;
+}
+
+function stripPadding(bytes, realLength) {
+  if (typeof realLength !== 'number' || realLength < 0 || realLength > bytes.length) {
+    return bytes;
+  }
+  return realLength === bytes.length ? bytes : bytes.subarray(0, realLength);
+}
+
+
 async function deriveSalt(password) {
   const bytes = await crypto.subtle.digest('SHA-256', utf8('e2ee-vault|salt|v1|' + password));
   return new Uint8Array(bytes);
@@ -133,9 +169,10 @@ export async function decryptMetadata(fileKeyRawBytes, encryptedMetadataB64, met
 }
 
 
-export async function decryptContent(fileKeyRawBytes, contentIvB64, ciphertextBytes, compressed = false) {
+export async function decryptContent(fileKeyRawBytes, contentIvB64, ciphertextBytes, compressed = false, unpaddedSize = null) {
   const fileKey = await importAesKey(fileKeyRawBytes, ['decrypt']);
-  const bytes = await aesGcmDecrypt(fileKey, fromBase64(contentIvB64), ciphertextBytes);
+  let bytes = await aesGcmDecrypt(fileKey, fromBase64(contentIvB64), ciphertextBytes);
+  bytes = stripPadding(bytes, unpaddedSize);
   return compressed ? decompressBytes(bytes) : bytes;
 }
 
@@ -158,10 +195,18 @@ export async function encryptFile(wrappingKeyRawBytes, file) {
   } catch {
   }
 
-  const metadataBytes = utf8(JSON.stringify({ name: file.name, mime: file.type || 'application/octet-stream', compressed }));
+  const unpaddedSize = contentBytes.length;
+  const paddedContentBytes = padToBucket(contentBytes);
+
+  const metadataBytes = utf8(JSON.stringify({
+    name: file.name,
+    mime: file.type || 'application/octet-stream',
+    compressed,
+    unpaddedSize,
+  }));
   const { iv: metadataIv, ciphertext: metadataCt } = await aesGcmEncrypt(fileKey, metadataBytes);
 
-  const { iv: contentIv, ciphertext } = await aesGcmEncrypt(fileKey, contentBytes);
+  const { iv: contentIv, ciphertext } = await aesGcmEncrypt(fileKey, paddedContentBytes);
 
   const { iv: wrapIv, ciphertext: wrappedKey } = await aesGcmEncrypt(wrappingKey, fileKeyRaw);
 
