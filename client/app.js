@@ -121,7 +121,7 @@ function icon(name) {
     close: '<path d="M5 5l14 14M19 5L5 19" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
     chevronLeft: '<path d="M12.5 4.5L6 11l6.5 6.5" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
     chevronRight: '<path d="M7.5 4.5L14 11l-6.5 6.5" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
-    expand: '<path d="M7 3H4a1 1 0 0 0-1 1v3M14 3h3a1 1 0 0 1 1 1v3M21 14v3a1 1 0 0 1-1 1h-3M3 14v3a1 1 0 0 0 1 1h3" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
+    expand: '<path d="M7 3H4a1 1 0 0 0-1 1v3M13 3h3a1 1 0 0 1 1 1v3M17 13v3a1 1 0 0 1-1 1h-3M3 13v3a1 1 0 0 0 1 1h3" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
   };
   return `<svg width="18" height="18" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">${icons[name] || ''}</svg>`;
 }
@@ -608,8 +608,8 @@ async function getDecryptedUrl(record) {
   if (objectUrlCache.has(record.id)) return objectUrlCache.get(record.id);
   const fileKeyRaw = fileKeyCache.get(record.id);
   const ciphertext = await api.downloadContent(record.id);
-  const bytes = await C.decryptContent(fileKeyRaw, record.content_iv, ciphertext);
   const meta = metaCache.get(record.id);
+  const bytes = await C.decryptContent(fileKeyRaw, record.content_iv, ciphertext, meta.compressed);
   const blob = new Blob([bytes], { type: meta.mime });
   const url = URL.createObjectURL(blob);
   objectUrlCache.set(record.id, url);
@@ -770,7 +770,7 @@ async function downloadAndSave(record, meta, existingUrl) {
     if (!url) {
       const fileKeyRaw = fileKeyCache.get(record.id);
       const ciphertext = await api.downloadContent(record.id);
-      const bytes = await C.decryptContent(fileKeyRaw, record.content_iv, ciphertext);
+      const bytes = await C.decryptContent(fileKeyRaw, record.content_iv, ciphertext, meta.compressed);
       const blob = new Blob([bytes], { type: meta.mime });
       url = URL.createObjectURL(blob);
     }

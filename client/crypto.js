@@ -31,6 +31,19 @@ function utf8(str) {
   return new TextEncoder().encode(str);
 }
 
+const canCompress = typeof CompressionStream !== 'undefined' && typeof DecompressionStream !== 'undefined';
+
+async function compressBytes(bytes) {
+  if (!canCompress) return null;
+  const stream = new Blob([bytes]).stream().pipeThrough(new CompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+async function decompressBytes(bytes) {
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
 function timingSafeEqualHex(aHex, bHex) {
   if (typeof aHex !== 'string' || typeof bHex !== 'string') return false;
   if (aHex.length !== bHex.length) {
@@ -120,9 +133,10 @@ export async function decryptMetadata(fileKeyRawBytes, encryptedMetadataB64, met
 }
 
 
-export async function decryptContent(fileKeyRawBytes, contentIvB64, ciphertextBytes) {
+export async function decryptContent(fileKeyRawBytes, contentIvB64, ciphertextBytes, compressed = false) {
   const fileKey = await importAesKey(fileKeyRawBytes, ['decrypt']);
-  return aesGcmDecrypt(fileKey, fromBase64(contentIvB64), ciphertextBytes);
+  const bytes = await aesGcmDecrypt(fileKey, fromBase64(contentIvB64), ciphertextBytes);
+  return compressed ? decompressBytes(bytes) : bytes;
 }
 
 
@@ -132,10 +146,21 @@ export async function encryptFile(wrappingKeyRawBytes, file) {
   const fileKeyRaw = generateAesKeyRaw();
   const fileKey = await importAesKey(fileKeyRaw);
 
-  const metadataBytes = utf8(JSON.stringify({ name: file.name, mime: file.type || 'application/octet-stream' }));
+  const rawContentBytes = new Uint8Array(await file.arrayBuffer());
+  let contentBytes = rawContentBytes;
+  let compressed = false;
+  try {
+    const gzipped = await compressBytes(rawContentBytes);
+    if (gzipped && gzipped.length < rawContentBytes.length) {
+      contentBytes = gzipped;
+      compressed = true;
+    }
+  } catch {
+  }
+
+  const metadataBytes = utf8(JSON.stringify({ name: file.name, mime: file.type || 'application/octet-stream', compressed }));
   const { iv: metadataIv, ciphertext: metadataCt } = await aesGcmEncrypt(fileKey, metadataBytes);
 
-  const contentBytes = new Uint8Array(await file.arrayBuffer());
   const { iv: contentIv, ciphertext } = await aesGcmEncrypt(fileKey, contentBytes);
 
   const { iv: wrapIv, ciphertext: wrappedKey } = await aesGcmEncrypt(wrappingKey, fileKeyRaw);
