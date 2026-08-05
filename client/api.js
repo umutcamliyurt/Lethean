@@ -102,20 +102,17 @@ export async function downloadContent(fileId, onProgress) {
     return new Uint8Array(await res.arrayBuffer());
   }
 
+  const out = new Uint8Array(total);
   const reader = res.body.getReader();
-  const chunks = [];
   let received = 0;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
-    chunks.push(value);
+    out.set(value, received);
     received += value.length;
     onProgress(received / total);
   }
-  const out = new Uint8Array(received);
-  let offset = 0;
-  for (const chunk of chunks) { out.set(chunk, offset); offset += chunk.length; }
-  return out;
+  return received === total ? out : out.subarray(0, received);
 }
 
 export async function deleteFile(fileId) {

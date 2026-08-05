@@ -607,18 +607,36 @@ function renderTile(record) {
 async function getDecryptedUrl(record) {
   if (objectUrlCache.has(record.id)) return objectUrlCache.get(record.id);
   const fileKeyRaw = fileKeyCache.get(record.id);
-  const ciphertext = await api.downloadContent(record.id);
+  let ciphertext = await api.downloadContent(record.id);
   const meta = metaCache.get(record.id);
-  const bytes = await C.decryptContent(fileKeyRaw, record.content_iv, ciphertext, meta.compressed, meta.unpaddedSize);
+  let bytes = await C.decryptContent(fileKeyRaw, record.content_iv, ciphertext, meta.compressed, meta.unpaddedSize);
+  ciphertext = null;
   const blob = new Blob([bytes], { type: meta.mime });
+  bytes = null;
   const url = URL.createObjectURL(blob);
   objectUrlCache.set(record.id, url);
   return url;
 }
 
 
+const isCoarsePointerDevice = typeof window.matchMedia === 'function'
+  && window.matchMedia('(pointer: coarse)').matches;
+const MOBILE_INLINE_VIDEO_LIMIT_BYTES = 150 * 1024 * 1024;
+
+function isUnsafeToPreviewInline(record, meta) {
+  return isCoarsePointerDevice
+    && fileKind(meta?.mime) === 'video'
+    && typeof record?.size === 'number'
+    && record.size > MOBILE_INLINE_VIDEO_LIMIT_BYTES;
+}
+
 function mediaRecords() {
-  return visibleRecords().filter((r) => fileKind(metaCache.get(r.id)?.mime) !== 'other');
+  return visibleRecords().filter((r) => {
+    const meta = metaCache.get(r.id);
+    if (fileKind(meta?.mime) === 'other') return false;
+    if (isUnsafeToPreviewInline(r, meta)) return false;
+    return true;
+  });
 }
 
 async function openTile(fileId) {
@@ -627,17 +645,19 @@ async function openTile(fileId) {
   if (!record || !meta) return;
 
   const kind = fileKind(meta.mime);
+  const skipInlinePreview = isUnsafeToPreviewInline(record, meta);
 
-  if (kind === 'other') {
+  if (kind === 'other' || skipInlinePreview) {
     lightboxMediaList = [];
     lightboxIndex = -1;
     const tileEl = boxGrid.querySelector(`[data-id="${fileId}"]`);
     tileEl?.classList.add('opening');
     showLightbox(`
       <div class="lightbox-generic">
-        ${icon('file')}
+        ${icon(kind === 'video' ? 'video' : 'file')}
         <p style="margin:12px 0 0;color:var(--text);font-family:var(--font-mono)">${escapeHtml(meta.name)}</p>
         <p style="font-size:0.8rem;margin-top:6px">${formatBytes(record.size)} \u00b7 encrypted</p>
+        ${skipInlinePreview ? `<p style="font-size:0.78rem;margin-top:10px;color:var(--dim)">This video is large \u2014 previewing it in-browser on a phone can crash the tab. Download it to watch in your device's player instead.</p>` : ''}
         <button class="btn-primary" id="lightbox-download" style="margin-top:18px">Decrypt &amp; download</button>
       </div>
     `);
@@ -660,6 +680,7 @@ async function openMediaAt(list, index) {
 
   lightboxMediaList = list;
   lightboxIndex = index;
+  lightbox.classList.toggle('has-nav', list.length > 1);
 
   const tileEl = boxGrid.querySelector(`[data-id="${record.id}"]`);
   tileEl?.classList.add('decrypting');
@@ -709,6 +730,7 @@ function showLightbox(innerHtml, { keepMedia = false } = {}) {
   if (!keepMedia) {
     lightboxMediaList = [];
     lightboxIndex = -1;
+    lightbox.classList.remove('has-nav');
   }
   lightbox.innerHTML = `
     <button class="btn-icon lightbox-close" id="lightbox-close" aria-label="Close">${icon('close')}</button>
@@ -726,6 +748,7 @@ function closeLightbox() {
   if (video) video.pause();
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
   lightbox.classList.add('hidden');
+  lightbox.classList.remove('has-nav');
   lightbox.innerHTML = '';
   lightboxMediaList = [];
   lightboxIndex = -1;

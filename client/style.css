@@ -438,6 +438,11 @@ main.vault {
 }
 #lightbox:focus-visible { outline: none; }
 
+#lightbox.has-nav {
+  padding-left: 64px;
+  padding-right: 64px;
+}
+
 .lightbox-content {
   position: relative;
   max-width: min(1000px, 100%);
@@ -459,13 +464,13 @@ main.vault {
   color: var(--text);
 }
 .lightbox-nav:hover { background: rgba(30, 30, 30, 0.8); color: var(--text); }
-.lightbox-nav-prev { left: -4px; }
-.lightbox-nav-next { right: -4px; }
+.lightbox-nav-prev { left: -52px; }
+.lightbox-nav-next { right: -52px; }
 
 @media (max-width: 560px) {
   .lightbox-nav { width: 38px; height: 38px; }
-  .lightbox-nav-prev { left: 2px; }
-  .lightbox-nav-next { right: 2px; }
+  .lightbox-nav-prev { left: -42px; }
+  .lightbox-nav-next { right: -42px; }
 }
 .lightbox-content img, .lightbox-content video {
   max-width: 100%;
@@ -566,6 +571,7 @@ main.vault {
   .grid-toolbar { gap: 10px; }
   .search-bar { max-width: 100%; }
   #lightbox { padding: 14px; }
+  #lightbox.has-nav { padding-left: 46px; padding-right: 46px; }
   .lightbox-close { top: 10px; right: 10px; }
   .lightbox-meta { flex-wrap: wrap; justify-content: center; text-align: center; }
   .settings-panel { padding: 20px; max-width: 100%; }
