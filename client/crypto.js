@@ -235,8 +235,8 @@ async function sha256(bytes) {
 
 const DURESS_KDF_PARAMS = {
   parallelism: 1,
-  iterations: 3,
-  memorySize: 19456,
+  iterations: ARGON2_PARAMS.iterations,
+  memorySize: ARGON2_PARAMS.memorySize,
   hashLength: 32,
   outputType: 'binary',
 };
@@ -315,13 +315,19 @@ function hasSequentialRun(password, runLength = 5) {
 function isMostlyRepeatedChars(password) {
   const counts = {};
   for (const ch of password) counts[ch] = (counts[ch] || 0) + 1;
-  const maxCount = Math.max(...Object.values(counts));
+  let maxCount = 0;
+  for (const c of Object.values(counts)) if (c > maxCount) maxCount = c;
   return maxCount / password.length > 0.5 && password.length > 3;
 }
+
+const PASSWORD_STRENGTH_CHECK_LIMIT = 1024;
 
 export function validatePasswordStrength(password) {
   const errors = [];
   password = password || '';
+  const checkSlice = password.length > PASSWORD_STRENGTH_CHECK_LIMIT
+    ? password.slice(0, PASSWORD_STRENGTH_CHECK_LIMIT)
+    : password;
 
   if (password.length < 12) {
     errors.push('Use at least 12 characters (longer passphrases are safer than short complex ones).');
@@ -334,10 +340,10 @@ export function validatePasswordStrength(password) {
   if (password.length < 20 && classes < 3) {
     errors.push('Mix at least 3 of: lowercase, uppercase, numbers, symbols — or use a longer passphrase (20+ characters).');
   }
-  if (hasSequentialRun(password)) {
+  if (hasSequentialRun(checkSlice)) {
     errors.push('Avoid simple sequences like "abcdef" or "12345".');
   }
-  if (isMostlyRepeatedChars(password)) {
+  if (isMostlyRepeatedChars(checkSlice)) {
     errors.push('Avoid passphrases made mostly of one repeated character.');
   }
 

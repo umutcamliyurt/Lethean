@@ -38,12 +38,12 @@
     <form id="auth-form">
       <div class="field">
         <label for="password">Passphrase</label>
-        <input type="password" id="password" autocomplete="current-password" required aria-describedby="password-strength-hint">
+        <input type="password" id="password" autocomplete="current-password" required maxlength="256" aria-describedby="password-strength-hint">
       </div>
 
       <div class="field hidden" id="confirm-field">
         <label for="password-confirm">Empty vault, retype to confirm</label>
-        <input type="password" id="password-confirm" autocomplete="new-password" minlength="12">
+        <input type="password" id="password-confirm" autocomplete="new-password" minlength="12" maxlength="256">
         <div class="strength-meter" id="password-strength" data-tier="" aria-hidden="true">
           <div class="strength-segment"></div>
           <div class="strength-segment"></div>

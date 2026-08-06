@@ -243,6 +243,11 @@ authForm.addEventListener('submit', async (e) => {
         setAuthStatus("Those don't match.", { error: true });
         return;
       }
+      const { valid, errors } = C.validatePasswordStrength(password);
+      if (!valid) {
+        setAuthStatus(errors[0] || 'Passphrase is too weak.', { error: true });
+        return;
+      }
       setAuthStatus('Deriving key\u2026', { spinning: true });
       const { vaultId, wrappingKeyRaw: wk } = await C.unlockVault(password);
       await checkDuressAndMaybeWipe(password, wk);
@@ -431,12 +436,12 @@ function openDuressPanel() {
       <form id="duress-form">
         <div class="field">
           <label for="duress-pin">Duress passphrase</label>
-          <input type="password" id="duress-pin" autocomplete="new-password" minlength="12">
+          <input type="password" id="duress-pin" autocomplete="new-password" minlength="12" maxlength="256">
           <p class="field-hint" id="duress-pin-hint">Use 12+ characters, ideally a random passphrase of several unrelated words.</p>
         </div>
         <div class="field">
           <label for="duress-pin-confirm">Confirm</label>
-          <input type="password" id="duress-pin-confirm" autocomplete="new-password" minlength="12">
+          <input type="password" id="duress-pin-confirm" autocomplete="new-password" minlength="12" maxlength="256">
         </div>
         <div class="panel-actions">
           <button type="button" id="duress-remove">Reset</button>
@@ -788,7 +793,7 @@ async function openTile(fileId) {
   if (kind === 'other' || skipInlinePreview) {
     lightboxMediaList = [];
     lightboxIndex = -1;
-    const tileEl = boxGrid.querySelector(`[data-id="${fileId}"]`);
+    const tileEl = boxGrid.querySelector(`[data-id="${CSS.escape(fileId)}"]`);
     tileEl?.classList.add('opening');
     let note = '';
     if (skipInlinePreview && kind === 'video') {
@@ -820,7 +825,7 @@ async function openTile(fileId) {
 async function openOtherPreview(record, meta, kind) {
   lightboxMediaList = [];
   lightboxIndex = -1;
-  const tileEl = boxGrid.querySelector(`[data-id="${record.id}"]`);
+  const tileEl = boxGrid.querySelector(`[data-id="${CSS.escape(record.id)}"]`);
   tileEl?.classList.add('decrypting');
   showLightbox(`<div class="lightbox-content"><div class="spinner spinner-lg"></div></div>`, { keepMedia: true });
 
@@ -872,7 +877,7 @@ async function openMediaAt(list, index) {
   lightboxIndex = index;
   lightbox.classList.toggle('has-nav', list.length > 1);
 
-  const tileEl = boxGrid.querySelector(`[data-id="${record.id}"]`);
+  const tileEl = boxGrid.querySelector(`[data-id="${CSS.escape(record.id)}"]`);
   tileEl?.classList.add('decrypting');
   showLightbox(`<div class="lightbox-content"><div class="spinner spinner-lg"></div></div>`, { keepMedia: true });
 
