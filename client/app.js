@@ -123,6 +123,39 @@ function fileKind(mime) {
   return 'other';
 }
 
+const TEXT_PREVIEW_MIME_WHITELIST = new Set([
+  'application/json',
+  'application/xml',
+  'application/javascript',
+  'application/x-javascript',
+  'application/x-yaml',
+  'application/ld+json',
+  'application/x-sh',
+  'application/toml',
+]);
+
+const TEXT_PREVIEW_EXTENSIONS = new Set([
+  'txt', 'md', 'markdown', 'csv', 'tsv', 'json', 'xml', 'yaml', 'yml', 'ini', 'conf', 'cfg', 'log',
+  'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'py', 'rb', 'go', 'rs', 'java', 'c', 'h', 'cpp', 'hpp', 'cs',
+  'php', 'sh', 'bash', 'zsh', 'sql', 'html', 'htm', 'css', 'scss', 'less', 'vue', 'svelte', 'toml',
+  'env', 'gitignore', 'gitattributes', 'dockerfile', 'makefile', 'gemfile', 'rakefile',
+]);
+
+function fileExtension(name) {
+  const clean = (name || '').toLowerCase();
+  const dot = clean.lastIndexOf('.');
+  return dot > 0 ? clean.slice(dot + 1) : clean.replace(/^\./, '');
+}
+
+function previewKind(meta) {
+  const mime = (meta?.mime || '').toLowerCase();
+  if (mime === 'application/pdf') return 'pdf';
+  if (mime.startsWith('audio/')) return 'audio';
+  if (mime.startsWith('text/') || TEXT_PREVIEW_MIME_WHITELIST.has(mime)) return 'text';
+  if (TEXT_PREVIEW_EXTENSIONS.has(fileExtension(meta?.name))) return 'text';
+  return null;
+}
+
 function decryptedSize(record, meta) {
   if (typeof meta?.unpaddedSize === 'number') return meta.unpaddedSize;
   return record?.size ?? 0;
@@ -695,13 +728,17 @@ function renderListRow(record) {
   return row;
 }
 
+async function getDecryptedBytes(record) {
+  const fileKeyRaw = fileKeyCache.get(record.id);
+  const ciphertext = await api.downloadContent(record.id);
+  const meta = metaCache.get(record.id);
+  return C.decryptContent(fileKeyRaw, record.content_iv, ciphertext, meta.compressed, meta.unpaddedSize);
+}
+
 async function getDecryptedUrl(record) {
   if (objectUrlCache.has(record.id)) return objectUrlCache.get(record.id);
-  const fileKeyRaw = fileKeyCache.get(record.id);
-  let ciphertext = await api.downloadContent(record.id);
   const meta = metaCache.get(record.id);
-  let bytes = await C.decryptContent(fileKeyRaw, record.content_iv, ciphertext, meta.compressed, meta.unpaddedSize);
-  ciphertext = null;
+  let bytes = await getDecryptedBytes(record);
   const blob = new Blob([bytes], { type: meta.mime });
   bytes = null;
   const url = URL.createObjectURL(blob);
@@ -713,11 +750,15 @@ async function getDecryptedUrl(record) {
 const isCoarsePointerDevice = typeof window.matchMedia === 'function'
   && window.matchMedia('(pointer: coarse)').matches;
 const MOBILE_INLINE_VIDEO_LIMIT_BYTES = 150 * 1024 * 1024;
+const MOBILE_INLINE_PDF_LIMIT_BYTES = 150 * 1024 * 1024;
+const TEXT_PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
 
 function isUnsafeToPreviewInline(record, meta) {
-  return isCoarsePointerDevice
-    && fileKind(meta?.mime) === 'video'
-    && decryptedSize(record, meta) > MOBILE_INLINE_VIDEO_LIMIT_BYTES;
+  if (!isCoarsePointerDevice) return false;
+  const size = decryptedSize(record, meta);
+  if (fileKind(meta?.mime) === 'video' && size > MOBILE_INLINE_VIDEO_LIMIT_BYTES) return true;
+  if (previewKind(meta) === 'pdf' && size > MOBILE_INLINE_PDF_LIMIT_BYTES) return true;
+  return false;
 }
 
 function mediaRecords() {
@@ -735,20 +776,35 @@ async function openTile(fileId) {
   if (!record || !meta) return;
 
   const kind = fileKind(meta.mime);
+  const pKind = kind === 'other' ? previewKind(meta) : null;
   const skipInlinePreview = isUnsafeToPreviewInline(record, meta);
+  const textTooLarge = pKind === 'text' && decryptedSize(record, meta) > TEXT_PREVIEW_MAX_BYTES;
+
+  if (kind === 'other' && pKind && !skipInlinePreview && !textTooLarge) {
+    await openOtherPreview(record, meta, pKind);
+    return;
+  }
 
   if (kind === 'other' || skipInlinePreview) {
     lightboxMediaList = [];
     lightboxIndex = -1;
     const tileEl = boxGrid.querySelector(`[data-id="${fileId}"]`);
     tileEl?.classList.add('opening');
+    let note = '';
+    if (skipInlinePreview && kind === 'video') {
+      note = "This video is large \u2014 previewing it in-browser on a phone can crash the tab. Download it to watch in your device's player instead.";
+    } else if (skipInlinePreview && pKind === 'pdf') {
+      note = "This PDF is large \u2014 previewing it in-browser on a phone can be slow. Download it to view in your device's PDF viewer instead.";
+    } else if (textTooLarge) {
+      note = "This text file is large \u2014 download it to view the full contents.";
+    }
     showLightbox(`
       <div class="lightbox-generic">
         ${icon(kind === 'video' ? 'video' : 'file')}
-        <p style="margin:12px 0 0;color:var(--text);font-family:var(--font-mono)">${escapeHtml(meta.name)}</p>
-        <p style="font-size:0.8rem;margin-top:6px">${formatBytes(decryptedSize(record, meta))} \u00b7 encrypted</p>
-        ${skipInlinePreview ? `<p style="font-size:0.78rem;margin-top:10px;color:var(--dim)">This video is large \u2014 previewing it in-browser on a phone can crash the tab. Download it to watch in your device's player instead.</p>` : ''}
-        <button class="btn-primary" id="lightbox-download" style="margin-top:18px">Decrypt &amp; download</button>
+        <p class="lightbox-generic-name">${escapeHtml(meta.name)}</p>
+        <p class="lightbox-generic-size">${formatBytes(decryptedSize(record, meta))} \u00b7 encrypted</p>
+        ${note ? `<p class="lightbox-generic-note">${note}</p>` : ''}
+        <button class="btn-primary lightbox-generic-btn" id="lightbox-download">Decrypt &amp; download</button>
       </div>
     `);
     $('lightbox-download').addEventListener('click', () => downloadAndSave(record, meta));
@@ -759,6 +815,50 @@ async function openTile(fileId) {
   const list = mediaRecords();
   const index = list.findIndex((r) => r.id === fileId);
   await openMediaAt(list, index >= 0 ? index : 0);
+}
+
+async function openOtherPreview(record, meta, kind) {
+  lightboxMediaList = [];
+  lightboxIndex = -1;
+  const tileEl = boxGrid.querySelector(`[data-id="${record.id}"]`);
+  tileEl?.classList.add('decrypting');
+  showLightbox(`<div class="lightbox-content"><div class="spinner spinner-lg"></div></div>`, { keepMedia: true });
+
+  try {
+    let inner;
+    let objectUrl = null;
+
+    if (kind === 'text') {
+      const bytes = await getDecryptedBytes(record);
+      const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+      inner = `<pre class="lightbox-text" id="lightbox-media">${escapeHtml(text)}</pre>`;
+      const blob = new Blob([bytes], { type: meta.mime || 'text/plain' });
+      objectUrl = URL.createObjectURL(blob);
+      objectUrlCache.set(record.id, objectUrl);
+    } else {
+      objectUrl = await getDecryptedUrl(record);
+      inner = kind === 'pdf'
+        ? `<iframe src="${objectUrl}" id="lightbox-media" title="${escapeHtml(meta.name)}"></iframe>`
+        : `<audio src="${objectUrl}" controls autoplay id="lightbox-media"></audio>`;
+    }
+
+    showLightbox(`
+      <div class="lightbox-content lightbox-content-${kind}">
+        ${inner}
+        <div class="lightbox-meta">
+          <span class="fname">${escapeHtml(meta.name)}</span>
+          <button class="btn-icon" id="lightbox-download" title="Download" aria-label="Download">${icon('download')}</button>
+        </div>
+      </div>
+    `, { keepMedia: true });
+
+    $('lightbox-download').addEventListener('click', () => downloadAndSave(record, meta, objectUrl));
+  } catch (err) {
+    showToast("Couldn't decrypt that file. " + err.message, 'error');
+    closeLightbox();
+  } finally {
+    tileEl?.classList.remove('decrypting', 'opening');
+  }
 }
 
 async function openMediaAt(list, index) {
@@ -774,7 +874,7 @@ async function openMediaAt(list, index) {
 
   const tileEl = boxGrid.querySelector(`[data-id="${record.id}"]`);
   tileEl?.classList.add('decrypting');
-  showLightbox(`<div class="lightbox-content"><div class="spinner" style="width:32px;height:32px"></div></div>`, { keepMedia: true });
+  showLightbox(`<div class="lightbox-content"><div class="spinner spinner-lg"></div></div>`, { keepMedia: true });
 
   try {
     const url = await getDecryptedUrl(record);
@@ -834,8 +934,8 @@ function showLightbox(innerHtml, { keepMedia = false } = {}) {
 }
 
 function closeLightbox() {
-  const video = lightbox.querySelector('video');
-  if (video) video.pause();
+  const av = lightbox.querySelector('video, audio');
+  if (av) av.pause();
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
   lightbox.classList.add('hidden');
   lightbox.classList.remove('has-nav');
@@ -985,12 +1085,18 @@ function createUploadRow(file) {
     <span class="name">${escapeHtml(file.name)}</span>
     <span class="status">Queued\u2026</span>
     <button type="button" class="btn-icon upload-cancel hidden" aria-label="Cancel upload" title="Cancel upload">${icon('close')}</button>
-    <div class="bar"><div class="bar-fill" style="width:0%"></div></div>
+    <div class="bar"><div class="bar-fill"></div></div>
   `;
   const rowItem = { el: row };
   uploadRows.push(rowItem);
   syncUploadQueueView();
   return rowItem;
+}
+
+function setBarProgress(barEl, fraction, { instant = false } = {}) {
+  const pct = `${Math.max(0, Math.min(100, Math.round(fraction * 100)))}%`;
+  barEl.getAnimations().forEach((a) => a.cancel());
+  barEl.animate([{ width: pct }], { duration: instant ? 1 : 200, fill: 'forwards', easing: 'ease' });
 }
 
 const RETRY_BASE_MS = 1000;
@@ -1056,9 +1162,9 @@ async function uploadOne(file, rowItem) {
     try {
       statusEl.textContent = attempt === 0 ? 'Uploading\u2026' : `Retrying\u2026 (attempt ${attempt + 1})`;
       statusEl.removeAttribute('title');
-      barEl.style.width = '0%';
+      setBarProgress(barEl, 0, { instant: true });
       await api.uploadFile(encrypted, (fraction) => {
-        barEl.style.width = `${Math.round(fraction * 100)}%`;
+        setBarProgress(barEl, fraction);
       }, controller.signal);
 
       row.classList.remove('error');

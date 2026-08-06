@@ -261,7 +261,7 @@ main.vault {
 .upload-row .upload-cancel { width: 26px; height: 26px; flex-shrink: 0; }
 .upload-row .upload-cancel svg { width: 13px; height: 13px; }
 .upload-row .bar { height: 2px; background: var(--border); border-radius: 2px; overflow: hidden; position: absolute; left: 0; right: 0; bottom: 0; }
-.upload-row .bar-fill { height: 100%; background: var(--text); transition: width 0.2s ease; }
+.upload-row .bar-fill { height: 100%; width: 0; background: var(--text); }
 .upload-row.done .status { color: var(--text); }
 .upload-row.error .status { text-decoration: underline; }
 
@@ -565,6 +565,33 @@ main.vault {
   border-radius: 4px;
   background: #000;
 }
+.lightbox-content-pdf iframe {
+  width: min(900px, 84vw);
+  height: 78vh;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: #fff;
+}
+.lightbox-content-audio audio {
+  width: min(480px, 84vw);
+}
+.lightbox-text {
+  width: min(820px, 88vw);
+  max-height: 72vh;
+  overflow: auto;
+  margin: 0;
+  padding: 18px 20px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-word;
+  text-align: left;
+}
 .lightbox-meta {
   display: flex;
   align-items: center;
@@ -584,6 +611,14 @@ main.vault {
   text-align: center;
   color: var(--dim);
 }
+.lightbox-generic-name {
+  margin: 12px 0 0;
+  color: var(--text);
+  font-family: var(--font-mono);
+}
+.lightbox-generic-size { font-size: 0.8rem; margin-top: 6px; }
+.lightbox-generic-note { font-size: 0.78rem; margin-top: 10px; color: var(--dim); }
+.lightbox-generic-btn { margin-top: 18px; }
 
 .settings-panel {
   background: var(--surface);
@@ -645,6 +680,7 @@ main.vault {
   animation: spin 0.7s linear infinite;
   flex-shrink: 0;
 }
+.spinner-lg { width: 32px; height: 32px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 
 @media (max-width: 560px) {

@@ -125,7 +125,7 @@ async def add_security_headers(request, call_next):
         "Content-Security-Policy",
         "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; "
         "style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' blob: data:; media-src 'self' blob:; "
+        "img-src 'self' blob: data:; media-src 'self' blob:; frame-src blob:; "
         "frame-ancestors 'none'; object-src 'none'; base-uri 'none'",
     )
     forwarded_proto = request.headers.get("x-forwarded-proto") if os.environ.get("TRUST_PROXY_HEADERS", "0") == "1" else None
