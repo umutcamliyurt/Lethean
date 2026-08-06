@@ -32,6 +32,10 @@ const chooseFilesBtn = $('choose-files-btn');
 const fileInput = $('file-input');
 const uploadQueue = $('upload-queue');
 const boxGrid = $('box-grid');
+const fileListEl = $('file-list');
+const fileListBody = $('file-list-body');
+const viewGridBtn = $('view-grid-btn');
+const viewListBtn = $('view-list-btn');
 const emptyState = $('empty-state');
 const gridLabel = $('grid-label');
 const searchInput = $('search-input');
@@ -53,6 +57,31 @@ let lightboxNavLock = false;
 const LS_SETUP_KEY = 'vault.setupComplete';
 const LS_DURESS_KEY = 'vault.duress';
 const LS_ACCESS_TOKEN_KEY = 'vault.accessToken';
+const LS_VIEW_MODE_KEY = 'vault.viewMode';
+
+let viewMode = localStorage.getItem(LS_VIEW_MODE_KEY) === 'list' ? 'list' : 'grid';
+
+function setViewMode(mode) {
+  if (mode !== 'grid' && mode !== 'list') return;
+  if (viewMode === mode) return;
+  viewMode = mode;
+  localStorage.setItem(LS_VIEW_MODE_KEY, mode);
+  updateViewToggleUI();
+  renderCurrentView();
+}
+
+function updateViewToggleUI() {
+  boxGrid.classList.toggle('hidden', viewMode !== 'grid');
+  fileListEl.classList.toggle('hidden', viewMode !== 'list');
+  viewGridBtn?.classList.toggle('active', viewMode === 'grid');
+  viewListBtn?.classList.toggle('active', viewMode === 'list');
+  viewGridBtn?.setAttribute('aria-pressed', String(viewMode === 'grid'));
+  viewListBtn?.setAttribute('aria-pressed', String(viewMode === 'list'));
+}
+
+viewGridBtn?.addEventListener('click', () => setViewMode('grid'));
+viewListBtn?.addEventListener('click', () => setViewMode('list'));
+updateViewToggleUI();
 
 function isSetupComplete() {
   return localStorage.getItem(LS_SETUP_KEY) === '1';
@@ -267,6 +296,7 @@ function clearRenderedGrid() {
   objectUrlCache.clear();
   if (gridObserver) { gridObserver.disconnect(); gridObserver = null; }
   boxGrid.innerHTML = '';
+  fileListBody.innerHTML = '';
   emptyState.classList.add('hidden');
   gridLabel.textContent = '';
   usagePill.textContent = '\u2014 items \u00b7,';
@@ -416,7 +446,7 @@ async function refreshGallery() {
   } catch (err) {
     showToast(err.message, 'error');
   }
-  renderGrid();
+  renderCurrentView();
   await loadNextPage();
   setupGridSentinel();
 }
@@ -454,7 +484,7 @@ async function loadNextPage() {
     }
 
     records = records.concat(fresh);
-    appendTiles(fresh);
+    appendToCurrentView(fresh);
   } catch (err) {
     showToast(err.message, 'error');
     hasMorePages = false;
@@ -484,20 +514,23 @@ function visibleRecords() {
   return records.filter((r) => (metaCache.get(r.id)?.name || '').toLowerCase().includes(q));
 }
 
-function renderGrid() {
+function renderCurrentView() {
   boxGrid.innerHTML = '';
+  fileListBody.innerHTML = '';
   const shown = visibleRecords();
   const searching = !!searchQuery;
 
   updateEmptyState(shown, searching);
   updateGridLabel(shown, searching);
 
+  const target = viewMode === 'list' ? fileListBody : boxGrid;
+  const render = viewMode === 'list' ? renderListRow : renderTile;
   for (const record of shown) {
-    boxGrid.appendChild(renderTile(record));
+    target.appendChild(render(record));
   }
 }
 
-function appendTiles(newRecords) {
+function appendToCurrentView(newRecords) {
   const searching = !!searchQuery;
   const q = searchQuery.toLowerCase();
   const toShow = searching
@@ -508,11 +541,13 @@ function appendTiles(newRecords) {
   updateEmptyState(shown, searching);
   updateGridLabel(shown, searching);
 
+  const target = viewMode === 'list' ? fileListBody : boxGrid;
+  const render = viewMode === 'list' ? renderListRow : renderTile;
   const fragment = document.createDocumentFragment();
   for (const record of toShow) {
-    fragment.appendChild(renderTile(record));
+    fragment.appendChild(render(record));
   }
-  boxGrid.appendChild(fragment);
+  target.appendChild(fragment);
 }
 
 function updateEmptyState(shown, searching) {
@@ -539,7 +574,7 @@ searchInput?.addEventListener('input', () => {
       gridSentinel.textContent = 'Loading all files to search\u2026';
       await loadAllPagesForSearch();
     }
-    renderGrid();
+    renderCurrentView();
   }, 180);
 });
 
@@ -547,7 +582,7 @@ searchClearBtn?.addEventListener('click', () => {
   searchInput.value = '';
   searchQuery = '';
   searchClearBtn.classList.add('hidden');
-  renderGrid();
+  renderCurrentView();
   searchInput.focus();
 });
 
@@ -602,6 +637,57 @@ function renderTile(record) {
   }
 
   return tile;
+}
+
+function fileTypeLabel(meta) {
+  const kind = fileKind(meta?.mime);
+  if (kind === 'image') return 'Image';
+  if (kind === 'video') return 'Video';
+  const sub = (meta?.mime || '').split('/')[1];
+  return sub ? sub.replace('x-', '').toUpperCase() : 'File';
+}
+
+function renderListRow(record) {
+  const meta = metaCache.get(record.id) || { name: '\u2026', mime: '' };
+  const kind = fileKind(meta.mime);
+
+  const row = document.createElement('div');
+  row.className = 'file-list-row';
+  row.dataset.id = record.id;
+  row.tabIndex = 0;
+  row.setAttribute('role', 'row');
+  row.setAttribute('aria-label', `Open ${meta.name}`);
+
+  row.innerHTML = `
+    <span class="file-row-name" role="cell">
+      <span class="file-row-icon">${icon(kind === 'image' ? 'image' : kind === 'video' ? 'video' : 'file')}</span>
+      <span class="file-row-text">${escapeHtml(meta.name)}</span>
+    </span>
+    <span class="file-row-type" role="cell">${escapeHtml(fileTypeLabel(meta))}</span>
+    <span class="file-row-size" role="cell">${formatBytes(record.size ?? 0)}</span>
+    <span class="file-row-actions" role="cell">
+      <button type="button" class="btn-icon file-download-btn" aria-label="Download ${escapeHtml(meta.name)}" title="Download">${icon('download')}</button>
+      <button type="button" class="btn-icon file-delete-btn" aria-label="Delete ${escapeHtml(meta.name)}" title="Delete">${icon('trash')}</button>
+    </span>
+  `;
+
+  row.addEventListener('click', (e) => {
+    if (e.target.closest('.file-download-btn') || e.target.closest('.file-delete-btn')) return;
+    openTile(record.id);
+  });
+  row.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openTile(record.id); }
+  });
+  row.querySelector('.file-download-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    downloadAndSave(record, meta);
+  });
+  row.querySelector('.file-delete-btn').addEventListener('click', (e) => {
+    e.stopPropagation();
+    handleDelete(record.id);
+  });
+
+  return row;
 }
 
 async function getDecryptedUrl(record) {
@@ -817,7 +903,7 @@ async function handleDelete(fileId) {
     fileKeyCache.delete(fileId);
     metaCache.delete(fileId);
     records = records.filter((r) => r.id !== fileId);
-    renderGrid();
+    renderCurrentView();
     showToast('Deleted.');
   } catch (err) {
     showToast("Couldn't delete that file. " + err.message, 'error');

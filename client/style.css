@@ -292,6 +292,29 @@ main.vault {
   flex-wrap: wrap;
 }
 
+.view-toggle {
+  display: flex;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.view-toggle-btn {
+  border: none;
+  border-radius: 0;
+  min-height: 36px;
+  width: 36px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--dim);
+  background: transparent;
+}
+.view-toggle-btn + .view-toggle-btn { border-left: 1px solid var(--border); }
+.view-toggle-btn:hover { color: var(--text); background: var(--surface-2); }
+.view-toggle-btn.active { color: var(--text); background: var(--surface-2); }
+
 .search-bar {
   position: relative;
   display: flex;
@@ -408,6 +431,70 @@ main.vault {
 
 .box-tile.decrypting .box-icon { animation: pulse 1.1s ease-in-out infinite; }
 @keyframes pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
+
+.file-list {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.file-list-head, .file-list-row {
+  display: grid;
+  grid-template-columns: 1fr 100px 90px 80px;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 14px;
+}
+.file-list-head {
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.file-list-actions-col, .file-row-actions { text-align: right; }
+.file-list-row {
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  font-size: 0.85rem;
+  transition: background 0.12s ease;
+}
+.file-list-row:last-child { border-bottom: none; }
+.file-list-row:hover, .file-list-row:focus-visible { background: var(--surface); }
+.file-row-name {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+.file-row-icon { color: var(--dim); flex-shrink: 0; display: inline-flex; }
+.file-row-icon svg { width: 16px; height: 16px; }
+.file-row-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-row-type {
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-row-size {
+  color: var(--dim);
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+}
+.file-row-actions {
+  display: flex;
+  gap: 2px;
+  justify-content: flex-end;
+}
+.file-row-actions .btn-icon { width: 30px; height: 30px; }
+.file-row-actions .btn-icon svg { width: 14px; height: 14px; }
 
 .empty-state-icon {
   margin: 0 auto;
@@ -570,6 +657,8 @@ main.vault {
   .deposit-slot { padding: 18px 14px; }
   .grid-toolbar { gap: 10px; }
   .search-bar { max-width: 100%; }
+  .file-list-head, .file-list-row { grid-template-columns: 1fr 64px 68px; gap: 8px; padding: 9px 10px; }
+  .file-row-type-col, .file-row-type { display: none; }
   #lightbox { padding: 14px; }
   #lightbox.has-nav { padding-left: 46px; padding-right: 46px; }
   .lightbox-close { top: 10px; right: 10px; }

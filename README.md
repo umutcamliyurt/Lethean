@@ -8,7 +8,7 @@ fully decrypted in memory, the server only ever sees ciphertext.
 
 ## Screenshot
 
-![screenshot](screenshot.jpg)
+![screenshot](screenshot.png)
 
 ## Features
 
