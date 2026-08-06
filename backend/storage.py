@@ -1,3 +1,4 @@
+import asyncio
 import os
 import re
 import secrets
@@ -32,25 +33,28 @@ def write_blob(path: str, data: bytes) -> None:
 
 async def write_blob_streamed(path: str, upload, limit: int, chunk_size: int = 4 * 1024 * 1024) -> int:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    f = os.fdopen(fd, "wb")
     total = 0
     try:
-        with os.fdopen(fd, "wb") as f:
-            while True:
-                chunk = await upload.read(chunk_size)
-                if not chunk:
-                    break
-                total += len(chunk)
-                if total > limit:
-                    raise ValueError(f"upload exceeds max size of {limit} bytes")
-                f.write(chunk)
-            f.flush()
-            os.fsync(f.fileno())
+        while True:
+            chunk = await upload.read(chunk_size)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise ValueError(f"upload exceeds max size of {limit} bytes")
+            await asyncio.to_thread(f.write, chunk)
+        await asyncio.to_thread(f.flush)
+        await asyncio.to_thread(os.fsync, f.fileno())
     except Exception:
+        f.close()
         try:
             os.remove(path)
         except FileNotFoundError:
             pass
         raise
+    else:
+        f.close()
     return total
 
 

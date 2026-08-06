@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -5,7 +6,9 @@ import os
 import threading
 import time
 from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 
+import anyio.to_thread
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, Form, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
@@ -25,6 +28,18 @@ logger = logging.getLogger("lethean")
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Lethean API", docs_url=None, redoc_url=None)
+
+_MAX_CONCURRENT_UPLOADS = int(os.environ.get("MAX_CONCURRENT_UPLOADS", "50"))
+_upload_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_UPLOADS)
+
+
+@app.on_event("startup")
+async def _configure_thread_capacity():
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_UPLOADS * 2))
+
+    anyio.to_thread.current_default_thread_limiter().total_tokens = max(100, _MAX_CONCURRENT_UPLOADS * 2)
+
 
 _ALLOWED_ORIGINS = ["tauri://localhost", "https://tauri.localhost"]
 _extra_origins = os.environ.get("EXTRA_CORS_ORIGINS", "")
@@ -129,33 +144,37 @@ def _lock_for_vault(vault_id: str) -> threading.Lock:
     return _vault_locks[idx]
 
 
-@app.post("/files", response_model=FileMetaResponse, status_code=201)
-async def upload_file(
-    content_iv: str = Form(..., max_length=_IV_MAX_LEN),
-    encrypted_metadata: str = Form(..., max_length=_ENCRYPTED_METADATA_MAX_LEN),
-    metadata_iv: str = Form(..., max_length=_IV_MAX_LEN),
-    wrapped_file_key: str = Form(..., max_length=_WRAPPED_KEY_MAX_LEN),
-    wrap_iv: str = Form(..., max_length=_IV_MAX_LEN),
-    blob: UploadFile | None = None,
-    db: Session = Depends(get_db),
-    auth: UploadAuthorization = Depends(require_upload_authorization),
-):
-    if blob is None:
-        raise HTTPException(status_code=400, detail="Missing file blob")
+_reserved_lock = threading.Lock()
+_reserved_bytes: dict[str, int] = defaultdict(int)
 
-    vault_id = auth.vault_id
 
+def _reserve_upload_slot(
+    db: Session,
+    vault_id: str,
+    quota_bytes: int,
+    declared_size: int | None,
+    encrypted_metadata: str,
+    metadata_iv: str,
+    content_iv: str,
+    wrapped_file_key: str,
+    wrap_iv: str,
+) -> tuple[EncryptedFile, int]:
     with _lock_for_vault(vault_id):
         current_usage = db.query(func.coalesce(func.sum(EncryptedFile.size), 0)).filter(
             EncryptedFile.vault_id == vault_id
         ).scalar()
-        remaining_quota = auth.quota_bytes - current_usage
+        with _reserved_lock:
+            reserved = _reserved_bytes.get(vault_id, 0)
+        remaining_quota = quota_bytes - current_usage - reserved
         if remaining_quota <= 0:
             raise HTTPException(
                 status_code=413,
-                detail=f"Storage quota exceeded: {current_usage} of {auth.quota_bytes} bytes",
+                detail=f"Storage quota exceeded: {current_usage + reserved} of {quota_bytes} bytes",
             )
-        stream_limit = min(MAX_UPLOAD_BYTES, remaining_quota)
+        candidate_limits = [MAX_UPLOAD_BYTES, remaining_quota]
+        if declared_size is not None:
+            candidate_limits.append(max(declared_size, 1))
+        stream_limit = min(candidate_limits)
 
         record = EncryptedFile(
             vault_id=vault_id,
@@ -170,22 +189,88 @@ async def upload_file(
         db.add(record)
         db.flush()
 
+        with _reserved_lock:
+            _reserved_bytes[vault_id] = _reserved_bytes.get(vault_id, 0) + stream_limit
+
+        return record, stream_limit
+
+
+def _release_reservation(vault_id: str, stream_limit: int) -> None:
+    with _reserved_lock:
+        remaining = _reserved_bytes.get(vault_id, 0) - stream_limit
+        if remaining <= 0:
+            _reserved_bytes.pop(vault_id, None)
+        else:
+            _reserved_bytes[vault_id] = remaining
+
+
+def _discard_upload(db: Session, vault_id: str, stream_limit: int) -> None:
+    db.rollback()
+    _release_reservation(vault_id, stream_limit)
+
+
+def _finalize_upload(db: Session, record: EncryptedFile, path: str, size: int, vault_id: str, stream_limit: int) -> EncryptedFile:
+    record.storage_path = path
+    record.size = size
+    db.commit()
+    db.refresh(record)
+    _release_reservation(vault_id, stream_limit)
+    return record
+
+
+@app.post("/files", response_model=FileMetaResponse, status_code=201)
+async def upload_file(
+    request: Request,
+    content_iv: str = Form(..., max_length=_IV_MAX_LEN),
+    encrypted_metadata: str = Form(..., max_length=_ENCRYPTED_METADATA_MAX_LEN),
+    metadata_iv: str = Form(..., max_length=_IV_MAX_LEN),
+    wrapped_file_key: str = Form(..., max_length=_WRAPPED_KEY_MAX_LEN),
+    wrap_iv: str = Form(..., max_length=_IV_MAX_LEN),
+    blob: UploadFile | None = None,
+    db: Session = Depends(get_db),
+    auth: UploadAuthorization = Depends(require_upload_authorization),
+):
+    if blob is None:
+        raise HTTPException(status_code=400, detail="Missing file blob")
+
+    vault_id = auth.vault_id
+
+    declared_size: int | None = None
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            declared_size = int(content_length)
+        except ValueError:
+            declared_size = None
+
+    async with _upload_semaphore:
+        record, stream_limit = await asyncio.to_thread(
+            _reserve_upload_slot,
+            db,
+            vault_id,
+            auth.quota_bytes,
+            declared_size,
+            encrypted_metadata,
+            metadata_iv,
+            content_iv,
+            wrapped_file_key,
+            wrap_iv,
+        )
+
         path = storage.path_for(vault_id, record.id)
         try:
             size = await storage.write_blob_streamed(path, blob, stream_limit, chunk_size=_READ_CHUNK)
         except ValueError:
-            db.rollback()
+            await asyncio.to_thread(_discard_upload, db, vault_id, stream_limit)
             raise HTTPException(
                 status_code=413,
                 detail=f"File exceeds allowed size ({stream_limit} bytes remaining under quota/limit)",
             )
+        except Exception:
+            await asyncio.to_thread(_discard_upload, db, vault_id, stream_limit)
+            raise
 
-        record.storage_path = path
-        record.size = size
-
-        db.commit()
-        db.refresh(record)
-        return record
+        return await asyncio.to_thread(_finalize_upload, db, record, path, size, vault_id, stream_limit)
 
 
 @app.get("/files", response_model=list[FileMetaResponse])
