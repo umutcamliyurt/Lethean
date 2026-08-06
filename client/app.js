@@ -123,6 +123,11 @@ function fileKind(mime) {
   return 'other';
 }
 
+function decryptedSize(record, meta) {
+  if (typeof meta?.unpaddedSize === 'number') return meta.unpaddedSize;
+  return record?.size ?? 0;
+}
+
 function formatBytes(n) {
   if (n < 1024) return `${n} B`;
   const units = ['KB', 'MB', 'GB', 'TB'];
@@ -664,7 +669,7 @@ function renderListRow(record) {
       <span class="file-row-text">${escapeHtml(meta.name)}</span>
     </span>
     <span class="file-row-type" role="cell">${escapeHtml(fileTypeLabel(meta))}</span>
-    <span class="file-row-size" role="cell">${formatBytes(record.size ?? 0)}</span>
+    <span class="file-row-size" role="cell">${formatBytes(decryptedSize(record, meta))}</span>
     <span class="file-row-actions" role="cell">
       <button type="button" class="btn-icon file-download-btn" aria-label="Download ${escapeHtml(meta.name)}" title="Download">${icon('download')}</button>
       <button type="button" class="btn-icon file-delete-btn" aria-label="Delete ${escapeHtml(meta.name)}" title="Delete">${icon('trash')}</button>
@@ -712,8 +717,7 @@ const MOBILE_INLINE_VIDEO_LIMIT_BYTES = 150 * 1024 * 1024;
 function isUnsafeToPreviewInline(record, meta) {
   return isCoarsePointerDevice
     && fileKind(meta?.mime) === 'video'
-    && typeof record?.size === 'number'
-    && record.size > MOBILE_INLINE_VIDEO_LIMIT_BYTES;
+    && decryptedSize(record, meta) > MOBILE_INLINE_VIDEO_LIMIT_BYTES;
 }
 
 function mediaRecords() {
@@ -742,7 +746,7 @@ async function openTile(fileId) {
       <div class="lightbox-generic">
         ${icon(kind === 'video' ? 'video' : 'file')}
         <p style="margin:12px 0 0;color:var(--text);font-family:var(--font-mono)">${escapeHtml(meta.name)}</p>
-        <p style="font-size:0.8rem;margin-top:6px">${formatBytes(record.size)} \u00b7 encrypted</p>
+        <p style="font-size:0.8rem;margin-top:6px">${formatBytes(decryptedSize(record, meta))} \u00b7 encrypted</p>
         ${skipInlinePreview ? `<p style="font-size:0.78rem;margin-top:10px;color:var(--dim)">This video is large \u2014 previewing it in-browser on a phone can crash the tab. Download it to watch in your device's player instead.</p>` : ''}
         <button class="btn-primary" id="lightbox-download" style="margin-top:18px">Decrypt &amp; download</button>
       </div>
