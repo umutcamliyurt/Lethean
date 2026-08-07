@@ -659,14 +659,16 @@ function renderTile(record) {
 
   tile.innerHTML = `
     <div class="box-menu">
-      <button type="button" class="btn-icon delete-btn" aria-label="Delete ${escapeHtml(meta.name)}" title="Delete">${icon('trash')}</button>
+      <button type="button" class="btn-icon delete-btn" title="Delete">${icon('trash')}</button>
     </div>
     <div class="box-body">
-      ${kind === 'image' ? `<div class="box-icon">${icon('image')}</div><div class="box-name">${escapeHtml(meta.name)}</div>`
-        : kind === 'video' ? `<div class="box-play">${icon('play')}</div><div class="box-icon">${icon('video')}</div><div class="box-name">${escapeHtml(meta.name)}</div>`
-        : `<div class="box-icon">${icon('file')}</div><div class="box-name">${escapeHtml(meta.name)}</div>`}
+      ${kind === 'image' ? `<div class="box-icon">${icon('image')}</div><div class="box-name"></div>`
+        : kind === 'video' ? `<div class="box-play">${icon('play')}</div><div class="box-icon">${icon('video')}</div><div class="box-name"></div>`
+        : `<div class="box-icon">${icon('file')}</div><div class="box-name"></div>`}
     </div>
   `;
+  tile.querySelector('.box-name').textContent = meta.name;
+  tile.querySelector('.delete-btn').setAttribute('aria-label', `Delete ${meta.name}`);
 
   tile.addEventListener('click', (e) => {
     if (e.target.closest('.delete-btn')) return;
@@ -721,15 +723,19 @@ function renderListRow(record) {
   row.innerHTML = `
     <span class="file-row-name" role="cell">
       <span class="file-row-icon">${icon(kind === 'image' ? 'image' : kind === 'video' ? 'video' : 'file')}</span>
-      <span class="file-row-text">${escapeHtml(meta.name)}</span>
+      <span class="file-row-text"></span>
     </span>
-    <span class="file-row-type" role="cell">${escapeHtml(fileTypeLabel(meta))}</span>
+    <span class="file-row-type" role="cell"></span>
     <span class="file-row-size" role="cell">${formatBytes(decryptedSize(record, meta))}</span>
     <span class="file-row-actions" role="cell">
-      <button type="button" class="btn-icon file-download-btn" aria-label="Download ${escapeHtml(meta.name)}" title="Download">${icon('download')}</button>
-      <button type="button" class="btn-icon file-delete-btn" aria-label="Delete ${escapeHtml(meta.name)}" title="Delete">${icon('trash')}</button>
+      <button type="button" class="btn-icon file-download-btn" title="Download">${icon('download')}</button>
+      <button type="button" class="btn-icon file-delete-btn" title="Delete">${icon('trash')}</button>
     </span>
   `;
+  row.querySelector('.file-row-text').textContent = meta.name;
+  row.querySelector('.file-row-type').textContent = fileTypeLabel(meta);
+  row.querySelector('.file-download-btn').setAttribute('aria-label', `Download ${meta.name}`);
+  row.querySelector('.file-delete-btn').setAttribute('aria-label', `Delete ${meta.name}`);
 
   row.addEventListener('click', (e) => {
     if (e.target.closest('.file-download-btn') || e.target.closest('.file-delete-btn')) return;
@@ -1126,11 +1132,12 @@ function createUploadRow(file) {
   const row = document.createElement('div');
   row.className = 'upload-row';
   row.innerHTML = `
-    <span class="name">${escapeHtml(file.name)}</span>
+    <span class="name"></span>
     <span class="status">Queued\u2026</span>
     <button type="button" class="btn-icon upload-cancel hidden" aria-label="Cancel upload" title="Cancel upload">${icon('close')}</button>
     <div class="bar"><div class="bar-fill"></div></div>
   `;
+  row.querySelector('.name').textContent = file.name;
   const rowItem = { el: row };
   uploadRows.push(rowItem);
   syncUploadQueueView();
