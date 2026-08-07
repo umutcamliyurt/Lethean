@@ -12,7 +12,7 @@ Lethean is a zero-knowledge encrypted storage app with no accounts, no email. Pa
 - AES-256-GCM for client-side encryption
 - Ciphertext padding to hide file size metadata
 - Argon2id for key derivation with per-vault salt
-- Minimum 12-character password, checked against a common-password/dictionary list
+- Minimum 12-character password, checked against a common-password list locally
 - Duress code for wiping the vault under coercion
 
 ## How It Works
