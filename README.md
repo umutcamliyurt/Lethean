@@ -11,17 +11,20 @@ Lethean is a zero-knowledge encrypted storage app with no accounts, no email. Pa
 - No user account required
 - AES-256-GCM for client-side encryption
 - Ciphertext padding to hide file size metadata
-- Argon2id for key derivation
+- Argon2id for key derivation with per-vault salt
+- Minimum 12-character password, checked against a common-password/dictionary list
 - Duress code for wiping the vault under coercion
 
 ## How It Works
 
-A password is run through Argon2id to derive a `masterKey`, which produces:
+A password, together with a salt, is run through Argon2id to derive a `masterKey`, which produces:
 
 | Key | Purpose |
 |---|---|
 | `vaultId` | Sent to the server as a bearer capability on every request. Never validated against a database, possession of it is access, the same trust model as an unguessable share link. |
 | `wrappingKey` | Stays in the browser and wraps each file's content key. |
+
+The salt isn't secret by itself, but it's required together with the password to re-derive the same `masterKey`, so two vaults that happen to share a password don't also share a salt.
 
 Because `vaultId` is only derived after the Argon2id step, an attacker with the server's storage must pay full Argon2id cost per guess, there's no cheaper path.
 

@@ -9,6 +9,7 @@ export const passwordInput = $('password');
 export const confirmField = $('confirm-field');
 export const passwordConfirmInput = $('password-confirm');
 export const accessTokenInput = $('access-token');
+export const saltInput = $('salt');
 
 export const depositSlot = $('deposit-slot');
 export const chooseFilesBtn = $('choose-files-btn');
@@ -28,6 +29,7 @@ export const usagePill = $('usage-pill');
 export const vaultFingerprint = $('vault-fingerprint');
 export const logoutBtn = $('logout-btn');
 export const tokenBtn = $('token-btn');
+export const saltBtn = $('salt-btn');
 export const duressBtn = $('duress-btn');
 export const lightbox = $('lightbox');
 export const toasts = $('toasts');

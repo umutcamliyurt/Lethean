@@ -33,11 +33,16 @@
     </div>
 
     <h1 id="auth-heading">Unlock</h1>
-    <p class="subtitle" id="auth-subtitle">No accounts. Your passphrase is the only key.</p>
+    <p class="subtitle" id="auth-subtitle">No accounts. Your password is the only key.</p>
 
     <form id="auth-form">
       <div class="field">
-        <label for="password">Passphrase</label>
+        <label for="salt">Salt <span class="label-hint">(leave blank to generate one)</span></label>
+        <input type="text" id="salt" autocomplete="off" spellcheck="false" maxlength="64">
+      </div>
+
+      <div class="field">
+        <label for="password">Password</label>
         <input type="password" id="password" autocomplete="current-password" required maxlength="256" aria-describedby="password-strength-hint">
       </div>
 
@@ -51,7 +56,7 @@
           <div class="strength-segment"></div>
         </div>
         <p class="field-hint" id="password-strength-hint" role="status" aria-live="polite">
-          Use 12+ characters, ideally a random passphrase of several unrelated words.
+          Use 12+ characters, ideally a random password of several unrelated words.
         </p>
       </div>
 
@@ -80,7 +85,8 @@
     </div>
     <div class="topbar-right">
       <span class="usage-pill" id="usage-pill">— items ·,</span>
-      <span class="account-email" id="vault-fingerprint" title="Derived from your passphrase, confirms you're in the same vault"></span>
+      <span class="account-email" id="vault-fingerprint" title="Derived from your password, confirms you're in the same vault"></span>
+      <button id="salt-btn" title="View your salt">Salt</button>
       <button id="token-btn" title="View or update your access token">Access Token</button>
       <button id="duress-btn" title="Configure a duress code">Duress Code</button>
       <button id="logout-btn">Lock</button>

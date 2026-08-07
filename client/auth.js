@@ -2,12 +2,13 @@ import * as C from './crypto.js';
 import * as api from './api.js';
 import {
   authScreen, appScreen, authForm, authSubmit, authStatus, passwordInput,
-  confirmField, passwordConfirmInput, accessTokenInput, vaultFingerprint,
-  logoutBtn, tokenBtn, duressBtn,
+  confirmField, passwordConfirmInput, accessTokenInput, saltInput, vaultFingerprint,
+  logoutBtn, tokenBtn, saltBtn, duressBtn,
 } from './dom.js';
 import { fileKeyCache, metaCache, getWrappingKeyRaw, setWrappingKeyRaw, getCurrentVaultId, setCurrentVaultId } from './state.js';
 import {
   isSetupComplete, markSetupComplete, getStoredAccessToken, setStoredAccessToken,
+  getStoredSalt, setStoredSalt,
   loadDuressConfig, saveDuressConfig, resetDuressConfig,
 } from './storage.js';
 import { escapeHtml, showToast } from './utils.js';
@@ -15,6 +16,9 @@ import { showLightbox, closeLightbox } from './lightbox.js';
 import { refreshGallery, clearRenderedGrid, resetRecords } from './gallery.js';
 
 accessTokenInput.value = getStoredAccessToken();
+saltInput.value = getStoredSalt();
+
+let currentsalt = null;
 
 function setAuthStatus(message, { error = false, spinning = false } = {}) {
   authStatus.classList.toggle('error', error);
@@ -35,13 +39,13 @@ let pendingConfirmation = null;
 function configureAuthScreenForRun() {
   if (isFirstRun) {
     document.getElementById('auth-heading').textContent = 'Set up';
-    document.getElementById('auth-subtitle').textContent = 'Choose a passphrase for this vault.';
+    document.getElementById('auth-subtitle').textContent = 'Choose a password for this vault.';
     confirmField.classList.remove('hidden');
     passwordConfirmInput.required = true;
-    confirmField.querySelector('label').textContent = 'Confirm passphrase';
+    confirmField.querySelector('label').textContent = 'Confirm password';
   } else {
     document.getElementById('auth-heading').textContent = 'Unlock';
-    document.getElementById('auth-subtitle').textContent = "No accounts. Your passphrase is the only key.";
+    document.getElementById('auth-subtitle').textContent = "No accounts. Your password is the only key.";
     confirmField.querySelector('label').textContent = 'Empty vault, retype to confirm';
   }
 }
@@ -59,48 +63,92 @@ authForm.addEventListener('submit', async (e) => {
         setAuthStatus("Those don't match.", { error: true });
         return;
       }
-      const { valid, errors } = C.validatePasswordStrength(password);
+      const { valid, errors } = await C.validatePasswordStrength(password);
       if (!valid) {
-        setAuthStatus(errors[0] || 'Passphrase is too weak.', { error: true });
+        setAuthStatus(errors[0] || 'Password is too weak.', { error: true });
         return;
       }
+      let salt = saltInput.value.trim();
+      let generatedsalt = null;
+      if (!salt) {
+        salt = C.generateSalt();
+        generatedsalt = salt;
+      }
+
       setAuthStatus('Deriving key\u2026', { spinning: true });
-      const { vaultId, wrappingKeyRaw: wk } = await C.unlockVault(password);
-      await checkDuressAndMaybeWipe(password, wk);
+      const { vaultId, wrappingKeyRaw: wk } = await C.unlockVault(password, salt);
+      await checkDuressAndMaybeWipe(password);
       markSetupComplete();
+      saltInput.value = salt;
+      setStoredSalt(salt);
+      currentsalt = salt;
       isFirstRun = false;
       configureAuthScreenForRun();
+
+      if (generatedsalt) {
+        setAuthStatus('');
+        await showGeneratedSalt(generatedsalt);
+      }
+
       await finishUnlock(vaultId, wk);
       return;
     }
 
     if (pendingConfirmation) {
       if (passwordConfirmInput.value !== pendingConfirmation.password) {
-        setAuthStatus("Those don't match. Try entering your passphrase again.", { error: true });
+        setAuthStatus("Those don't match. Try entering your password again.", { error: true });
         passwordConfirmInput.value = '';
         return;
       }
+      currentsalt = pendingConfirmation.salt;
+      saltInput.value = pendingConfirmation.salt;
+      setStoredSalt(pendingConfirmation.salt);
+
+      if (pendingConfirmation.generatedsalt) {
+        setAuthStatus('');
+        await showGeneratedSalt(pendingConfirmation.generatedsalt);
+      }
+
       await finishUnlock(pendingConfirmation.vaultId, pendingConfirmation.wrappingKeyRaw);
       return;
     }
 
+    let salt = saltInput.value.trim();
     setAuthStatus('Deriving key\u2026', { spinning: true });
-    const { vaultId, wrappingKeyRaw: wk } = await C.unlockVault(password);
-    await checkDuressAndMaybeWipe(password, wk);
+    let { vaultId, wrappingKeyRaw: wk } = await C.unlockVault(password, salt);
+    await checkDuressAndMaybeWipe(password);
 
     setAuthStatus('Checking vault\u2026', { spinning: true });
     api.setVaultId(vaultId);
-    const usage = await api.getUsage();
+    let usage = await api.getUsage();
+
+    let generatedsalt = null;
+    if (usage.file_count === 0 && !salt) {
+      salt = C.generateSalt();
+      generatedsalt = salt;
+      setAuthStatus('Deriving key\u2026', { spinning: true });
+      ({ vaultId, wrappingKeyRaw: wk } = await C.unlockVault(password, salt));
+      await checkDuressAndMaybeWipe(password);
+      api.setVaultId(vaultId);
+      usage = await api.getUsage();
+    }
 
     if (usage.file_count === 0) {
-      pendingConfirmation = { vaultId, wrappingKeyRaw: wk, password };
+      const { valid, errors } = await C.validatePasswordStrength(password);
+      if (!valid) {
+        setAuthStatus(errors[0] || 'Password is too weak.', { error: true });
+        return;
+      }
+      pendingConfirmation = { vaultId, wrappingKeyRaw: wk, password, salt, generatedsalt };
       confirmField.classList.remove('hidden');
       passwordConfirmInput.required = true;
       passwordConfirmInput.focus();
-      setAuthStatus('Empty vault. Confirm your passphrase to continue.');
+      setAuthStatus('Empty vault. Confirm your password to continue.');
       return;
     }
 
+    currentsalt = salt;
+    setStoredSalt(salt);
     await finishUnlock(vaultId, wk);
   } catch (err) {
     setAuthStatus("Couldn't reach the vault. " + err.message, { error: true });
@@ -109,12 +157,45 @@ authForm.addEventListener('submit', async (e) => {
   }
 });
 
-async function checkDuressAndMaybeWipe(input, _wk) {
+async function checkDuressAndMaybeWipe(input) {
   const cfg = loadDuressConfig();
   const realVaultId = await C.checkDuress(input, cfg);
 
   const target = realVaultId || C.randomVaultIdShaped();
   await api.sendShredSignal(target).catch(() => {});
+}
+
+function showGeneratedSalt(salt) {
+  return new Promise((resolve) => {
+    showLightbox(`
+      <div class="settings-panel">
+        <h2>Save your salt</h2>
+        <p class="subtitle">
+          You left this blank, so one was generated for you. It's not secret,
+          but it's required together with your password to unlock this vault.
+        </p>
+        <div class="salt-display" id="generated-salt-value">${escapeHtml(salt)}</div>
+        <div class="panel-actions">
+          <button type="button" id="copy-salt">Copy</button>
+          <button type="button" class="btn-primary" id="ack-salt">Continue</button>
+        </div>
+      </div>
+    `);
+
+    document.getElementById('copy-salt').addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(salt);
+        showToast('Salt copied.');
+      } catch {
+        showToast('Could not copy automatically, please select and copy it manually.', 'error');
+      }
+    });
+
+    document.getElementById('ack-salt').addEventListener('click', () => {
+      closeLightbox();
+      resolve();
+    });
+  });
 }
 
 async function finishUnlock(vaultId, wk) {
@@ -168,6 +249,39 @@ function leaveApp() {
 logoutBtn.addEventListener('click', leaveApp);
 
 tokenBtn.addEventListener('click', openTokenPanel);
+
+saltBtn.addEventListener('click', opensaltPanel);
+
+function opensaltPanel() {
+  const current = currentsalt || getStoredSalt();
+
+  showLightbox(`
+    <div class="settings-panel">
+      <h2>Salt</h2>
+      <p class="subtitle">
+        Used together with your password to derive this vault's key.
+      </p>
+      <div class="salt-display" id="salt-view-value">
+        ${current ? escapeHtml(current) : 'None, this vault was set up without one.'}
+      </div>
+      <div class="panel-actions">
+        ${current ? '<button type="button" id="copy-salt-view">Copy</button>' : ''}
+      </div>
+    </div>
+  `);
+
+  const copyBtn = document.getElementById('copy-salt-view');
+  if (copyBtn) {
+    copyBtn.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(current);
+        showToast('Salt copied.');
+      } catch {
+        showToast('Could not copy automatically, please select and copy it manually.', 'error');
+      }
+    });
+  }
+}
 
 function openTokenPanel() {
   const current = getStoredAccessToken();
@@ -225,18 +339,18 @@ function openDuressPanel() {
     <div class="settings-panel">
       <h2>Duress Code</h2>
       <p class="subtitle">
-        A second passphrase. Typing it here instead of your real one erases
+        A second password. Typing it here instead of your real one erases
         this vault's files and opens an empty decoy vault, indistinguishable
         from a real unlock. Choose something you won't mix up with your real
-        passphrase. It must meet the same strength requirements as your
-        vault passphrase.
+        password. It must meet the same strength requirements as your
+        vault password.
       </p>
 
       <form id="duress-form">
         <div class="field">
-          <label for="duress-pin">Duress passphrase</label>
+          <label for="duress-pin">Duress password</label>
           <input type="password" id="duress-pin" autocomplete="new-password" minlength="12" maxlength="256">
-          <p class="field-hint" id="duress-pin-hint">Use 12+ characters, ideally a random passphrase of several unrelated words.</p>
+          <p class="field-hint" id="duress-pin-hint">Use 12+ characters, ideally a random password of several unrelated words.</p>
         </div>
         <div class="field">
           <label for="duress-pin-confirm">Confirm</label>
@@ -255,14 +369,23 @@ function openDuressPanel() {
     const pin = document.getElementById('duress-pin').value;
     const pinConfirm = document.getElementById('duress-pin-confirm').value;
 
-    const { valid, errors } = C.validatePasswordStrength(pin);
+    const { valid, errors } = await C.validatePasswordStrength(pin);
     if (!valid) {
-      showToast(errors[0] || 'Duress passphrase is too weak.', 'error');
+      showToast(errors[0] || 'Duress password is too weak.', 'error');
       document.getElementById('duress-pin-hint').textContent = errors[0];
       document.getElementById('duress-pin-hint').classList.add('error');
       return;
     }
-    if (pin !== pinConfirm) { showToast("Passphrases don't match.", 'error'); return; }
+    if (pin !== pinConfirm) { showToast("Passwords don't match.", 'error'); return; }
+
+    const { vaultId: pinVaultId } = await C.unlockVault(pin, currentsalt);
+    if (pinVaultId === getCurrentVaultId()) {
+      const hint = document.getElementById('duress-pin-hint');
+      showToast('Duress password must be different from your real password.', 'error');
+      hint.textContent = 'This matches your real password, choose a different one.';
+      hint.classList.add('error');
+      return;
+    }
 
     const cfg = await C.setupDuress(pin, getCurrentVaultId());
     saveDuressConfig(cfg);

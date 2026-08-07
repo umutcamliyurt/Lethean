@@ -3,6 +3,7 @@ import * as C from './crypto.js';
 const LS_SETUP_KEY = 'vault.setupComplete';
 const LS_DURESS_KEY = 'vault.duress';
 const LS_ACCESS_TOKEN_KEY = 'vault.accessToken';
+const LS_SALT_KEY = 'vault.salt';
 const LS_VIEW_MODE_KEY = 'vault.viewMode';
 
 export function isSetupComplete() {
@@ -18,6 +19,14 @@ export function getStoredAccessToken() {
 export function setStoredAccessToken(token) {
   if (token) localStorage.setItem(LS_ACCESS_TOKEN_KEY, token);
   else localStorage.removeItem(LS_ACCESS_TOKEN_KEY);
+}
+
+export function getStoredSalt() {
+  return localStorage.getItem(LS_SALT_KEY) || '';
+}
+export function setStoredSalt(salt) {
+  if (salt) localStorage.setItem(LS_SALT_KEY, salt);
+  else localStorage.removeItem(LS_SALT_KEY);
 }
 
 export function loadDuressConfig() {

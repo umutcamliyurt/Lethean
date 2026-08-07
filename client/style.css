@@ -652,6 +652,19 @@ main.vault {
   color: var(--dim);
   margin-bottom: 16px;
 }
+.settings-panel .salt-display {
+  display: block;
+  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 1.5rem;
+  font-weight: 600;
+  color: var(--text);
+  text-align: center;
+  letter-spacing: 0.02em;
+  word-break: break-all;
+  user-select: all;
+  margin-bottom: 16px;
+}
 
 #toasts {
   position: fixed;

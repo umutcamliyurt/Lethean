@@ -1,4 +1,5 @@
 import { argon2id } from './vendor/hash-wasm.esm.min.js';
+import { AhoCorasick } from './ahocorasick.js';
 
 const ARGON2_PARAMS = {
   parallelism: 1,
@@ -95,13 +96,17 @@ function stripPadding(bytes, realLength) {
 }
 
 
-async function deriveSalt(password) {
-  const bytes = await crypto.subtle.digest('SHA-256', utf8('e2ee-vault|salt|v1|' + password));
+async function deriveSalt(Salt) {
+  const bytes = await crypto.subtle.digest('SHA-256', utf8('e2ee-vault|salt|v1|' + (Salt || '')));
   return new Uint8Array(bytes);
 }
 
-export async function deriveMasterKey(password) {
-  const salt = await deriveSalt(password);
+export function generateSalt() {
+  return toHex(randomBytes(10));
+}
+
+export async function deriveMasterKey(password, Salt) {
+  const salt = await deriveSalt(Salt);
   const hash = await argon2id({ password, salt, ...ARGON2_PARAMS });
   return new Uint8Array(hash);
 }
@@ -126,8 +131,8 @@ export async function deriveWrappingKey(masterKeyBytes) {
   return hkdf(masterKeyBytes, 'e2ee-vault|wrap|v1', 32);
 }
 
-export async function unlockVault(password) {
-  const masterKey = await deriveMasterKey(password);
+export async function unlockVault(password, Salt) {
+  const masterKey = await deriveMasterKey(password, Salt);
   const [vaultId, wrappingKeyRaw] = await Promise.all([
     deriveVaultId(masterKey),
     deriveWrappingKey(masterKey),
@@ -299,6 +304,99 @@ export async function checkDuress(input, duressConfig) {
   }
 }
 
+function memoizeWithRetry(factory) {
+  let cached = null;
+  return () => {
+    if (!cached) {
+      cached = factory().catch((err) => {
+        cached = null;
+        console.warn('[crypto] common-password dictionary unavailable, retrying next call:', err);
+        throw err;
+      });
+    }
+    return cached;
+  };
+}
+
+const loadCommonPasswordsRaw = memoizeWithRetry(async () => {
+  const res = await fetch(new URL('./common_passwords.txt', import.meta.url));
+  if (!res.ok) throw new Error(`Failed to load common-password list: HTTP ${res.status}`);
+  return res.text();
+});
+
+function parseWordList(raw) {
+  if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
+  return raw
+    .split(/\r\n|\r|\n/)
+    .map((w) => w.trim())
+    .filter(Boolean);
+}
+
+const getCommonPasswordSet = memoizeWithRetry(async () => {
+  const raw = await loadCommonPasswordsRaw();
+  return new Set(parseWordList(raw));
+});
+
+const LEET_MAP = { '0': 'o', '1': 'i', '3': 'e', '4': 'a', '5': 's', '7': 't', '@': 'a', '$': 's' };
+function deleetify(str) {
+  let out = '';
+  for (const ch of str) out += LEET_MAP[ch] ?? ch;
+  return out;
+}
+
+async function isCommonPassword(password) {
+  const dict = await getCommonPasswordSet();
+  const lower = password.toLowerCase();
+
+  const candidates = new Set([lower]);
+  const stripped = lower.replace(/[\d\W_]+$/u, '');
+  if (stripped) candidates.add(stripped);
+  const deleeted = deleetify(lower);
+  candidates.add(deleeted);
+  const deleetedStripped = deleetify(stripped);
+  if (deleetedStripped) candidates.add(deleetedStripped);
+
+  for (const candidate of candidates) {
+    if (dict.has(candidate)) return true;
+  }
+  return false;
+}
+
+const getDictionaryMatcher = memoizeWithRetry(async () => {
+  const raw = await loadCommonPasswordsRaw();
+  const words = parseWordList(raw).filter((w) => w.length >= 5 && w.length <= 20 && /^[a-z]+$/.test(w));
+  return new AhoCorasick(words);
+});
+
+if (typeof requestIdleCallback === 'function') {
+  requestIdleCallback(() => { getDictionaryMatcher().catch(() => {}); });
+} else if (typeof window !== 'undefined') {
+  setTimeout(() => { getDictionaryMatcher().catch(() => {}); }, 0);
+}
+
+const DICTIONARY_COVERAGE_REJECT_RATIO = 0.6;
+const DICTIONARY_COVERAGE_LENIENT_WORD_COUNT = 5;
+const DICTIONARY_COVERAGE_LENIENT_MIN_LENGTH = 30;
+
+async function hasSignificantDictionaryCoverage(password) {
+  const matcher = await getDictionaryMatcher();
+  const lower = password.toLowerCase();
+  const deleeted = deleetify(lower);
+
+  const plain = matcher.analyze(lower);
+  const unleeted = deleeted === lower ? plain : matcher.analyze(deleeted);
+  const { coverageRatio, wordCount } = plain.coverageRatio >= unleeted.coverageRatio ? plain : unleeted;
+
+  if (coverageRatio < DICTIONARY_COVERAGE_REJECT_RATIO) return false;
+  if (
+    wordCount >= DICTIONARY_COVERAGE_LENIENT_WORD_COUNT &&
+    password.length >= DICTIONARY_COVERAGE_LENIENT_MIN_LENGTH
+  ) {
+    return false;
+  }
+  return true;
+}
+
 function hasSequentialRun(password, runLength = 5) {
   const lower = password.toLowerCase();
   const sequences = ['abcdefghijklmnopqrstuvwxyz', '0123456789', 'qwertyuiop', 'asdfghjkl', 'zxcvbnm'];
@@ -322,7 +420,7 @@ function isMostlyRepeatedChars(password) {
 
 const PASSWORD_STRENGTH_CHECK_LIMIT = 1024;
 
-export function validatePasswordStrength(password) {
+export async function validatePasswordStrength(password) {
   const errors = [];
   password = password || '';
   const checkSlice = password.length > PASSWORD_STRENGTH_CHECK_LIMIT
@@ -330,29 +428,40 @@ export function validatePasswordStrength(password) {
     : password;
 
   if (password.length < 12) {
-    errors.push('Use at least 12 characters (longer passphrases are safer than short complex ones).');
+    errors.push('Use at least 12 characters (longer passwords are safer than short complex ones).');
   }
   if (password.length > 256) {
-    errors.push('Passphrase is unreasonably long (max 256 characters).');
+    errors.push('Password is unreasonably long (max 256 characters).');
   }
 
   const classes = [/[a-z]/, /[A-Z]/, /[0-9]/, /[^A-Za-z0-9]/].filter((re) => re.test(password)).length;
   if (password.length < 20 && classes < 3) {
-    errors.push('Mix at least 3 of: lowercase, uppercase, numbers, symbols — or use a longer passphrase (20+ characters).');
+    errors.push('Mix at least 3 of: lowercase, uppercase, numbers, symbols — or use a longer password (20+ characters).');
   }
   if (hasSequentialRun(checkSlice)) {
     errors.push('Avoid simple sequences like "abcdef" or "12345".');
   }
   if (isMostlyRepeatedChars(checkSlice)) {
-    errors.push('Avoid passphrases made mostly of one repeated character.');
+    errors.push('Avoid passwords made mostly of one repeated character.');
+  }
+
+  try {
+    if (await isCommonPassword(checkSlice)) {
+      errors.push('This password (or a close variant of it) is known to be common or previously breached. Choose something less predictable.');
+    } else if (await hasSignificantDictionaryCoverage(checkSlice)) {
+      errors.push('This password is mostly made up of common dictionary words strung together, which is easy to guess. Add more, less predictable words, or mix in numbers/symbols.');
+    }
+  } catch (err) {
+    console.error('[crypto] Could not check password against breach dictionary; rejecting until this can be verified.', err);
+    errors.push("Couldn't verify this password against the breach dictionary (network or deployment issue). Try again in a moment.");
   }
 
   let score = 0;
-  if (password.length >= 12) score++;
   if (password.length >= 16) score++;
-  if (password.length >= 20 || classes >= 3) score++;
-  if (password.length >= 24 && classes >= 3) score++;
-  if (errors.some((e) => e.includes('common') || e.includes('sequence') || e.includes('repeated'))) {
+  if (password.length >= 20) score++;
+  if (password.length >= 24 || classes >= 3) score++;
+  if (password.length >= 28 && classes >= 3) score++;
+  if (errors.some((e) => e.includes('common') || e.includes('sequence') || e.includes('repeated') || e.includes('breach') || e.includes('dictionary words'))) {
     score = Math.min(score, 1);
   }
 
