@@ -156,6 +156,20 @@ function previewKind(meta) {
   return null;
 }
 
+const PDF_MAGIC = [0x25, 0x50, 0x44, 0x46, 0x2d];
+
+function looksLikePdf(bytes) {
+  const scanLen = Math.min(bytes.length, 1024);
+  for (let i = 0; i <= scanLen - PDF_MAGIC.length; i++) {
+    let match = true;
+    for (let j = 0; j < PDF_MAGIC.length; j++) {
+      if (bytes[i + j] !== PDF_MAGIC[j]) { match = false; break; }
+    }
+    if (match) return true;
+  }
+  return false;
+}
+
 function decryptedSize(record, meta) {
   if (typeof meta?.unpaddedSize === 'number') return meta.unpaddedSize;
   return record?.size ?? 0;
@@ -194,9 +208,12 @@ function icon(name) {
 }
 
 function escapeHtml(str) {
-  const div = document.createElement('div');
-  div.textContent = str;
-  return div.innerHTML;
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
 }
 
 function setAuthStatus(message, { error = false, spinning = false } = {}) {
@@ -840,11 +857,20 @@ async function openOtherPreview(record, meta, kind) {
       const blob = new Blob([bytes], { type: meta.mime || 'text/plain' });
       objectUrl = URL.createObjectURL(blob);
       objectUrlCache.set(record.id, objectUrl);
+    } else if (kind === 'pdf') {
+      const bytes = await getDecryptedBytes(record);
+      if (!looksLikePdf(bytes)) {
+        const err = new Error("This file is named/labeled as a PDF but its contents don't look like one, so it can't be previewed safely.");
+        err.unsafePdf = true;
+        throw err;
+      }
+      const blob = new Blob([bytes], { type: 'application/pdf' });
+      objectUrl = URL.createObjectURL(blob);
+      objectUrlCache.set(record.id, objectUrl);
+      inner = `<iframe src="${objectUrl}" id="lightbox-media" title="${escapeHtml(meta.name)}"></iframe>`;
     } else {
       objectUrl = await getDecryptedUrl(record);
-      inner = kind === 'pdf'
-        ? `<iframe src="${objectUrl}" id="lightbox-media" title="${escapeHtml(meta.name)}"></iframe>`
-        : `<audio src="${objectUrl}" controls autoplay id="lightbox-media"></audio>`;
+      inner = `<audio src="${objectUrl}" controls autoplay id="lightbox-media"></audio>`;
     }
 
     showLightbox(`
@@ -859,8 +885,21 @@ async function openOtherPreview(record, meta, kind) {
 
     $('lightbox-download').addEventListener('click', () => downloadAndSave(record, meta, objectUrl));
   } catch (err) {
-    showToast("Couldn't decrypt that file. " + err.message, 'error');
-    closeLightbox();
+    if (err.unsafePdf) {
+      showLightbox(`
+        <div class="lightbox-generic">
+          ${icon('file')}
+          <p class="lightbox-generic-name">${escapeHtml(meta.name)}</p>
+          <p class="lightbox-generic-size">${formatBytes(decryptedSize(record, meta))} \u00b7 encrypted</p>
+          <p class="lightbox-generic-note">${escapeHtml(err.message)}</p>
+          <button class="btn-primary lightbox-generic-btn" id="lightbox-download">Decrypt &amp; download</button>
+        </div>
+      `);
+      $('lightbox-download').addEventListener('click', () => downloadAndSave(record, meta));
+    } else {
+      showToast("Couldn't decrypt that file. " + err.message, 'error');
+      closeLightbox();
+    }
   } finally {
     tileEl?.classList.remove('decrypting', 'opening');
   }
