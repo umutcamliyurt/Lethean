@@ -96,6 +96,32 @@ function stripPadding(bytes, realLength) {
 }
 
 
+const METADATA_PADDING_BUCKETS = [64, 128, 256, 512, 1024, 2048, 4096];
+
+function paddedMetadataSize(n) {
+  for (const bucket of METADATA_PADDING_BUCKETS) {
+    if (n <= bucket) return bucket;
+  }
+  const step = METADATA_PADDING_BUCKETS[METADATA_PADDING_BUCKETS.length - 1];
+  return Math.ceil(n / step) * step;
+}
+
+function padMetadataBytes(bytes) {
+  const target = paddedMetadataSize(bytes.length + 4);
+  const out = new Uint8Array(target);
+  new DataView(out.buffer).setUint32(0, bytes.length, false);
+  out.set(bytes, 4);
+  return out;
+}
+
+function unpadMetadataBytes(bytes) {
+  if (bytes.length < 4) return bytes;
+  const len = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength).getUint32(0, false);
+  if (len > bytes.length - 4) return bytes.subarray(4);
+  return bytes.subarray(4, 4 + len);
+}
+
+
 async function deriveSalt(Salt) {
   const bytes = await crypto.subtle.digest('SHA-256', utf8('e2ee-vault|salt|v1|' + (Salt || '')));
   return new Uint8Array(bytes);
@@ -170,7 +196,7 @@ export async function unwrapFileKey(wrappingKeyRawBytes, wrappedFileKeyB64, wrap
 export async function decryptMetadata(fileKeyRawBytes, encryptedMetadataB64, metadataIvB64) {
   const fileKey = await importAesKey(fileKeyRawBytes, ['decrypt']);
   const bytes = await aesGcmDecrypt(fileKey, fromBase64(metadataIvB64), fromBase64(encryptedMetadataB64));
-  return JSON.parse(new TextDecoder().decode(bytes));
+  return JSON.parse(new TextDecoder().decode(unpadMetadataBytes(bytes)));
 }
 
 
@@ -203,12 +229,12 @@ export async function encryptFile(wrappingKeyRawBytes, file) {
   const unpaddedSize = contentBytes.length;
   const paddedContentBytes = padToBucket(contentBytes);
 
-  const metadataBytes = utf8(JSON.stringify({
+  const metadataBytes = padMetadataBytes(utf8(JSON.stringify({
     name: file.name,
     mime: file.type || 'application/octet-stream',
     compressed,
     unpaddedSize,
-  }));
+  })));
   const { iv: metadataIv, ciphertext: metadataCt } = await aesGcmEncrypt(fileKey, metadataBytes);
 
   const { iv: contentIv, ciphertext } = await aesGcmEncrypt(fileKey, paddedContentBytes);

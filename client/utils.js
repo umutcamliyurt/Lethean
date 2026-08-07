@@ -14,9 +14,15 @@ export const TEXT_PREVIEW_MIME_WHITELIST = new Set([
 export const TEXT_PREVIEW_EXTENSIONS = new Set([
   'txt', 'md', 'markdown', 'csv', 'tsv', 'json', 'xml', 'yaml', 'yml', 'ini', 'conf', 'cfg', 'log',
   'js', 'mjs', 'cjs', 'ts', 'tsx', 'jsx', 'py', 'rb', 'go', 'rs', 'java', 'c', 'h', 'cpp', 'hpp', 'cs',
-  'php', 'sh', 'bash', 'zsh', 'sql', 'html', 'htm', 'css', 'scss', 'less', 'vue', 'svelte', 'toml',
+  'php', 'sh', 'bash', 'zsh', 'sql', 'css', 'scss', 'less', 'vue', 'svelte', 'toml',
   'env', 'gitignore', 'gitattributes', 'dockerfile', 'makefile', 'gemfile', 'rakefile',
 ]);
+
+const TEXT_PREVIEW_MIME_BLOCKLIST = new Set([
+  'text/html',
+  'application/xhtml+xml',
+]);
+const TEXT_PREVIEW_EXTENSION_BLOCKLIST = new Set(['html', 'htm', 'xhtml', 'shtml', 'svg']);
 
 const PDF_MAGIC = [0x25, 0x50, 0x44, 0x46, 0x2d];
 
@@ -34,10 +40,12 @@ export function fileExtension(name) {
 
 export function previewKind(meta) {
   const mime = (meta?.mime || '').toLowerCase();
+  const ext = fileExtension(meta?.name);
   if (mime === 'application/pdf') return 'pdf';
   if (mime.startsWith('audio/')) return 'audio';
+  if (TEXT_PREVIEW_MIME_BLOCKLIST.has(mime) || TEXT_PREVIEW_EXTENSION_BLOCKLIST.has(ext)) return null;
   if (mime.startsWith('text/') || TEXT_PREVIEW_MIME_WHITELIST.has(mime)) return 'text';
-  if (TEXT_PREVIEW_EXTENSIONS.has(fileExtension(meta?.name))) return 'text';
+  if (TEXT_PREVIEW_EXTENSIONS.has(ext)) return 'text';
   return null;
 }
 

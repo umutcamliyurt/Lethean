@@ -1,7 +1,7 @@
 const isLocalDev = window.location.port === '5500';
 const BASE_URL = isLocalDev ? 'http://localhost:8000' : '';
 
-if (!isLocalDev && window.isSecureContext === false) {
+if (!isLocalDev && window.isSecureContext !== true) {
   throw new Error('This app must be served over HTTPS — refusing to run over an insecure connection.');
 }
 
@@ -92,12 +92,15 @@ export async function getUsage() {
   return res.json();
 }
 
+const MAX_TRUSTED_CONTENT_LENGTH = 2 * 1024 * 1024 * 1024;
+
 export async function downloadContent(fileId, onProgress) {
   assertSafeId(fileId);
   const res = await fetch(`${BASE_URL}/files/${fileId}/blob`, { headers: authHeaders(), credentials: 'omit' });
   await checkOk(res, 'Download failed');
 
-  const total = Number(res.headers.get('Content-Length')) || 0;
+  const declared = Number(res.headers.get('Content-Length')) || 0;
+  const total = declared > 0 && declared <= MAX_TRUSTED_CONTENT_LENGTH ? declared : 0;
   if (!onProgress || !total || !res.body) {
     return new Uint8Array(await res.arrayBuffer());
   }
@@ -108,6 +111,9 @@ export async function downloadContent(fileId, onProgress) {
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
+    if (received + value.length > total) {
+      throw new Error('Download failed: response exceeded declared length');
+    }
     out.set(value, received);
     received += value.length;
     onProgress(received / total);
