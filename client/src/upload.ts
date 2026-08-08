@@ -99,8 +99,8 @@ function createUploadRow(file: File): UploadRowItem {
 
 function setBarProgress(barEl: HTMLElement, fraction: number, { instant = false }: { instant?: boolean } = {}): void {
   const pct = `${Math.max(0, Math.min(100, Math.round(fraction * 100)))}%`;
-  barEl.getAnimations().forEach((a) => a.cancel());
-  barEl.animate([{ width: pct }], { duration: instant ? 1 : 200, fill: 'forwards', easing: 'ease' });
+  barEl.style.transition = instant ? 'none' : 'width 200ms ease';
+  barEl.style.width = pct;
 }
 
 const RETRY_BASE_MS = 1000;
