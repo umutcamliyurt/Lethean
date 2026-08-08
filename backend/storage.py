@@ -63,6 +63,24 @@ def read_blob(path: str) -> bytes:
         return f.read()
 
 
+async def stream_blob(path: str, chunk_size: int = 8 * 1024 * 1024):
+    fd = os.open(path, os.O_RDONLY)
+    if hasattr(os, "posix_fadvise") and hasattr(os, "POSIX_FADV_SEQUENTIAL"):
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_SEQUENTIAL)
+        except OSError:
+            pass
+    f = os.fdopen(fd, "rb")
+    try:
+        while True:
+            chunk = await asyncio.to_thread(f.read, chunk_size)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        await asyncio.to_thread(f.close)
+
+
 def shred_blob(path: str) -> None:
     try:
         length = os.path.getsize(path)

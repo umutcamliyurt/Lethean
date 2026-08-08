@@ -6,8 +6,8 @@ DATABASE_URL = "sqlite:///./lethean.db"
 engine = create_engine(
     DATABASE_URL,
     connect_args={"check_same_thread": False},
-    pool_size=20,
-    max_overflow=40,
+    pool_size=30,
+    max_overflow=60,
     pool_timeout=30,
 )
 

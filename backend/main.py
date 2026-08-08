@@ -29,16 +29,21 @@ Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="Lethean API", docs_url=None, redoc_url=None)
 
-_MAX_CONCURRENT_UPLOADS = int(os.environ.get("MAX_CONCURRENT_UPLOADS", "50"))
+_MAX_CONCURRENT_UPLOADS = int(os.environ.get("MAX_CONCURRENT_UPLOADS", "100"))
 _upload_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_UPLOADS)
+
+_MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "100"))
+_download_semaphore = asyncio.Semaphore(_MAX_CONCURRENT_DOWNLOADS)
+
+_THREAD_POOL_WORKERS = max(100, (_MAX_CONCURRENT_UPLOADS + _MAX_CONCURRENT_DOWNLOADS) * 2)
 
 
 @app.on_event("startup")
 async def _configure_thread_capacity():
     loop = asyncio.get_running_loop()
-    loop.set_default_executor(ThreadPoolExecutor(max_workers=_MAX_CONCURRENT_UPLOADS * 2))
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=_THREAD_POOL_WORKERS))
 
-    anyio.to_thread.current_default_thread_limiter().total_tokens = max(100, _MAX_CONCURRENT_UPLOADS * 2)
+    anyio.to_thread.current_default_thread_limiter().total_tokens = _THREAD_POOL_WORKERS
 
 
 _ALLOWED_ORIGINS = ["tauri://localhost", "https://tauri.localhost"]
@@ -58,7 +63,9 @@ else:
     )
 
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(5 * 1024**3)))
-_READ_CHUNK = 4 * 1024 * 1024
+_READ_CHUNK = 8 * 1024 * 1024
+
+_DEFAULT_LIST_LIMIT = 1000
 
 _IV_MAX_LEN = 64
 _WRAPPED_KEY_MAX_LEN = 4096
@@ -67,7 +74,7 @@ _ENCRYPTED_METADATA_MAX_LEN = 65536
 _MAX_REQUEST_BYTES = MAX_UPLOAD_BYTES + _ENCRYPTED_METADATA_MAX_LEN + _WRAPPED_KEY_MAX_LEN + (4 * _IV_MAX_LEN) + (64 * 1024)
 
 _RATE_LIMIT_WINDOW_SECONDS = 60
-_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "1200"))
+_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("RATE_LIMIT_PER_MINUTE", "3000"))
 _rate_limit_lock = threading.Lock()
 _rate_limit_hits: dict[str, deque] = defaultdict(deque)
 _rate_limit_last_seen: dict[str, float] = {}
@@ -285,14 +292,15 @@ def list_files(
     if limit is not None and not (1 <= limit <= 500):
         raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
 
+    effective_limit = limit if limit is not None else _DEFAULT_LIST_LIMIT
+
     query = (
         db.query(EncryptedFile)
         .filter(EncryptedFile.vault_id == vault_id)
         .order_by(EncryptedFile.created_at.desc(), EncryptedFile.id.asc())
         .offset(offset)
+        .limit(effective_limit)
     )
-    if limit is not None:
-        query = query.limit(limit)
     return query.all()
 
 
@@ -310,24 +318,23 @@ def get_file_meta(file_id: str, db: Session = Depends(get_db), vault_id: str = D
 
 
 @app.get("/files/{file_id}/blob")
-def get_file_blob(file_id: str, db: Session = Depends(get_db), vault_id: str = Depends(get_vault_id)):
+async def get_file_blob(file_id: str, db: Session = Depends(get_db), vault_id: str = Depends(get_vault_id)):
     record = _get_owned_file(db, file_id, vault_id)
+    storage_path = record.storage_path
+    size = record.size
 
-    def _iter_file(path: str, chunk_size: int = _READ_CHUNK):
-        with open(path, "rb") as f:
-            while True:
-                chunk = f.read(chunk_size)
-                if not chunk:
-                    break
+    async def _bounded_stream():
+        async with _download_semaphore:
+            async for chunk in storage.stream_blob(storage_path, chunk_size=_READ_CHUNK):
                 yield chunk
 
     return StreamingResponse(
-        _iter_file(record.storage_path),
+        _bounded_stream(),
         media_type="application/octet-stream",
         headers={
             "X-Content-Type-Options": "nosniff",
             "Content-Disposition": "attachment",
-            "Content-Length": str(record.size),
+            "Content-Length": str(size),
         },
     )
 
