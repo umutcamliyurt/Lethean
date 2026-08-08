@@ -1,0 +1,5 @@
+{
+  "imports": {
+    "hash-wasm": "./vendor/hash-wasm.esm.min.js"
+  }
+}

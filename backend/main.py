@@ -375,6 +375,9 @@ def _get_owned_file(db: Session, file_id: str, vault_id: str) -> EncryptedFile:
     return record
 
 
-_client_dir = os.path.join(os.path.dirname(__file__), "..", "client")
+_client_dir = os.environ.get(
+    "CLIENT_DIST_DIR",
+    os.path.join(os.path.dirname(__file__), "..", "client", "dist"),
+)
 if os.path.isdir(_client_dir):
     app.mount("/", StaticFiles(directory=_client_dir, html=True), name="client")

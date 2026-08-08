@@ -1,0 +1,23 @@
+{
+  "name": "lethean-ts",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "clean": "rm -rf dist",
+    "prebuild": "npm run clean",
+    "build": "tsc -p tsconfig.json && npm run fix-imports && npm run copy-assets",
+    "watch": "tsc -p tsconfig.json --watch",
+    "fix-imports": "sed -i.bak \"s#from 'hash-wasm'#from './vendor/hash-wasm.esm.min.js'#\" dist/crypto.js && rm -f dist/crypto.js.bak",
+    "copy-assets": "mkdir -p dist/vendor && cp index.html dist/index.html && cp node_modules/hash-wasm/dist/index.esm.min.js dist/vendor/hash-wasm.esm.min.js && ([ -f node_modules/hash-wasm/LICENSE ] && cp node_modules/hash-wasm/LICENSE dist/vendor/hash-wasm.LICENSE || true) && ([ -f common_passwords.txt ] && cp common_passwords.txt dist/ || true) && ([ -f style.css ] && cp style.css dist/ || true)"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "hash-wasm": "^4.12.0"
+  }
+}

@@ -47,7 +47,15 @@ python manage_tokens.py revoke <token>
 
 ```bash
 git clone https://github.com/umutcamliyurt/Lethean.git
-cd Lethean/backend
+cd Lethean/client
+npm install
+npm run build
+```
+
+Then run the backend:
+
+```bash
+cd ../backend
 pip install -r requirements.txt
 uvicorn main:app --reload
 ```
