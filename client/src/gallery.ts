@@ -2,11 +2,11 @@ import * as C from './crypto.js';
 import * as api from './api.js';
 import {
   boxGrid, fileListEl, fileListBody, viewGridBtn, viewListBtn,
-  emptyState, gridLabel, searchInput, searchClearBtn, gridSentinel, usagePill,
+  emptyState, gridLabel, searchInput, searchClearBtn, gridSentinel, usagePill, breadcrumbEl,
 } from './dom.js';
 import { fileKeyCache, metaCache, objectUrlCache, getWrappingKeyRaw } from './state.js';
 import { getStoredViewMode, setStoredViewMode } from './storage.js';
-import { fileKind, formatBytes, decryptedSize, icon, showToast } from './utils.js';
+import { fileKind, fileTypeLabel, formatBytes, decryptedSize, icon, showToast } from './utils.js';
 import { openTile, downloadAndSave } from './lightbox.js';
 import type { FileMeta, FileRecord, UsageResponse, ViewMode } from './types.js';
 
@@ -39,8 +39,27 @@ let pageOffset = 0;
 let hasMorePages = true;
 let isLoadingPage = false;
 let searchQuery = '';
-let gridObserver: IntersectionObserver | null = null;
 let records: FileRecord[] = [];
+
+let currentFolderId: string | null = null;
+
+export function getCurrentFolderId(): string | null {
+  return currentFolderId;
+}
+
+function parentIdOf(recordId: string): string | null {
+  const meta = metaCache.get(recordId);
+  return (meta?.parentId as string | null | undefined) ?? null;
+}
+
+export function navigateToFolder(folderId: string | null): void {
+  if (folderId === currentFolderId) return;
+  currentFolderId = folderId;
+  if (searchInput) searchInput.value = '';
+  searchQuery = '';
+  searchClearBtn?.classList.add('hidden');
+  renderCurrentView();
+}
 
 export function getRecords(): FileRecord[] {
   return records;
@@ -48,20 +67,22 @@ export function getRecords(): FileRecord[] {
 
 export function resetRecords(): void {
   records = [];
+  currentFolderId = null;
 }
 
 export function clearRenderedGrid(): void {
   for (const url of objectUrlCache.values()) URL.revokeObjectURL(url);
   objectUrlCache.clear();
-  if (gridObserver) { gridObserver.disconnect(); gridObserver = null; }
   boxGrid.innerHTML = '';
   fileListBody.innerHTML = '';
   emptyState.classList.add('hidden');
   gridLabel.textContent = '';
+  if (breadcrumbEl) { breadcrumbEl.innerHTML = ''; breadcrumbEl.classList.add('hidden'); }
   usagePill.textContent = '\u2014 items \u00b7,';
   if (searchInput) searchInput.value = '';
   searchQuery = '';
   searchClearBtn?.classList.add('hidden');
+  currentFolderId = null;
 }
 
 export async function refreshGallery(): Promise<void> {
@@ -75,14 +96,19 @@ export async function refreshGallery(): Promise<void> {
     showToast((err as Error).message, 'error');
   }
   renderCurrentView();
-  await loadNextPage();
-  setupGridSentinel();
+  await loadAllPages();
 }
 
 function updateUsagePill(usage: UsageResponse): void {
   usagePill.textContent = usage.quota_bytes != null
     ? `${formatBytes(usage.total_bytes)} / ${formatBytes(usage.quota_bytes)} \u00b7 ${usage.file_count} item${usage.file_count === 1 ? '' : 's'}`
     : `${usage.file_count} item${usage.file_count === 1 ? '' : 's'} \u00b7 ${formatBytes(usage.total_bytes)}`;
+}
+
+async function loadAllPages(): Promise<void> {
+  while (hasMorePages) {
+    await loadNextPage();
+  }
 }
 
 async function loadNextPage(): Promise<void> {
@@ -112,7 +138,7 @@ async function loadNextPage(): Promise<void> {
     }
 
     records = records.concat(fresh);
-    appendToCurrentView(fresh);
+    renderCurrentView();
   } catch (err) {
     showToast((err as Error).message, 'error');
     hasMorePages = false;
@@ -122,24 +148,62 @@ async function loadNextPage(): Promise<void> {
   }
 }
 
-async function loadAllPagesForSearch(): Promise<void> {
-  while (hasMorePages) {
-    await loadNextPage();
-  }
-}
-
-function setupGridSentinel(): void {
-  if (gridObserver) gridObserver.disconnect();
-  gridObserver = new IntersectionObserver((entries) => {
-    if (entries[0]?.isIntersecting) loadNextPage();
-  }, { rootMargin: '400px' });
-  gridObserver.observe(gridSentinel);
-}
-
 export function visibleRecords(): FileRecord[] {
-  if (!searchQuery) return records;
+  const inFolder = records.filter((r) => parentIdOf(r.id) === currentFolderId);
   const q = searchQuery.toLowerCase();
-  return records.filter((r) => (metaCache.get(r.id)?.name || '').toLowerCase().includes(q));
+  const filtered = q
+    ? inFolder.filter((r) => (metaCache.get(r.id)?.name || '').toLowerCase().includes(q))
+    : inFolder;
+  return filtered.slice().sort((a, b) => {
+    const aFolder = !!metaCache.get(a.id)?.isFolder;
+    const bFolder = !!metaCache.get(b.id)?.isFolder;
+    if (aFolder !== bFolder) return aFolder ? -1 : 1;
+    return 0;
+  });
+}
+
+function folderPathTo(folderId: string | null): FileRecord[] {
+  const path: FileRecord[] = [];
+  let cur = folderId;
+  const seen = new Set<string>();
+  while (cur && !seen.has(cur)) {
+    seen.add(cur);
+    const rec = records.find((r) => r.id === cur);
+    if (!rec) break;
+    path.unshift(rec);
+    cur = parentIdOf(rec.id);
+  }
+  return path;
+}
+
+function renderBreadcrumb(): void {
+  if (!breadcrumbEl) return;
+  const path = folderPathTo(currentFolderId);
+  breadcrumbEl.innerHTML = '';
+  breadcrumbEl.classList.toggle('hidden', path.length === 0);
+  if (path.length === 0) return;
+
+  const homeBtn = document.createElement('button');
+  homeBtn.type = 'button';
+  homeBtn.className = 'breadcrumb-item';
+  homeBtn.textContent = 'Home';
+  homeBtn.addEventListener('click', () => navigateToFolder(null));
+  breadcrumbEl.appendChild(homeBtn);
+
+  path.forEach((folder, i) => {
+    const sep = document.createElement('span');
+    sep.className = 'breadcrumb-sep';
+    sep.textContent = '/';
+    breadcrumbEl.appendChild(sep);
+
+    const meta = metaCache.get(folder.id);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'breadcrumb-item' + (i === path.length - 1 ? ' current' : '');
+    btn.textContent = meta?.name || '\u2026';
+    btn.addEventListener('click', () => navigateToFolder(folder.id));
+    breadcrumbEl.appendChild(btn);
+  });
 }
 
 function renderCurrentView(): void {
@@ -148,31 +212,14 @@ function renderCurrentView(): void {
   const shown = visibleRecords();
   const searching = !!searchQuery;
 
-  updateEmptyState(shown, searching);
-  updateGridLabel(shown, searching);
-
-  const target = viewMode === 'list' ? fileListBody : boxGrid;
-  const render = viewMode === 'list' ? renderListRow : renderTile;
-  for (const record of shown) {
-    target.appendChild(render(record));
-  }
-}
-
-function appendToCurrentView(newRecords: FileRecord[]): void {
-  const searching = !!searchQuery;
-  const q = searchQuery.toLowerCase();
-  const toShow = searching
-    ? newRecords.filter((r) => (metaCache.get(r.id)?.name || '').toLowerCase().includes(q))
-    : newRecords;
-
-  const shown = visibleRecords();
+  renderBreadcrumb();
   updateEmptyState(shown, searching);
   updateGridLabel(shown, searching);
 
   const target = viewMode === 'list' ? fileListBody : boxGrid;
   const render = viewMode === 'list' ? renderListRow : renderTile;
   const fragment = document.createDocumentFragment();
-  for (const record of toShow) {
+  for (const record of shown) {
     fragment.appendChild(render(record));
   }
   target.appendChild(fragment);
@@ -180,15 +227,16 @@ function appendToCurrentView(newRecords: FileRecord[]): void {
 
 function updateEmptyState(shown: FileRecord[], searching: boolean): void {
   emptyState.classList.toggle('hidden', shown.length > 0);
-  emptyState.querySelector('h3')!.textContent = searching ? 'No matches' : 'No files yet';
+  emptyState.querySelector('h3')!.textContent = searching ? 'No matches' : 'Nothing here';
   emptyState.querySelector('p')!.textContent = searching
     ? `Nothing matches "${searchQuery}".`
-    : 'Upload something above to see it here.';
+    : (currentFolderId ? 'This folder is empty.' : 'Upload something above to see it here.');
 }
 
 function updateGridLabel(shown: FileRecord[], searching: boolean): void {
+  const allInFolder = records.filter((r) => parentIdOf(r.id) === currentFolderId);
   gridLabel.textContent = shown.length
-    ? `Files \u00b7 ${shown.length}${searching ? ` of ${records.length}` : ''}`
+    ? `Files \u00b7 ${shown.length}${searching ? ` of ${allInFolder.length}` : ''}`
     : '';
 }
 
@@ -196,12 +244,8 @@ let searchDebounce: ReturnType<typeof setTimeout> | null = null;
 searchInput?.addEventListener('input', () => {
   if (searchDebounce) clearTimeout(searchDebounce);
   searchClearBtn?.classList.toggle('hidden', !searchInput.value);
-  searchDebounce = setTimeout(async () => {
+  searchDebounce = setTimeout(() => {
     searchQuery = searchInput.value.trim();
-    if (searchQuery && hasMorePages) {
-      gridSentinel.textContent = 'Loading all files to search\u2026';
-      await loadAllPagesForSearch();
-    }
     renderCurrentView();
   }, 180);
 });
@@ -216,21 +260,23 @@ searchClearBtn?.addEventListener('click', () => {
 
 function renderTile(record: FileRecord): HTMLDivElement {
   const meta: FileMeta = metaCache.get(record.id) || { name: '\u2026', mime: '' };
-  const kind = fileKind(meta.mime);
+  const isFolder = !!meta.isFolder;
+  const kind = isFolder ? 'folder' : fileKind(meta.mime);
 
   const tile = document.createElement('div');
-  tile.className = 'box-tile';
+  tile.className = 'box-tile' + (isFolder ? ' is-folder' : '');
   tile.dataset.id = record.id;
   tile.tabIndex = 0;
   tile.setAttribute('role', 'button');
-  tile.setAttribute('aria-label', `Open ${meta.name}`);
+  tile.setAttribute('aria-label', isFolder ? `Open folder ${meta.name}` : `Open ${meta.name}`);
 
   tile.innerHTML = `
     <div class="box-menu">
       <button type="button" class="btn-icon delete-btn" title="Delete">${icon('trash')}</button>
     </div>
     <div class="box-body">
-      ${kind === 'image' ? `<div class="box-icon">${icon('image')}</div><div class="box-name"></div>`
+      ${isFolder ? `<div class="box-icon">${icon('folder')}</div><div class="box-name"></div>`
+        : kind === 'image' ? `<div class="box-icon">${icon('image')}</div><div class="box-name"></div>`
         : kind === 'video' ? `<div class="box-play">${icon('play')}</div><div class="box-icon">${icon('video')}</div><div class="box-name"></div>`
         : `<div class="box-icon">${icon('file')}</div><div class="box-name"></div>`}
     </div>
@@ -238,19 +284,21 @@ function renderTile(record: FileRecord): HTMLDivElement {
   tile.querySelector('.box-name')!.textContent = meta.name;
   tile.querySelector('.delete-btn')!.setAttribute('aria-label', `Delete ${meta.name}`);
 
+  const openThisTile = () => (isFolder ? navigateToFolder(record.id) : openTile(record.id));
+
   tile.addEventListener('click', (e) => {
     if ((e.target as HTMLElement).closest('.delete-btn')) return;
-    openTile(record.id);
+    openThisTile();
   });
   tile.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openTile(record.id); }
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openThisTile(); }
   });
   tile.querySelector('.delete-btn')!.addEventListener('click', (e) => {
     e.stopPropagation();
     handleDelete(record.id);
   });
 
-  if (kind === 'image') {
+  if (!isFolder && kind === 'image') {
     const observer = new IntersectionObserver(async (entries) => {
       if (entries[0]?.isIntersecting) {
         observer.disconnect();
@@ -270,50 +318,45 @@ function renderTile(record: FileRecord): HTMLDivElement {
   return tile;
 }
 
-function fileTypeLabel(meta: FileMeta | undefined | null): string {
-  const kind = fileKind(meta?.mime);
-  if (kind === 'image') return 'Image';
-  if (kind === 'video') return 'Video';
-  const sub = (meta?.mime || '').split('/')[1];
-  return sub ? sub.replace('x-', '').toUpperCase() : 'File';
-}
-
 function renderListRow(record: FileRecord): HTMLDivElement {
   const meta: FileMeta = metaCache.get(record.id) || { name: '\u2026', mime: '' };
-  const kind = fileKind(meta.mime);
+  const isFolder = !!meta.isFolder;
+  const kind = isFolder ? 'folder' : fileKind(meta.mime);
 
   const row = document.createElement('div');
-  row.className = 'file-list-row';
+  row.className = 'file-list-row' + (isFolder ? ' is-folder' : '');
   row.dataset.id = record.id;
   row.tabIndex = 0;
   row.setAttribute('role', 'row');
-  row.setAttribute('aria-label', `Open ${meta.name}`);
+  row.setAttribute('aria-label', isFolder ? `Open folder ${meta.name}` : `Open ${meta.name}`);
 
   row.innerHTML = `
     <span class="file-row-name" role="cell">
-      <span class="file-row-icon">${icon(kind === 'image' ? 'image' : kind === 'video' ? 'video' : 'file')}</span>
+      <span class="file-row-icon">${icon(isFolder ? 'folder' : kind === 'image' ? 'image' : kind === 'video' ? 'video' : 'file')}</span>
       <span class="file-row-text"></span>
     </span>
     <span class="file-row-type" role="cell"></span>
-    <span class="file-row-size" role="cell">${formatBytes(decryptedSize(record, meta))}</span>
+    <span class="file-row-size" role="cell">${isFolder ? '\u2014' : formatBytes(decryptedSize(record, meta))}</span>
     <span class="file-row-actions" role="cell">
-      <button type="button" class="btn-icon file-download-btn" title="Download">${icon('download')}</button>
+      ${isFolder ? '' : `<button type="button" class="btn-icon file-download-btn" title="Download">${icon('download')}</button>`}
       <button type="button" class="btn-icon file-delete-btn" title="Delete">${icon('trash')}</button>
     </span>
   `;
   row.querySelector('.file-row-text')!.textContent = meta.name;
   row.querySelector('.file-row-type')!.textContent = fileTypeLabel(meta);
-  row.querySelector('.file-download-btn')!.setAttribute('aria-label', `Download ${meta.name}`);
+  row.querySelector('.file-download-btn')?.setAttribute('aria-label', `Download ${meta.name}`);
   row.querySelector('.file-delete-btn')!.setAttribute('aria-label', `Delete ${meta.name}`);
+
+  const openThisRow = () => (isFolder ? navigateToFolder(record.id) : openTile(record.id));
 
   row.addEventListener('click', (e) => {
     if ((e.target as HTMLElement).closest('.file-download-btn') || (e.target as HTMLElement).closest('.file-delete-btn')) return;
-    openTile(record.id);
+    openThisRow();
   });
   row.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openTile(record.id); }
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openThisRow(); }
   });
-  row.querySelector('.file-download-btn')!.addEventListener('click', (e) => {
+  row.querySelector('.file-download-btn')?.addEventListener('click', (e) => {
     e.stopPropagation();
     downloadAndSave(record, meta);
   });
@@ -343,18 +386,64 @@ export async function getDecryptedUrl(record: FileRecord): Promise<string> {
   return url;
 }
 
+function collectDescendantIds(folderId: string): string[] {
+  const result: string[] = [];
+  const visited = new Set<string>([folderId]);
+  const stack = [folderId];
+  while (stack.length) {
+    const id = stack.pop()!;
+    for (const r of records) {
+      if (parentIdOf(r.id) === id && !visited.has(r.id)) {
+        visited.add(r.id);
+        result.push(r.id);
+        if (metaCache.get(r.id)?.isFolder) stack.push(r.id);
+      }
+    }
+  }
+  return result;
+}
+
+export async function createFolder(name: string): Promise<void> {
+  const trimmed = name.trim();
+  if (!trimmed) return;
+  const wrappingKeyRaw = getWrappingKeyRaw();
+  if (!wrappingKeyRaw) return;
+  try {
+    const payload = await C.encryptFolder(wrappingKeyRaw, trimmed, currentFolderId);
+    await api.uploadFile(payload);
+    await refreshGallery();
+    showToast('Folder created.');
+  } catch (err) {
+    showToast("Couldn't create folder. " + (err as Error).message, 'error');
+  }
+}
+
 async function handleDelete(fileId: string): Promise<void> {
   const meta = metaCache.get(fileId);
-  if (!confirm(`Delete "${meta?.name ?? 'this file'}"? This can't be undone.`)) return;
+  const isFolder = !!meta?.isFolder;
+  const descendantIds = isFolder ? collectDescendantIds(fileId) : [];
+
+  const confirmMsg = isFolder
+    ? descendantIds.length
+      ? `Delete "${meta?.name ?? 'this folder'}" and everything inside it (${descendantIds.length} item${descendantIds.length === 1 ? '' : 's'})? This can't be undone.`
+      : `Delete "${meta?.name ?? 'this folder'}"? This can't be undone.`
+    : `Delete "${meta?.name ?? 'this file'}"? This can't be undone.`;
+  if (!confirm(confirmMsg)) return;
+
+  const idsToDelete = [...descendantIds, fileId];
   try {
-    await api.deleteFile(fileId);
-    if (objectUrlCache.has(fileId)) { URL.revokeObjectURL(objectUrlCache.get(fileId)!); objectUrlCache.delete(fileId); }
-    fileKeyCache.delete(fileId);
-    metaCache.delete(fileId);
-    records = records.filter((r) => r.id !== fileId);
+    for (const id of idsToDelete) {
+      await api.deleteFile(id);
+      if (objectUrlCache.has(id)) { URL.revokeObjectURL(objectUrlCache.get(id)!); objectUrlCache.delete(id); }
+      fileKeyCache.delete(id);
+      metaCache.delete(id);
+    }
+    const removed = new Set(idsToDelete);
+    records = records.filter((r) => !removed.has(r.id));
     renderCurrentView();
-    showToast('Deleted.');
+    showToast(isFolder ? 'Folder deleted.' : 'Deleted.');
   } catch (err) {
-    showToast("Couldn't delete that file. " + (err as Error).message, 'error');
+    showToast("Couldn't delete that item. " + (err as Error).message, 'error');
+    await refreshGallery();
   }
 }

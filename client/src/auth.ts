@@ -3,7 +3,7 @@ import * as api from './api.js';
 import {
   authScreen, appScreen, authForm, authSubmit, authStatus, passwordInput,
   confirmField, passwordConfirmInput, accessTokenInput, saltInput, vaultFingerprint,
-  logoutBtn, tokenBtn, saltBtn, duressBtn,
+  logoutBtn, tokenBtn, saltBtn, duressBtn, sourceBtn,
 } from './dom.js';
 import { fileKeyCache, metaCache, getWrappingKeyRaw, setWrappingKeyRaw, getCurrentVaultId, setCurrentVaultId } from './state.js';
 import {
@@ -249,6 +249,11 @@ function leaveApp(): void {
   api.setAccessToken(null);
   pendingConfirmation = null;
 
+  passwordInput.value = '';
+  passwordConfirmInput.value = '';
+  confirmField.classList.add('hidden');
+  passwordConfirmInput.required = false;
+
   appScreen.classList.add('hidden');
   authScreen.classList.remove('hidden');
   setAuthStatus('');
@@ -340,6 +345,10 @@ function openTokenPanel(): void {
     });
   }
 }
+
+sourceBtn.addEventListener('click', () => {
+  window.open('https://github.com/umutcamliyurt/Lethean', '_blank', 'noopener,noreferrer');
+});
 
 duressBtn.addEventListener('click', openDuressPanel);
 

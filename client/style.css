@@ -71,7 +71,7 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
 }
 .btn-icon:hover { color: var(--text); background: var(--surface-2); }
 
-input[type=password], input[type=text] {
+input[type=password], input[type=text], textarea {
   font-family: inherit;
   font-size: 16px;
   background: var(--bg);
@@ -81,7 +81,9 @@ input[type=password], input[type=text] {
   border-radius: var(--radius);
   width: 100%;
 }
-input::placeholder { color: var(--faint); }
+input::placeholder, textarea::placeholder { color: var(--faint); }
+textarea { resize: vertical; }
+textarea[readonly] { color: var(--faint); background: var(--surface-2); }
 
 .hidden { display: none !important; }
 
@@ -206,6 +208,12 @@ input::placeholder { color: var(--faint); }
   color: var(--dim);
   white-space: nowrap;
 }
+#source-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+#source-btn svg { flex-shrink: 0; }
 .account-email {
   font-size: 0.78rem;
   color: var(--dim);
@@ -245,6 +253,13 @@ main.vault {
   margin: 0 0 12px;
 }
 
+.deposit-slot-actions {
+  display: flex;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .upload-queue { margin-bottom: 20px; display: flex; flex-direction: column; gap: 6px; }
 .upload-row {
   display: flex;
@@ -281,6 +296,34 @@ main.vault {
   letter-spacing: 0.06em;
   color: var(--dim);
   margin: 0;
+}
+
+.breadcrumb {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-bottom: 12px;
+}
+.breadcrumb-item {
+  border: none;
+  background: transparent;
+  min-height: auto;
+  padding: 3px 4px;
+  font-size: 0.82rem;
+  color: var(--dim);
+  border-radius: 4px;
+}
+.breadcrumb-item:hover { color: var(--text); background: var(--surface-2); }
+.breadcrumb-item.current {
+  color: var(--text);
+  font-weight: 600;
+  cursor: default;
+}
+.breadcrumb-item.current:hover { background: transparent; }
+.breadcrumb-sep {
+  color: var(--faint);
+  font-size: 0.8rem;
 }
 
 .grid-toolbar {
@@ -627,6 +670,8 @@ main.vault {
   padding: 28px;
   width: 100%;
   max-width: 360px;
+  max-height: 90vh;
+  overflow-y: auto;
   text-align: left;
 }
 .settings-panel h2 {

@@ -1,9 +1,9 @@
 import * as C from './crypto.js';
 import * as api from './api.js';
-import { depositSlot, chooseFilesBtn, fileInput, uploadQueue } from './dom.js';
+import { depositSlot, chooseFilesBtn, newFolderBtn, fileInput, uploadQueue } from './dom.js';
 import { getWrappingKeyRaw } from './state.js';
 import { icon, showToast } from './utils.js';
-import { refreshGallery } from './gallery.js';
+import { refreshGallery, getCurrentFolderId, createFolder } from './gallery.js';
 
 chooseFilesBtn.addEventListener('click', () => fileInput.click());
 depositSlot.addEventListener('click', (e) => {
@@ -11,6 +11,12 @@ depositSlot.addEventListener('click', (e) => {
   if (target === depositSlot || target.tagName === 'P' || target.tagName === 'H2') fileInput.click();
 });
 depositSlot.addEventListener('keydown', (e) => { if (e.key === 'Enter') fileInput.click(); });
+
+newFolderBtn?.addEventListener('click', async () => {
+  const name = window.prompt('Folder name:');
+  if (name == null || !name.trim()) return;
+  await createFolder(name);
+});
 
 fileInput.addEventListener('change', () => {
   handleFiles([...fileInput.files ?? []]);
@@ -155,7 +161,7 @@ async function uploadOne(file: File, rowItem: UploadRowItem): Promise<void> {
   statusEl.textContent = 'Encrypting\u2026';
   let encrypted;
   try {
-    encrypted = await C.encryptFile(getWrappingKeyRaw()!, file);
+    encrypted = await C.encryptFile(getWrappingKeyRaw()!, file, getCurrentFolderId());
   } catch (err) {
     row.classList.add('error');
     statusEl.textContent = 'Failed';

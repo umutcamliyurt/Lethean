@@ -17,8 +17,10 @@ export const saltInput = $<HTMLInputElement>('salt');
 
 export const depositSlot = $<HTMLDivElement>('deposit-slot');
 export const chooseFilesBtn = $<HTMLButtonElement>('choose-files-btn');
+export const newFolderBtn = $<HTMLButtonElement>('new-folder-btn');
 export const fileInput = $<HTMLInputElement>('file-input');
 export const uploadQueue = $<HTMLDivElement>('upload-queue');
+export const breadcrumbEl = $<HTMLDivElement>('breadcrumb');
 export const boxGrid = $<HTMLDivElement>('box-grid');
 export const fileListEl = $<HTMLDivElement>('file-list');
 export const fileListBody = $<HTMLDivElement>('file-list-body');
@@ -35,5 +37,6 @@ export const logoutBtn = $<HTMLButtonElement>('logout-btn');
 export const tokenBtn = $<HTMLButtonElement>('token-btn');
 export const saltBtn = $<HTMLButtonElement>('salt-btn');
 export const duressBtn = $<HTMLButtonElement>('duress-btn');
+export const sourceBtn = $<HTMLButtonElement>('source-btn');
 export const lightbox = $<HTMLDivElement>('lightbox');
 export const toasts = $<HTMLDivElement>('toasts');

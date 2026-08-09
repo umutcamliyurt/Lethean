@@ -1,5 +1,6 @@
 import { argon2id } from 'hash-wasm';
 import { AhoCorasick } from './ahocorasick.js';
+import { FOLDER_MIME } from './types.js';
 import type { DuressConfig, EncryptedFilePayload, FileMeta, PasswordValidationResult, UnlockResult } from './types.js';
 
 const ARGON2_PARAMS = {
@@ -225,7 +226,11 @@ export async function decryptContent(
   return compressed ? decompressBytes(bytes) : bytes;
 }
 
-export async function encryptFile(wrappingKeyRawBytes: Uint8Array, file: File): Promise<EncryptedFilePayload> {
+export async function encryptFile(
+  wrappingKeyRawBytes: Uint8Array,
+  file: File,
+  parentId: string | null = null
+): Promise<EncryptedFilePayload> {
   const wrappingKey = await importAesKey(wrappingKeyRawBytes, ['encrypt']);
 
   const fileKeyRaw = generateAesKeyRaw();
@@ -251,10 +256,43 @@ export async function encryptFile(wrappingKeyRawBytes: Uint8Array, file: File): 
     mime: file.type || 'application/octet-stream',
     compressed,
     unpaddedSize,
+    parentId,
   })));
   const { iv: metadataIv, ciphertext: metadataCt } = await aesGcmEncrypt(fileKey, metadataBytes);
 
   const { iv: contentIv, ciphertext } = await aesGcmEncrypt(fileKey, paddedContentBytes);
+
+  const { iv: wrapIv, ciphertext: wrappedKey } = await aesGcmEncrypt(wrappingKey, fileKeyRaw);
+
+  return {
+    ciphertext,
+    contentIv: toBase64(contentIv),
+    encryptedMetadata: toBase64(metadataCt),
+    metadataIv: toBase64(metadataIv),
+    wrappedFileKey: toBase64(wrappedKey),
+    wrapIv: toBase64(wrapIv),
+  };
+}
+
+export async function encryptFolder(
+  wrappingKeyRawBytes: Uint8Array,
+  name: string,
+  parentId: string | null = null
+): Promise<EncryptedFilePayload> {
+  const wrappingKey = await importAesKey(wrappingKeyRawBytes, ['encrypt']);
+
+  const fileKeyRaw = generateAesKeyRaw();
+  const fileKey = await importAesKey(fileKeyRaw);
+
+  const metadataBytes = padMetadataBytes(utf8(JSON.stringify({
+    name,
+    mime: FOLDER_MIME,
+    isFolder: true,
+    parentId,
+  })));
+  const { iv: metadataIv, ciphertext: metadataCt } = await aesGcmEncrypt(fileKey, metadataBytes);
+
+  const { iv: contentIv, ciphertext } = await aesGcmEncrypt(fileKey, new Uint8Array(0));
 
   const { iv: wrapIv, ciphertext: wrappedKey } = await aesGcmEncrypt(wrappingKey, fileKeyRaw);
 

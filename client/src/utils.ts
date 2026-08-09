@@ -33,6 +33,15 @@ export function fileKind(mime: string | undefined | null): FileKind {
   return 'other';
 }
 
+export function fileTypeLabel(meta: FileMeta | undefined | null): string {
+  if (meta?.isFolder) return 'Folder';
+  const kind = fileKind(meta?.mime);
+  if (kind === 'image') return 'Image';
+  if (kind === 'video') return 'Video';
+  const sub = (meta?.mime || '').split('/')[1];
+  return sub ? sub.replace('x-', '').toUpperCase() : 'File';
+}
+
 export function fileExtension(name: string | undefined | null): string {
   const clean = (name || '').toLowerCase();
   const dot = clean.lastIndexOf('.');
@@ -87,6 +96,8 @@ const ICONS: Record<string, string> = {
   image: '<path d="M4 5h16a1 1 0 0 1 1 1v12a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1z" stroke="currentColor" stroke-width="1.4"/><circle cx="8.5" cy="9.5" r="1.5" stroke="currentColor" stroke-width="1.4"/><path d="M21 15l-5.5-5.5a1 1 0 0 0-1.4 0L4 19" stroke="currentColor" stroke-width="1.4"/>',
   video: '<rect x="3" y="6" width="14" height="12" rx="1.5" stroke="currentColor" stroke-width="1.4"/><path d="M21 9.5v5l-4-2.5v0z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
   file: '<path d="M6 3h8l5 5v13a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z" stroke="currentColor" stroke-width="1.4"/><path d="M14 3v5h5" stroke="currentColor" stroke-width="1.4"/>',
+  folder: '<path d="M3 6.5a1 1 0 0 1 1-1h4.4l1.6 2H16a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-10z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/>',
+  folderPlus: '<path d="M3 6.5a1 1 0 0 1 1-1h4.4l1.6 2H16a1 1 0 0 1 1 1v8a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1v-10z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M10 10.5v4M8 12.5h4" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>',
   play: '<circle cx="13" cy="13" r="12" fill="rgba(20,22,26,0.6)"/><path d="M10.5 8.5l7 4.5-7 4.5z" fill="white"/>',
   trash: '<path d="M4 6h14M9 6V4.5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V6M6 6l.7 12a1 1 0 0 0 1 .9h6.6a1 1 0 0 0 1-.9L16 6" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/>',
   download: '<path d="M10 3v10m0 0l-4-4m4 4l4-4M4 16v2a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-2" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',

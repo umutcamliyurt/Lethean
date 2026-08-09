@@ -1,9 +1,13 @@
 
+export const FOLDER_MIME = 'application/x-lethean-folder';
+
 export interface FileMeta {
   name: string;
   mime: string;
   compressed?: boolean;
   unpaddedSize?: number;
+  isFolder?: boolean;
+  parentId?: string | null;
 }
 
 export interface FileRecord {
