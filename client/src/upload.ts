@@ -1,9 +1,9 @@
-import * as C from './crypto.js';
 import * as api from './api.js';
+import { encryptPool } from './encrypt-pool.js';
 import { depositSlot, chooseFilesBtn, newFolderBtn, fileInput, uploadQueue } from './dom.js';
 import { getWrappingKeyRaw } from './state.js';
 import { icon, showToast } from './utils.js';
-import { refreshGallery, getCurrentFolderId, createFolder } from './gallery.js';
+import { addUploadedRecord, getCurrentFolderId, createFolder } from './gallery.js';
 
 chooseFilesBtn.addEventListener('click', () => fileInput.click());
 depositSlot.addEventListener('click', (e) => {
@@ -35,19 +35,15 @@ depositSlot.addEventListener('drop', (e) => {
 });
 
 const MAX_VISIBLE_UPLOADS = 10;
-const MAX_CONCURRENT_UPLOADS = 3;
+const MAX_CONCURRENT_UPLOADS = 6;
 
 interface UploadRowItem {
   el: HTMLDivElement;
 }
 
-interface QueueItem {
-  file: File;
-  rowItem: UploadRowItem;
-}
-
 let uploadRows: UploadRowItem[] = [];
 let uploadMoreIndicator: HTMLDivElement | null = null;
+let pendingRowCount = 0;
 
 function getUploadMoreIndicator(): HTMLDivElement {
   if (!uploadMoreIndicator) {
@@ -59,7 +55,8 @@ function getUploadMoreIndicator(): HTMLDivElement {
 
 function syncUploadQueueView(): void {
   const visible = uploadRows.slice(0, MAX_VISIBLE_UPLOADS);
-  const hiddenCount = uploadRows.length - visible.length;
+  const hiddenStartedCount = uploadRows.length - visible.length;
+  const hiddenCount = hiddenStartedCount + pendingRowCount;
   const indicator = getUploadMoreIndicator();
 
   for (const item of visible) {
@@ -75,15 +72,20 @@ function syncUploadQueueView(): void {
 }
 
 async function handleFiles(files: File[]): Promise<void> {
-  const queue: QueueItem[] = files.map((file) => ({ file, rowItem: createUploadRow(file) }));
+  pendingRowCount += files.length;
+  syncUploadQueueView();
+
+  const queue: File[] = [...files];
   const workerCount = Math.min(MAX_CONCURRENT_UPLOADS, queue.length);
   await Promise.all(Array.from({ length: workerCount }, () => runUploadWorker(queue)));
 }
 
-async function runUploadWorker(queue: QueueItem[]): Promise<void> {
-  let item: QueueItem | undefined;
-  while ((item = queue.shift())) {
-    await uploadOne(item.file, item.rowItem);
+async function runUploadWorker(queue: File[]): Promise<void> {
+  let file: File | undefined;
+  while ((file = queue.shift())) {
+    pendingRowCount--;
+    const rowItem = createUploadRow(file);
+    await uploadOne(file, rowItem);
   }
 }
 
@@ -107,6 +109,25 @@ function setBarProgress(barEl: HTMLElement, fraction: number, { instant = false 
   const pct = `${Math.max(0, Math.min(100, Math.round(fraction * 100)))}%`;
   barEl.style.transition = instant ? 'none' : 'width 200ms ease';
   barEl.style.width = pct;
+}
+
+const pendingBarUpdates = new Map<HTMLElement, number>();
+let barUpdateScheduled = false;
+
+function scheduleBarProgress(barEl: HTMLElement, fraction: number): void {
+  pendingBarUpdates.set(barEl, fraction);
+  if (!barUpdateScheduled) {
+    barUpdateScheduled = true;
+    requestAnimationFrame(flushBarProgress);
+  }
+}
+
+function flushBarProgress(): void {
+  barUpdateScheduled = false;
+  for (const [barEl, fraction] of pendingBarUpdates) {
+    setBarProgress(barEl, fraction);
+  }
+  pendingBarUpdates.clear();
 }
 
 const RETRY_BASE_MS = 1000;
@@ -161,7 +182,7 @@ async function uploadOne(file: File, rowItem: UploadRowItem): Promise<void> {
   statusEl.textContent = 'Encrypting\u2026';
   let encrypted;
   try {
-    encrypted = await C.encryptFile(getWrappingKeyRaw()!, file, getCurrentFolderId());
+    encrypted = await encryptPool.encryptFile(getWrappingKeyRaw()!, file, getCurrentFolderId());
   } catch (err) {
     row.classList.add('error');
     statusEl.textContent = 'Failed';
@@ -178,8 +199,8 @@ async function uploadOne(file: File, rowItem: UploadRowItem): Promise<void> {
       statusEl.textContent = attempt === 0 ? 'Uploading\u2026' : `Retrying\u2026 (attempt ${attempt + 1})`;
       statusEl.removeAttribute('title');
       setBarProgress(barEl, 0, { instant: true });
-      await api.uploadFile(encrypted, (fraction) => {
-        setBarProgress(barEl, fraction);
+      const created = await api.uploadFile(encrypted, (fraction) => {
+        scheduleBarProgress(barEl, fraction);
       }, controller.signal);
 
       row.classList.remove('error');
@@ -188,7 +209,7 @@ async function uploadOne(file: File, rowItem: UploadRowItem): Promise<void> {
       cancelBtn.classList.add('hidden');
       setTimeout(removeRow, 1800);
 
-      await refreshGallery();
+      await addUploadedRecord(created);
       return;
     } catch (err) {
       const error = err as Error;

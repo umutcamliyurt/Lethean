@@ -51,11 +51,13 @@ async function checkOk(res: Response, label: string): Promise<Response> {
   return res;
 }
 
+const STALL_TIMEOUT_MS = 20000;
+
 export async function uploadFile(
   encrypted: EncryptedFilePayload,
   onProgress?: ProgressCallback,
   signal?: AbortSignal
-): Promise<unknown> {
+): Promise<FileRecord> {
   const form = new FormData();
   form.append('content_iv', encrypted.contentIv);
   form.append('encrypted_metadata', encrypted.encryptedMetadata);
@@ -69,11 +71,29 @@ export async function uploadFile(
     xhr.open('POST', `${BASE_URL}/files`);
     for (const [k, v] of Object.entries(authHeaders())) xhr.setRequestHeader(k, v);
     if (accessToken) xhr.setRequestHeader('X-Access-Token', accessToken);
+
+    let stalled = false;
+    let watchdog: ReturnType<typeof setTimeout>;
+
+    const armWatchdog = () => {
+      clearTimeout(watchdog);
+      watchdog = setTimeout(() => {
+        stalled = true;
+        xhr.abort();
+      }, STALL_TIMEOUT_MS);
+    };
+    const clearWatchdog = () => clearTimeout(watchdog);
+
+    armWatchdog();
+
     xhr.upload.onprogress = (e) => {
+      armWatchdog();
       if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total);
     };
+
     xhr.onload = () => {
-      if (xhr.status >= 200 && xhr.status < 300) resolve(JSON.parse(xhr.responseText));
+      clearWatchdog();
+      if (xhr.status >= 200 && xhr.status < 300) resolve(JSON.parse(xhr.responseText) as FileRecord);
       else {
         let detail: string = xhr.statusText;
         try {
@@ -84,12 +104,26 @@ export async function uploadFile(
         reject(new Error(detail));
       }
     };
-    xhr.onabort = () => reject(new DOMException('Upload cancelled', 'AbortError'));
+
+    xhr.onabort = () => {
+      clearWatchdog();
+      if (stalled) {
+        reject(new Error('Upload stalled (no progress) — will retry'));
+      } else {
+        reject(new DOMException('Upload cancelled', 'AbortError'));
+      }
+    };
+
     if (signal) {
       if (signal.aborted) { xhr.abort(); return; }
       signal.addEventListener('abort', () => xhr.abort());
     }
-    xhr.onerror = () => reject(new Error('network error'));
+
+    xhr.onerror = () => {
+      clearWatchdog();
+      reject(new Error('network error'));
+    };
+
     xhr.send(form);
   });
 }

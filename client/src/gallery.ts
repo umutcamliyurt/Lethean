@@ -99,6 +99,55 @@ export async function refreshGallery(): Promise<void> {
   await loadAllPages();
 }
 
+export async function addUploadedRecord(record: FileRecord): Promise<void> {
+  if (!fileKeyCache.has(record.id)) {
+    try {
+      const fileKeyRaw = await C.unwrapFileKey(getWrappingKeyRaw()!, record.wrapped_file_key, record.wrap_iv);
+      fileKeyCache.set(record.id, fileKeyRaw);
+      const meta = await C.decryptMetadata(fileKeyRaw, record.encrypted_metadata, record.metadata_iv);
+      metaCache.set(record.id, meta);
+    } catch {
+      metaCache.set(record.id, { name: 'Unreadable item', mime: 'application/octet-stream' });
+    }
+  }
+
+  records.push(record);
+  scheduleUsageRefresh();
+  appendRecordIfVisible(record);
+}
+
+let usageRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+const USAGE_REFRESH_DEBOUNCE_MS = 400;
+
+function scheduleUsageRefresh(): void {
+  if (usageRefreshTimer) return;
+  usageRefreshTimer = setTimeout(async () => {
+    usageRefreshTimer = null;
+    try {
+      const usage = await api.getUsage();
+      updateUsagePill(usage);
+    } catch (err) {
+      showToast((err as Error).message, 'error');
+    }
+  }, USAGE_REFRESH_DEBOUNCE_MS);
+}
+
+function appendRecordIfVisible(record: FileRecord): void {
+  if (parentIdOf(record.id) !== currentFolderId) return;
+  if (searchQuery) {
+    const name = (metaCache.get(record.id)?.name || '').toLowerCase();
+    if (!name.includes(searchQuery.toLowerCase())) return;
+  }
+
+  const shown = visibleRecords();
+  updateEmptyState(shown, !!searchQuery);
+  updateGridLabel(shown, !!searchQuery);
+
+  const target = viewMode === 'list' ? fileListBody : boxGrid;
+  const render = viewMode === 'list' ? renderListRow : renderTile;
+  target.appendChild(render(record));
+}
+
 function updateUsagePill(usage: UsageResponse): void {
   usagePill.textContent = usage.quota_bytes != null
     ? `${formatBytes(usage.total_bytes)} / ${formatBytes(usage.quota_bytes)} \u00b7 ${usage.file_count} item${usage.file_count === 1 ? '' : 's'}`

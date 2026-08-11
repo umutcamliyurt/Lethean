@@ -1,5 +1,6 @@
 import asyncio
 import os
+import queue as _queue
 import re
 import secrets
 
@@ -10,6 +11,10 @@ _FILE_ID_RE = re.compile(
 )
 
 _SHRED_PASSES = int(os.environ.get("SHRED_PASSES", "3"))
+
+_READ_STALL_TIMEOUT_SECONDS = float(os.environ.get("UPLOAD_READ_STALL_TIMEOUT", "60"))
+
+_WRITE_BUFFER_CHUNKS = int(os.environ.get("UPLOAD_WRITE_BUFFER_CHUNKS", "4"))
 
 
 def path_for(vault_id: str, file_id: str) -> str:
@@ -31,30 +36,72 @@ def write_blob(path: str, data: bytes) -> None:
         os.fsync(f.fileno())
 
 
-async def write_blob_streamed(path: str, upload, limit: int, chunk_size: int = 4 * 1024 * 1024) -> int:
+async def write_blob_streamed(
+    path: str,
+    upload,
+    limit: int,
+    chunk_size: int = 4 * 1024 * 1024,
+    read_timeout: float = _READ_STALL_TIMEOUT_SECONDS,
+    buffer_chunks: int = _WRITE_BUFFER_CHUNKS,
+) -> int:
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     f = os.fdopen(fd, "wb")
+
+    write_q: "_queue.Queue[bytes | None]" = _queue.Queue(maxsize=buffer_chunks)
+    write_errors: list[BaseException] = []
+
+    def _writer() -> None:
+        try:
+            while True:
+                item = write_q.get()
+                if item is None:
+                    break
+                f.write(item)
+            f.flush()
+            os.fsync(f.fileno())
+        except Exception as exc:
+            write_errors.append(exc)
+        finally:
+            f.close()
+
+    writer_task = asyncio.create_task(asyncio.to_thread(_writer))
+
     total = 0
     try:
         while True:
-            chunk = await upload.read(chunk_size)
+            try:
+                chunk = await asyncio.wait_for(upload.read(chunk_size), timeout=read_timeout)
+            except asyncio.TimeoutError:
+                raise ValueError(
+                    f"upload stalled: no data received within {read_timeout:.0f}s"
+                )
+
             if not chunk:
                 break
+
             total += len(chunk)
             if total > limit:
                 raise ValueError(f"upload exceeds max size of {limit} bytes")
-            await asyncio.to_thread(f.write, chunk)
-        await asyncio.to_thread(f.flush)
-        await asyncio.to_thread(os.fsync, f.fileno())
+
+            if write_errors:
+                raise write_errors[0]
+
+            await asyncio.to_thread(write_q.put, chunk)
+
+        await asyncio.to_thread(write_q.put, None)
+        await writer_task
+        if write_errors:
+            raise write_errors[0]
+
     except Exception:
-        f.close()
+        await asyncio.to_thread(write_q.put, None)
+        await writer_task
         try:
             os.remove(path)
         except FileNotFoundError:
             pass
         raise
-    else:
-        f.close()
+
     return total
 
 
