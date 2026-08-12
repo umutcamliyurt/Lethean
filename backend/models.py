@@ -28,4 +28,4 @@ class EncryptedFile(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
-Index("ix_files_vault_id", EncryptedFile.vault_id)
+Index("ix_files_vault_created", EncryptedFile.vault_id, EncryptedFile.created_at, EncryptedFile.id)

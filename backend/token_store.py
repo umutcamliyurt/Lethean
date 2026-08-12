@@ -9,16 +9,30 @@ DEFAULT_QUOTA_BYTES = int(os.environ.get("DEFAULT_QUOTA_GB", "10")) * 1024**3
 
 _lock = threading.Lock()
 
+_cache: dict | None = None
+_cache_mtime: float | None = None
+
 
 def _load() -> dict:
-    if not os.path.exists(TOKENS_PATH):
+    global _cache, _cache_mtime
+    try:
+        mtime = os.path.getmtime(TOKENS_PATH)
+    except FileNotFoundError:
+        _cache = {}
+        _cache_mtime = None
         return {}
+    if _cache is not None and mtime == _cache_mtime:
+        return _cache
     with open(TOKENS_PATH, "r") as f:
         content = f.read().strip()
-        return json.loads(content) if content else {}
+        data = json.loads(content) if content else {}
+    _cache = data
+    _cache_mtime = mtime
+    return data
 
 
 def _save(data: dict) -> None:
+    global _cache, _cache_mtime
     tmp_path = TOKENS_PATH + ".tmp"
     fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
@@ -27,6 +41,8 @@ def _save(data: dict) -> None:
         os.fsync(f.fileno())
     os.replace(tmp_path, TOKENS_PATH)
     os.chmod(TOKENS_PATH, 0o600)
+    _cache = data
+    _cache_mtime = os.path.getmtime(TOKENS_PATH)
 
 
 def _find_token(data: dict, token: str) -> str | None:

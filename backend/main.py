@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 import anyio.to_thread
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, Form, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func
@@ -140,6 +141,9 @@ async def add_security_headers(request, call_next):
     if is_https:
         response.headers.setdefault("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
     return response
+
+
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 _LOCK_STRIPES = 256
@@ -306,10 +310,14 @@ def list_files(
 
 @app.get("/usage", response_model=UsageResponse)
 def usage(db: Session = Depends(get_db), vault_id: str = Depends(get_vault_id)):
-    files = db.query(EncryptedFile).filter(EncryptedFile.vault_id == vault_id).all()
+    file_count, total_bytes = (
+        db.query(func.count(EncryptedFile.id), func.coalesce(func.sum(EncryptedFile.size), 0))
+        .filter(EncryptedFile.vault_id == vault_id)
+        .one()
+    )
     record = token_store.find_by_vault_id(vault_id)
     quota_bytes = token_store.quota_bytes_for(record) if record else None
-    return UsageResponse(file_count=len(files), total_bytes=sum(f.size for f in files), quota_bytes=quota_bytes)
+    return UsageResponse(file_count=file_count, total_bytes=total_bytes, quota_bytes=quota_bytes)
 
 
 @app.get("/files/{file_id}", response_model=FileMetaResponse)
@@ -335,6 +343,7 @@ async def get_file_blob(file_id: str, db: Session = Depends(get_db), vault_id: s
             "X-Content-Type-Options": "nosniff",
             "Content-Disposition": "attachment",
             "Content-Length": str(size),
+            "Content-Encoding": "identity",
         },
     )
 
@@ -354,8 +363,12 @@ def wipe_vault(
     db: Session = Depends(get_db),
     vault_id: str = Depends(get_vault_id),
 ):
-    files = db.query(EncryptedFile).filter(EncryptedFile.vault_id == vault_id).all()
-    file_infos = [(f.id, f.storage_path) for f in files]
+    rows = (
+        db.query(EncryptedFile.id, EncryptedFile.storage_path)
+        .filter(EncryptedFile.vault_id == vault_id)
+        .all()
+    )
+    file_infos = [(row.id, row.storage_path) for row in rows]
 
     if file_infos:
         db.query(EncryptedFile).filter(EncryptedFile.vault_id == vault_id).delete(synchronize_session=False)
