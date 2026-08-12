@@ -1,6 +1,6 @@
 import type { EncryptedFilePayload } from './types.js';
 
-const POOL_SIZE = Math.min(4, Math.max(1, (navigator.hardwareConcurrency || 2) - 1));
+const POOL_SIZE = Math.min(6, Math.max(1, (navigator.hardwareConcurrency || 2) - 1));
 
 interface PendingJob {
   resolve: (value: EncryptedFilePayload) => void;

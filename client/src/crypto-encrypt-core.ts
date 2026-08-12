@@ -1,4 +1,3 @@
-
 import type { EncryptedFilePayload, FileMeta } from './types.js';
 import { FOLDER_MIME } from './types.js';
 
@@ -38,6 +37,24 @@ export async function compressBytes(bytes: Uint8Array): Promise<Uint8Array | nul
   if (!canCompress) return null;
   const stream = new Blob([asBlobPart(bytes)]).stream().pipeThrough(new CompressionStream('gzip'));
   return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+export async function readAndMaybeCompressFile(file: File): Promise<{ bytes: Uint8Array; compressed: boolean }> {
+  if (!canCompress) {
+    return { bytes: new Uint8Array(await file.arrayBuffer()), compressed: false };
+  }
+  try {
+    const [rawStream, gzipStream] = file.stream().tee();
+    const rawPromise = new Response(rawStream).arrayBuffer();
+    const compressedPromise = new Response(gzipStream.pipeThrough(new CompressionStream('gzip'))).arrayBuffer();
+    const [rawBuf, gzippedBuf] = await Promise.all([rawPromise, compressedPromise]);
+    if (gzippedBuf.byteLength < rawBuf.byteLength) {
+      return { bytes: new Uint8Array(gzippedBuf), compressed: true };
+    }
+    return { bytes: new Uint8Array(rawBuf), compressed: false };
+  } catch {
+    return { bytes: new Uint8Array(await file.arrayBuffer()), compressed: false };
+  }
 }
 
 export async function decompressBytes(bytes: Uint8Array): Promise<Uint8Array> {
@@ -171,17 +188,7 @@ export async function encryptFile(
   const fileKeyRaw = generateAesKeyRaw();
   const fileKey = await importAesKey(fileKeyRaw);
 
-  const rawContentBytes = new Uint8Array(await file.arrayBuffer());
-  let contentBytes: Uint8Array = rawContentBytes;
-  let compressed = false;
-  try {
-    const gzipped = await compressBytes(rawContentBytes);
-    if (gzipped && gzipped.length < rawContentBytes.length) {
-      contentBytes = gzipped;
-      compressed = true;
-    }
-  } catch {
-  }
+  const { bytes: contentBytes, compressed } = await readAndMaybeCompressFile(file);
 
   const unpaddedSize = contentBytes.length;
   const paddedContentBytes = padToBucket(contentBytes);

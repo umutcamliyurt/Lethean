@@ -173,18 +173,17 @@ async function loadNextPage(): Promise<void> {
     if (page.length < PAGE_SIZE || fresh.length === 0) hasMorePages = false;
     pageOffset += page.length || PAGE_SIZE;
 
-    for (const record of fresh) {
-      if (!fileKeyCache.has(record.id)) {
-        try {
-          const fileKeyRaw = await C.unwrapFileKey(getWrappingKeyRaw()!, record.wrapped_file_key, record.wrap_iv);
-          fileKeyCache.set(record.id, fileKeyRaw);
-          const meta = await C.decryptMetadata(fileKeyRaw, record.encrypted_metadata, record.metadata_iv);
-          metaCache.set(record.id, meta);
-        } catch {
-          metaCache.set(record.id, { name: 'Unreadable item', mime: 'application/octet-stream' });
-        }
+    await Promise.all(fresh.map(async (record) => {
+      if (fileKeyCache.has(record.id)) return;
+      try {
+        const fileKeyRaw = await C.unwrapFileKey(getWrappingKeyRaw()!, record.wrapped_file_key, record.wrap_iv);
+        fileKeyCache.set(record.id, fileKeyRaw);
+        const meta = await C.decryptMetadata(fileKeyRaw, record.encrypted_metadata, record.metadata_iv);
+        metaCache.set(record.id, meta);
+      } catch {
+        metaCache.set(record.id, { name: 'Unreadable item', mime: 'application/octet-stream' });
       }
-    }
+    }));
 
     records = records.concat(fresh);
     renderCurrentView();
