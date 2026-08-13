@@ -208,22 +208,49 @@ textarea[readonly] { color: var(--faint); background: var(--surface-2); }
   color: var(--dim);
   white-space: nowrap;
 }
+.settings-wrap {
+  position: relative;
+}
+.settings-menu {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  z-index: 50;
+  min-width: 190px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+}
+.settings-menu button {
+  border: 1px solid transparent;
+  background: transparent;
+  min-height: auto;
+  width: 100%;
+  padding: 9px 10px;
+  font-size: 0.85rem;
+  text-align: left;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.settings-menu button:hover { border-color: transparent; background: var(--surface-2); }
+.settings-menu-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 5px 2px;
+}
 #source-btn {
   display: inline-flex;
   align-items: center;
   gap: 6px;
 }
 #source-btn svg { flex-shrink: 0; }
-.account-email {
-  font-size: 0.78rem;
-  color: var(--dim);
-  font-family: var(--font-mono);
-  max-width: 90px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
 main.vault {
   flex: 1;
   padding: 24px 20px 60px;
@@ -535,6 +562,13 @@ main.vault {
   display: flex;
   gap: 2px;
   justify-content: flex-end;
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.file-list-row:hover .file-row-actions,
+.file-list-row:focus-within .file-row-actions { opacity: 1; }
+@media (hover: none) {
+  .file-row-actions { opacity: 1; }
 }
 .file-row-actions .btn-icon { width: 30px; height: 30px; }
 .file-row-actions .btn-icon svg { width: 14px; height: 14px; }
@@ -744,8 +778,8 @@ main.vault {
 @media (max-width: 560px) {
   .topbar { padding: 10px 14px; gap: 8px; }
   .topbar-right { gap: 8px; }
-  .topbar-right button { padding: 8px 10px; font-size: 0.78rem; }
-  .account-email { display: none; }
+  .topbar-right > button { padding: 8px 10px; font-size: 0.78rem; }
+  .settings-menu { right: -8px; }
   main.vault { padding: 16px 12px 50px; }
   .box-grid { grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 8px; }
   .deposit-slot { padding: 18px 14px; }

@@ -2,8 +2,8 @@ import * as C from './crypto.js';
 import * as api from './api.js';
 import {
   authScreen, appScreen, authForm, authSubmit, authStatus, passwordInput,
-  confirmField, passwordConfirmInput, accessTokenInput, saltInput, vaultFingerprint,
-  logoutBtn, tokenBtn, saltBtn, duressBtn, sourceBtn,
+  confirmField, passwordConfirmInput, accessTokenInput, saltInput,
+  logoutBtn, tokenBtn, saltBtn, duressBtn, sourceBtn, settingsBtn, settingsMenu,
 } from './dom.js';
 import { fileKeyCache, metaCache, getWrappingKeyRaw, setWrappingKeyRaw, getCurrentVaultId, setCurrentVaultId } from './state.js';
 import {
@@ -230,7 +230,6 @@ async function enterApp(): Promise<void> {
 
   authScreen.classList.add('hidden');
   appScreen.classList.remove('hidden');
-  vaultFingerprint.textContent = getCurrentVaultId()!.slice(0, 8);
   passwordInput.value = '';
   passwordConfirmInput.value = '';
   confirmField.classList.add('hidden');
@@ -261,6 +260,36 @@ function leaveApp(): void {
 }
 
 logoutBtn.addEventListener('click', leaveApp);
+
+function openSettingsMenu(): void {
+  settingsMenu.classList.remove('hidden');
+  settingsBtn.setAttribute('aria-expanded', 'true');
+}
+
+function closeSettingsMenu(): void {
+  settingsMenu.classList.add('hidden');
+  settingsBtn.setAttribute('aria-expanded', 'false');
+}
+
+settingsBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  if (settingsMenu.classList.contains('hidden')) openSettingsMenu();
+  else closeSettingsMenu();
+});
+
+document.addEventListener('click', (e) => {
+  if (settingsMenu.classList.contains('hidden')) return;
+  if (settingsMenu.contains(e.target as Node) || e.target === settingsBtn) return;
+  closeSettingsMenu();
+});
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !settingsMenu.classList.contains('hidden')) closeSettingsMenu();
+});
+
+for (const item of settingsMenu.querySelectorAll('button')) {
+  item.addEventListener('click', closeSettingsMenu);
+}
 
 tokenBtn.addEventListener('click', openTokenPanel);
 
