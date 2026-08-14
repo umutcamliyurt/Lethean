@@ -35,6 +35,7 @@ export const usagePill = $<HTMLSpanElement>('usage-pill');
 export const logoutBtn = $<HTMLButtonElement>('logout-btn');
 export const tokenBtn = $<HTMLButtonElement>('token-btn');
 export const saltBtn = $<HTMLButtonElement>('salt-btn');
+export const themeBtn = $<HTMLButtonElement>('theme-btn');
 export const duressBtn = $<HTMLButtonElement>('duress-btn');
 export const sourceBtn = $<HTMLButtonElement>('source-btn');
 export const settingsBtn = $<HTMLButtonElement>('settings-btn');

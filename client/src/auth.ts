@@ -3,14 +3,17 @@ import * as api from './api.js';
 import {
   authScreen, appScreen, authForm, authSubmit, authStatus, passwordInput,
   confirmField, passwordConfirmInput, accessTokenInput, saltInput,
-  logoutBtn, tokenBtn, saltBtn, duressBtn, sourceBtn, settingsBtn, settingsMenu,
+  logoutBtn, tokenBtn, saltBtn, themeBtn, duressBtn, sourceBtn, settingsBtn, settingsMenu,
 } from './dom.js';
 import { fileKeyCache, metaCache, getWrappingKeyRaw, setWrappingKeyRaw, getCurrentVaultId, setCurrentVaultId } from './state.js';
 import {
   isSetupComplete, markSetupComplete, getStoredAccessToken, setStoredAccessToken,
   getStoredSalt, setStoredSalt,
   loadDuressConfig, saveDuressConfig, resetDuressConfig,
+  getStoredTheme, setStoredTheme,
 } from './storage.js';
+import { THEMES, getTheme, applyTheme } from './theme.js';
+import type { ThemeDef } from './theme.js';
 import { escapeHtml, showToast } from './utils.js';
 import { showLightbox, closeLightbox } from './lightbox.js';
 import { refreshGallery, clearRenderedGrid, resetRecords } from './gallery.js';
@@ -294,6 +297,67 @@ for (const item of settingsMenu.querySelectorAll('button')) {
 tokenBtn.addEventListener('click', openTokenPanel);
 
 saltBtn.addEventListener('click', opensaltPanel);
+
+themeBtn.addEventListener('click', openThemePanel);
+
+function openThemePanel(): void {
+  const current = getStoredTheme();
+
+  showLightbox(`
+    <div class="settings-panel">
+      <h2>Theme</h2>
+      <p class="subtitle">
+        Pick a color theme. Applies instantly and is stored only on this device.
+      </p>
+      <div class="theme-grid" id="theme-grid" role="group" aria-label="Theme">
+        ${THEMES.map((t) => `
+          <button
+            type="button"
+            class="theme-swatch${t.id === current ? ' active' : ''}"
+            data-theme-id="${escapeHtml(t.id)}"
+            aria-pressed="${t.id === current}"
+          >
+            <span class="theme-swatch-preview">
+              <span class="theme-swatch-chip"></span>
+            </span>
+            <span class="theme-swatch-name">${escapeHtml(t.name)}</span>
+          </button>
+        `).join('')}
+      </div>
+    </div>
+  `);
+
+  const grid = document.getElementById('theme-grid')!;
+  grid.querySelectorAll<HTMLButtonElement>('.theme-swatch').forEach((btn) => {
+    const id = btn.dataset.themeId!;
+    const theme = getTheme(id);
+    paintThemeSwatch(btn, theme);
+
+    btn.addEventListener('click', () => {
+      applyTheme(id);
+      setStoredTheme(id);
+      grid.querySelectorAll<HTMLButtonElement>('.theme-swatch').forEach((b) => {
+        b.classList.toggle('active', b === btn);
+        b.setAttribute('aria-pressed', String(b === btn));
+      });
+      showToast(`Theme set to ${theme.name}.`);
+    });
+  });
+}
+
+function paintThemeSwatch(btn: HTMLButtonElement, theme: ThemeDef): void {
+  btn.style.background = theme.vars.surface;
+  btn.style.borderColor = theme.vars.border;
+  btn.style.color = theme.vars.text;
+
+  const preview = btn.querySelector<HTMLElement>('.theme-swatch-preview');
+  if (preview) {
+    preview.style.background = theme.vars.bg;
+    preview.style.borderColor = theme.vars.border;
+  }
+  const chip = btn.querySelector<HTMLElement>('.theme-swatch-chip');
+  if (chip) chip.style.background = theme.accent;
+}
 
 function opensaltPanel(): void {
   const current = currentsalt || getStoredSalt();

@@ -1,3 +1,4 @@
+import './theme.js';
 import './gallery.js';
 import './lightbox.js';
 import './auth.js';

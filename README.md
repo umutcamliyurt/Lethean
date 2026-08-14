@@ -9,6 +9,7 @@ Lethean is a zero-knowledge encrypted storage app with no accounts, no email. Pa
 ## Features
 
 - No user account required
+- Elegant and customizable UI
 - AES-256-GCM for client-side encryption
 - Ciphertext padding to hide file size metadata
 - Argon2id for key derivation with per-vault salt

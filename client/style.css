@@ -33,6 +33,7 @@ html, body {
   font-family: var(--font);
   -webkit-font-smoothing: antialiased;
   overflow-x: hidden;
+  transition: background-color 0.15s ease, color 0.15s ease;
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -754,6 +755,49 @@ main.vault {
   user-select: all;
   margin-bottom: 16px;
 }
+
+.theme-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 10px;
+}
+.theme-swatch {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 6px 12px;
+  min-height: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  transition: box-shadow 0.12s ease, transform 0.12s ease;
+}
+.theme-swatch:hover { box-shadow: 0 0 0 1px currentColor; }
+.theme-swatch.active {
+  box-shadow: 0 0 0 2px currentColor;
+}
+.theme-swatch-preview {
+  position: relative;
+  width: 100%;
+  height: 40px;
+  border-radius: calc(var(--radius) - 2px);
+  border: 1px solid var(--border);
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-end;
+  padding: 6px;
+}
+.theme-swatch-chip {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.25);
+}
+.theme-swatch-name {
+  font-size: 0.76rem;
+}
+.theme-swatch.active .theme-swatch-name { font-weight: 600; }
 
 #toasts {
   position: fixed;

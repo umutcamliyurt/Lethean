@@ -6,6 +6,8 @@ const LS_DURESS_KEY = 'vault.duress';
 const LS_ACCESS_TOKEN_KEY = 'vault.accessToken';
 const LS_SALT_KEY = 'vault.salt';
 const LS_VIEW_MODE_KEY = 'vault.viewMode';
+const LS_THEME_KEY = 'vault.theme';
+const DEFAULT_THEME_ID = 'noir';
 
 export function isSetupComplete(): boolean {
   return localStorage.getItem(LS_SETUP_KEY) === '1';
@@ -52,4 +54,11 @@ export function getStoredViewMode(): ViewMode {
 }
 export function setStoredViewMode(mode: ViewMode): void {
   localStorage.setItem(LS_VIEW_MODE_KEY, mode);
+}
+
+export function getStoredTheme(): string {
+  return localStorage.getItem(LS_THEME_KEY) || DEFAULT_THEME_ID;
+}
+export function setStoredTheme(id: string): void {
+  localStorage.setItem(LS_THEME_KEY, id);
 }
