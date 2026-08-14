@@ -66,8 +66,8 @@ Serves the API and client at `http://localhost:8000`.
 ## Threat Model
 
 **Defends against:**
-- Server compromise, only ciphertext, random `vaultId`s, and wrapped keys are ever stored
-- Offline brute-force of a stolen database, every guess pays full Argon2id cost
+- Server compromise: only encrypted data and encrypted metadata are stored. File size also remains hidden from adversary
+- Offline brute-force of a stolen database
 - Coerced unlock, duress path is indistinguishable at the network, storage, and UI level
 - Passive network eavesdropping of unlock attempts
 
