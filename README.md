@@ -48,11 +48,8 @@ All three cases look identical from the outside, same derivation steps happen in
 This also means an observer can't even confirm that a duress code exists for a given vault, the possibility is baked in silently, not something that shows up as a special "duress mode" anywhere.
 
 ## Access Tokens
- 
-There are two levels of access, depending on what user wants to do:
- 
-- Browsing an existing vault just needs the password, nothing else.
-- Uploading files needs one more thing: an access token, issued by whoever operates the server. Each token comes with a default 10 GB quota, and it's a one-time pairing, the first vault it's used with is the only vault it will ever work with.
+
+Uploading files requires an access token, issued by whoever operates the server. Each token comes with a default 10 GB quota, and it's a one-time pairing, the first vault it's used with is the only vault it will ever work with.
 Server operators manage these tokens from the command line:
  
 ```bash
