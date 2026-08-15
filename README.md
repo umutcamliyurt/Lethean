@@ -2,7 +2,9 @@
 
 ## Anonymous Zero-Knowledge Encrypted Cloud Storage
 
-Lethean is a zero-knowledge encrypted storage app with no accounts. Password and salt are the only credentials and they never leave the browser. Upload photos and videos, browse them in a gallery, and play them fully decrypted in memory; the server only ever sees encrypted data.
+Lethean is a zero-knowledge encrypted storage app with no accounts. Your chosen password and the salt are the only credentials required to access your personal vault. These credentials never leave the browser. You can upload files and archives, including photos or videos, which you can browse and play (decrypted in memory). By design and for maximum security, the server only ever sees encrypted data, while only you hold the key.
+
+> The name comes from the **River of Forgetfulness** in Greek mythology. In the Underworld, souls who drink from the river would lose all memory of their past lives before reincarnation.
 
 ![screenshot](screenshot.png)
 
