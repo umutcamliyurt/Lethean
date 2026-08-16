@@ -56,6 +56,7 @@ async function checkOk(res: Response, label: string): Promise<Response> {
 }
 
 const STALL_TIMEOUT_MS = 20000;
+const RESPONSE_WAIT_TIMEOUT_MS = 120000;
 
 export async function uploadFile(
   encrypted: EncryptedFilePayload,
@@ -79,20 +80,24 @@ export async function uploadFile(
     let stalled = false;
     let watchdog: ReturnType<typeof setTimeout>;
 
-    const armWatchdog = () => {
+    const armWatchdog = (timeoutMs: number) => {
       clearTimeout(watchdog);
       watchdog = setTimeout(() => {
         stalled = true;
         xhr.abort();
-      }, STALL_TIMEOUT_MS);
+      }, timeoutMs);
     };
     const clearWatchdog = () => clearTimeout(watchdog);
 
-    armWatchdog();
+    armWatchdog(STALL_TIMEOUT_MS);
 
     xhr.upload.onprogress = (e) => {
-      armWatchdog();
       if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total);
+      if (e.lengthComputable && e.loaded >= e.total) {
+        armWatchdog(RESPONSE_WAIT_TIMEOUT_MS);
+      } else {
+        armWatchdog(STALL_TIMEOUT_MS);
+      }
     };
 
     xhr.onload = () => {
