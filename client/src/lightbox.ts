@@ -12,6 +12,28 @@ let lightboxMediaList: FileRecord[] = [];
 let lightboxIndex = -1;
 let lightboxNavLock = false;
 
+let currentPreviewId: string | null = null;
+
+function isThumbnailedKind(meta: FileMeta | undefined | null): boolean {
+  return fileKind(meta?.mime) === 'image';
+}
+
+function releaseEphemeralPreview(id: string | null): void {
+  if (!id) return;
+  const meta = metaCache.get(id);
+  if (isThumbnailedKind(meta)) return;
+  const url = objectUrlCache.get(id);
+  if (url) {
+    URL.revokeObjectURL(url);
+    objectUrlCache.delete(id);
+  }
+}
+
+function switchPreview(newId: string | null): void {
+  if (currentPreviewId && currentPreviewId !== newId) releaseEphemeralPreview(currentPreviewId);
+  currentPreviewId = newId;
+}
+
 const isCoarsePointerDevice = typeof window.matchMedia === 'function'
   && window.matchMedia('(pointer: coarse)').matches;
 const MOBILE_INLINE_VIDEO_LIMIT_BYTES = 150 * 1024 * 1024;
@@ -57,6 +79,7 @@ export async function openTile(fileId: string): Promise<void> {
   if (kind === 'other' || skipInlinePreview) {
     lightboxMediaList = [];
     lightboxIndex = -1;
+    switchPreview(null);
     const tileEl = boxGrid.querySelector(`[data-id="${CSS.escape(fileId)}"]`);
     tileEl?.classList.add('opening');
     let note = '';
@@ -89,6 +112,7 @@ export async function openTile(fileId: string): Promise<void> {
 async function openOtherPreview(record: FileRecord, meta: FileMeta, kind: 'pdf' | 'audio' | 'text'): Promise<void> {
   lightboxMediaList = [];
   lightboxIndex = -1;
+  switchPreview(record.id);
   const tileEl = boxGrid.querySelector(`[data-id="${CSS.escape(record.id)}"]`);
   tileEl?.classList.add('decrypting');
   showLightbox(`<div class="lightbox-content"><div class="spinner spinner-lg"></div></div>`, { keepMedia: true });
@@ -101,9 +125,6 @@ async function openOtherPreview(record: FileRecord, meta: FileMeta, kind: 'pdf' 
       const bytes = await getDecryptedBytes(record);
       const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
       inner = `<pre class="lightbox-text" id="lightbox-media">${escapeHtml(text)}</pre>`;
-      const blob = new Blob([bytes as BlobPart], { type: meta.mime || 'text/plain' });
-      objectUrl = URL.createObjectURL(blob);
-      objectUrlCache.set(record.id, objectUrl);
     } else if (kind === 'pdf') {
       const bytes = await getDecryptedBytes(record);
       if (!looksLikePdf(bytes)) {
@@ -114,7 +135,7 @@ async function openOtherPreview(record: FileRecord, meta: FileMeta, kind: 'pdf' 
       const blob = new Blob([bytes as BlobPart], { type: 'application/pdf' });
       objectUrl = URL.createObjectURL(blob);
       objectUrlCache.set(record.id, objectUrl);
-      inner = `<iframe src="${objectUrl}" id="lightbox-media" title="${escapeHtml(meta.name)}"></iframe>`;
+      inner = `<iframe src="${objectUrl}" id="lightbox-media" title="${escapeHtml(meta.name)}" sandbox="allow-same-origin" referrerpolicy="no-referrer"></iframe>`;
     } else {
       objectUrl = await getDecryptedUrl(record);
       inner = `<audio src="${objectUrl}" controls autoplay id="lightbox-media"></audio>`;
@@ -130,7 +151,7 @@ async function openOtherPreview(record: FileRecord, meta: FileMeta, kind: 'pdf' 
       </div>
     `, { keepMedia: true });
 
-    document.getElementById('lightbox-download')!.addEventListener('click', () => downloadAndSave(record, meta, objectUrl!));
+    document.getElementById('lightbox-download')!.addEventListener('click', () => downloadAndSave(record, meta, objectUrl ?? undefined));
   } catch (err) {
     const unsafeErr = err as UnsafePdfError;
     if (unsafeErr.unsafePdf) {
@@ -163,6 +184,7 @@ async function openMediaAt(list: FileRecord[], index: number): Promise<void> {
   lightboxMediaList = list;
   lightboxIndex = index;
   lightbox.classList.toggle('has-nav', list.length > 1);
+  switchPreview(record.id);
 
   const tileEl = boxGrid.querySelector(`[data-id="${CSS.escape(record.id)}"]`);
   tileEl?.classList.add('decrypting');
@@ -213,6 +235,8 @@ export function showLightbox(innerHtml: string, { keepMedia = false }: { keepMed
     lightboxMediaList = [];
     lightboxIndex = -1;
     lightbox.classList.remove('has-nav');
+    releaseEphemeralPreview(currentPreviewId);
+    currentPreviewId = null;
   }
   lightbox.innerHTML = `
     <button class="btn-icon lightbox-close" id="lightbox-close" aria-label="Close">${icon('close')}</button>
@@ -234,6 +258,8 @@ export function closeLightbox(): void {
   lightbox.innerHTML = '';
   lightboxMediaList = [];
   lightboxIndex = -1;
+  releaseEphemeralPreview(currentPreviewId);
+  currentPreviewId = null;
 }
 
 document.addEventListener('keydown', (e) => {
