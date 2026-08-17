@@ -7,7 +7,9 @@ const LS_ACCESS_TOKEN_KEY = 'vault.accessToken';
 const LS_SALT_KEY = 'vault.salt';
 const LS_VIEW_MODE_KEY = 'vault.viewMode';
 const LS_THEME_KEY = 'vault.theme';
+const LS_CONFIRMED_MARKERS_KEY = 'vault.confirmedMarkers';
 const DEFAULT_THEME_ID = 'noir';
+const MAX_CONFIRMED_MARKERS = 50;
 
 export function isSetupComplete(): boolean {
   return localStorage.getItem(LS_SETUP_KEY) === '1';
@@ -61,4 +63,28 @@ export function getStoredTheme(): string {
 }
 export function setStoredTheme(id: string): void {
   localStorage.setItem(LS_THEME_KEY, id);
+}
+
+function loadConfirmedMarkers(): string[] {
+  try {
+    const raw = localStorage.getItem(LS_CONFIRMED_MARKERS_KEY);
+    if (raw) {
+      const parsed = JSON.parse(raw) as unknown;
+      if (Array.isArray(parsed)) return parsed.filter((m): m is string => typeof m === 'string');
+    }
+  } catch {
+  }
+  return [];
+}
+
+export function isVaultConfirmed(marker: string): boolean {
+  return loadConfirmedMarkers().includes(marker);
+}
+
+export function markVaultConfirmed(marker: string): void {
+  const markers = loadConfirmedMarkers();
+  if (markers.includes(marker)) return;
+  markers.push(marker);
+  while (markers.length > MAX_CONFIRMED_MARKERS) markers.shift();
+  localStorage.setItem(LS_CONFIRMED_MARKERS_KEY, JSON.stringify(markers));
 }

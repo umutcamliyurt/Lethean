@@ -756,6 +756,46 @@ main.vault {
   margin-bottom: 16px;
 }
 
+.settings-panel.settings-panel-wide {
+  max-width: 480px;
+}
+
+.duress-decoy-section {
+  margin-top: 22px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+}
+.duress-decoy-section h3 {
+  font-size: 0.88rem;
+  font-weight: 600;
+  margin: 0 0 6px;
+}
+.duress-decoy-section p.subtitle {
+  margin-bottom: 16px;
+}
+.decoy-inline-fields {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+}
+.decoy-inline-fields .field {
+  flex: 1;
+  margin-bottom: 0;
+}
+.decoy-inline-fields button {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.duress-decoy-section .upload-queue {
+  margin-top: 14px;
+  margin-bottom: 0;
+}
+
+@media (max-width: 420px) {
+  .decoy-inline-fields { flex-direction: column; align-items: stretch; }
+  .decoy-inline-fields button { width: 100%; }
+}
+
 .theme-grid {
   display: grid;
   grid-template-columns: repeat(3, 1fr);

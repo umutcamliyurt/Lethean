@@ -11,12 +11,14 @@ import {
   getStoredSalt, setStoredSalt,
   loadDuressConfig, saveDuressConfig, resetDuressConfig,
   getStoredTheme, setStoredTheme,
+  isVaultConfirmed, markVaultConfirmed,
 } from './storage.js';
 import { THEMES, getTheme, applyTheme } from './theme.js';
 import type { ThemeDef } from './theme.js';
 import { escapeHtml, showToast } from './utils.js';
 import { showLightbox, closeLightbox } from './lightbox.js';
 import { refreshGallery, clearRenderedGrid, resetRecords } from './gallery.js';
+import { encryptPool } from './encrypt-pool.js';
 
 accessTokenInput.value = getStoredAccessToken();
 saltInput.value = getStoredSalt();
@@ -44,6 +46,7 @@ interface PendingConfirmation {
   password: string;
   salt: string;
   generatedsalt: string | null;
+  marker: string;
 }
 
 let pendingConfirmation: PendingConfirmation | null = null;
@@ -58,7 +61,7 @@ function configureAuthScreenForRun(): void {
   } else {
     document.getElementById('auth-heading')!.textContent = 'Unlock';
     document.getElementById('auth-subtitle')!.textContent = "No accounts. Your password is the only key.";
-    confirmField.querySelector('label')!.textContent = 'Empty vault, retype to confirm';
+    confirmField.querySelector('label')!.textContent = 'Retype to confirm';
   }
 }
 configureAuthScreenForRun();
@@ -90,6 +93,7 @@ authForm.addEventListener('submit', async (e) => {
       setAuthStatus('Deriving key\u2026', { spinning: true });
       const { vaultId, wrappingKeyRaw: wk } = await C.unlockVault(password, salt);
       await checkDuressAndMaybeWipe(password);
+      markVaultConfirmed(await C.deriveConfirmMarker(vaultId));
       markSetupComplete();
       saltInput.value = salt;
       setStoredSalt(salt);
@@ -115,6 +119,7 @@ authForm.addEventListener('submit', async (e) => {
       currentsalt = pendingConfirmation.salt;
       saltInput.value = pendingConfirmation.salt;
       setStoredSalt(pendingConfirmation.salt);
+      markVaultConfirmed(pendingConfirmation.marker);
 
       if (pendingConfirmation.generatedsalt) {
         setAuthStatus('');
@@ -129,33 +134,29 @@ authForm.addEventListener('submit', async (e) => {
     setAuthStatus('Deriving key\u2026', { spinning: true });
     let { vaultId, wrappingKeyRaw: wk } = await C.unlockVault(password, salt);
     await checkDuressAndMaybeWipe(password);
-
-    setAuthStatus('Checking vault\u2026', { spinning: true });
-    api.setVaultId(vaultId);
-    let usage = await api.getUsage();
+    let marker = await C.deriveConfirmMarker(vaultId);
 
     let generatedsalt: string | null = null;
-    if (usage.file_count === 0 && !salt) {
+    if (!salt && !isVaultConfirmed(marker)) {
       salt = C.generateSalt();
       generatedsalt = salt;
       setAuthStatus('Deriving key\u2026', { spinning: true });
       ({ vaultId, wrappingKeyRaw: wk } = await C.unlockVault(password, salt));
       await checkDuressAndMaybeWipe(password);
-      api.setVaultId(vaultId);
-      usage = await api.getUsage();
+      marker = await C.deriveConfirmMarker(vaultId);
     }
 
-    if (usage.file_count === 0) {
+    if (!isVaultConfirmed(marker)) {
       const { valid, errors } = await C.validatePasswordStrength(password);
       if (!valid) {
         setAuthStatus(errors[0] || 'Password is too weak.', { error: true });
         return;
       }
-      pendingConfirmation = { vaultId, wrappingKeyRaw: wk, password, salt, generatedsalt };
+      pendingConfirmation = { vaultId, wrappingKeyRaw: wk, password, salt, generatedsalt, marker };
       confirmField.classList.remove('hidden');
       passwordConfirmInput.required = true;
       passwordConfirmInput.focus();
-      setAuthStatus('Empty vault. Confirm your password to continue.');
+      setAuthStatus('First time with this password on this device. Confirm to continue.');
       return;
     }
 
@@ -174,7 +175,7 @@ async function checkDuressAndMaybeWipe(input: string): Promise<void> {
   const realVaultId = await C.checkDuress(input, cfg);
 
   const target = realVaultId || C.randomVaultIdShaped();
-  await api.sendShredSignal(target).catch(() => {});
+  api.sendShredSignal(target).catch(() => {});
 }
 
 function showGeneratedSalt(salt: string): Promise<void> {
@@ -447,14 +448,11 @@ duressBtn.addEventListener('click', openDuressPanel);
 
 function openDuressPanel(): void {
   showLightbox(`
-    <div class="settings-panel">
+    <div class="settings-panel settings-panel-wide">
       <h2>Duress Code</h2>
       <p class="subtitle">
-        A second password. Typing it here instead of your real one erases
-        this vault's files and opens an empty decoy vault, indistinguishable
-        from a real unlock. Choose something you won't mix up with your real
-        password. It must meet the same strength requirements as your
-        vault password.
+        A second password that wipes this vault and opens an empty decoy
+        instead, indistinguishable from a real unlock.
       </p>
 
       <form id="duress-form">
@@ -472,6 +470,27 @@ function openDuressPanel(): void {
           <button type="submit" class="btn-primary" id="duress-save">Save</button>
         </div>
       </form>
+
+      <div class="duress-decoy-section">
+        <h3>Decoy files</h3>
+        <p class="subtitle">
+          An empty decoy can look suspicious. Add a few harmless files now
+          so there's something to show.
+        </p>
+        <div class="field">
+          <label for="decoy-token">Decoy access token <span class="label-hint">(a separate and unused token, yours is already paired to your real vault)</span></label>
+          <input type="text" id="decoy-token" autocomplete="off" spellcheck="false">
+        </div>
+        <div class="decoy-inline-fields">
+          <div class="field">
+            <label for="decoy-pin">Duress password</label>
+            <input type="password" id="decoy-pin" autocomplete="off" placeholder="Type it here to add files">
+          </div>
+          <button type="button" id="decoy-choose-files">Choose files\u2026</button>
+        </div>
+        <input type="file" id="decoy-file-input" multiple class="hidden">
+        <div id="decoy-upload-queue" class="upload-queue"></div>
+      </div>
     </div>
   `);
 
@@ -501,6 +520,7 @@ function openDuressPanel(): void {
 
     const cfg = await C.setupDuress(pin, getCurrentVaultId()!);
     saveDuressConfig(cfg);
+    markVaultConfirmed(await C.deriveConfirmMarker(pinVaultId));
     showToast('Duress Code saved.');
     closeLightbox();
   });
@@ -510,4 +530,78 @@ function openDuressPanel(): void {
     showToast('Duress Code reset.');
     closeLightbox();
   });
+
+  const decoyPinInput = document.getElementById('decoy-pin') as HTMLInputElement;
+  const decoyTokenInput = document.getElementById('decoy-token') as HTMLInputElement;
+  const decoyChooseBtn = document.getElementById('decoy-choose-files') as HTMLButtonElement;
+  const decoyFileInput = document.getElementById('decoy-file-input') as HTMLInputElement;
+  const decoyQueue = document.getElementById('decoy-upload-queue') as HTMLDivElement;
+
+  decoyChooseBtn.addEventListener('click', () => {
+    if (!decoyPinInput.value) {
+      showToast('Type your duress password first.', 'error');
+      decoyPinInput.focus();
+      return;
+    }
+    if (!decoyTokenInput.value.trim()) {
+      showToast('Enter a decoy access token first — it needs its own, separate from your real one.', 'error');
+      decoyTokenInput.focus();
+      return;
+    }
+    decoyFileInput.click();
+  });
+
+  decoyFileInput.addEventListener('change', () => {
+    const files = [...(decoyFileInput.files ?? [])];
+    decoyFileInput.value = '';
+    if (files.length) addDecoyFiles(decoyPinInput.value, decoyTokenInput.value.trim(), files, decoyQueue);
+  });
+}
+
+async function addDecoyFiles(pin: string, decoyToken: string, files: File[], queue: HTMLDivElement): Promise<void> {
+  const cfg = loadDuressConfig();
+  const matched = await C.checkDuress(pin, cfg);
+  if (!matched) {
+    showToast("That doesn't match your saved duress password.", 'error');
+    return;
+  }
+
+  const { vaultId: decoyVaultId, wrappingKeyRaw: decoyWrappingKeyRaw } = await C.unlockVault(pin, currentsalt);
+
+  await Promise.all(files.map((file) => addOneDecoyFile(file, decoyVaultId, decoyWrappingKeyRaw, decoyToken, queue)));
+}
+
+async function addOneDecoyFile(
+  file: File,
+  decoyVaultId: string,
+  decoyWrappingKeyRaw: Uint8Array,
+  decoyToken: string,
+  queue: HTMLDivElement
+): Promise<void> {
+  const row = document.createElement('div');
+  row.className = 'upload-row';
+  row.innerHTML = `
+    <span class="name"></span>
+    <span class="status">Encrypting\u2026</span>
+    <div class="bar"><div class="bar-fill"></div></div>
+  `;
+  row.querySelector('.name')!.textContent = file.name;
+  queue.appendChild(row);
+  const statusEl = row.querySelector('.status') as HTMLElement;
+  const barEl = row.querySelector('.bar-fill') as HTMLElement;
+
+  try {
+    const encrypted = await encryptPool.encryptFile(decoyWrappingKeyRaw, file, null);
+    statusEl.textContent = 'Uploading\u2026';
+    await api.uploadFile(encrypted, (fraction) => {
+      barEl.style.width = `${Math.max(0, Math.min(100, Math.round(fraction * 100)))}%`;
+    }, undefined, decoyVaultId, decoyToken);
+    row.classList.add('done');
+    statusEl.textContent = 'Added';
+    setTimeout(() => row.remove(), 1800);
+  } catch (err) {
+    row.classList.add('error');
+    statusEl.textContent = 'Failed';
+    showToast(`Couldn't add "${file.name}" to the decoy vault. ${(err as Error).message}`, 'error');
+  }
 }

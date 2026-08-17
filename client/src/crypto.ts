@@ -77,6 +77,11 @@ export async function deriveWrappingKey(masterKeyBytes: Uint8Array): Promise<Uin
   return hkdf(masterKeyBytes, 'e2ee-vault|wrap|v1', 32);
 }
 
+export async function deriveConfirmMarker(vaultId: string): Promise<string> {
+  const bytes = await crypto.subtle.digest('SHA-256', asBufferSource(utf8('e2ee-vault|confirmed-marker|v1|' + vaultId)));
+  return toHex(new Uint8Array(bytes));
+}
+
 export async function unlockVault(password: string, Salt: string | null | undefined): Promise<UnlockResult> {
   const masterKey = await deriveMasterKey(password, Salt);
   const [vaultId, wrappingKeyRaw] = await Promise.all([

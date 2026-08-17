@@ -23,8 +23,9 @@ export function clearCredentials(): void {
   accessToken = null;
 }
 
-function authHeaders(): Record<string, string> {
-  return vaultId ? { Authorization: `Bearer ${vaultId}` } : {};
+function authHeaders(vaultIdOverride?: string): Record<string, string> {
+  const id = vaultIdOverride ?? vaultId;
+  return id ? { Authorization: `Bearer ${id}` } : {};
 }
 
 function privateFetch(input: string, init: RequestInit = {}): Promise<Response> {
@@ -61,7 +62,9 @@ const RESPONSE_WAIT_TIMEOUT_MS = 120000;
 export async function uploadFile(
   encrypted: EncryptedFilePayload,
   onProgress?: ProgressCallback,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  vaultIdOverride?: string,
+  accessTokenOverride?: string
 ): Promise<FileRecord> {
   const form = new FormData();
   form.append('content_iv', encrypted.contentIv);
@@ -74,8 +77,9 @@ export async function uploadFile(
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', `${BASE_URL}/files`);
-    for (const [k, v] of Object.entries(authHeaders())) xhr.setRequestHeader(k, v);
-    if (accessToken) xhr.setRequestHeader('X-Access-Token', accessToken);
+    for (const [k, v] of Object.entries(authHeaders(vaultIdOverride))) xhr.setRequestHeader(k, v);
+    const tokenToSend = accessTokenOverride !== undefined ? accessTokenOverride : accessToken;
+    if (tokenToSend) xhr.setRequestHeader('X-Access-Token', tokenToSend);
 
     let stalled = false;
     let watchdog: ReturnType<typeof setTimeout>;

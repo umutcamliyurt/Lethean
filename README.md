@@ -16,7 +16,7 @@ Lethean is a zero-knowledge encrypted storage app with no accounts. Your chosen 
 - Ciphertext padding to hide file size metadata
 - Argon2id for key derivation with per-vault salt
 - Minimum 12-character password, checked against a common-password list locally
-- Duress code for wiping the vault under coercion
+- Duress code for wiping the vault under coercion, with an optional decoy vault
 
 ## How It Works
 
@@ -36,24 +36,26 @@ Everything starts with the password. Here's the chain, step by step:
 **Why this resists brute-forcing:** because `vaultId` only exists after the Argon2id step, someone who steals the server's data can't shortcut anything. Every single password guess still has to pay the full Argon2id cost, there's no faster path in.
 
 ## Duress Code
- 
+
 Think of the duress code as a second, secret password that opens a decoy vault instead of the real one, and silently destroys the real one in the process.
- 
+
 Here's what makes it safe to use under coercion: if someone forces user to "unlock their vault," there's no way for them to tell which of these three things actually happened:
- 
+
 - User entered their real password --> real vault opens normally
-- User entered their duress code --> real vault is wiped, an empty decoy opens instead
+- User entered their duress code --> real vault is wiped, a decoy opens instead
 - User entered the wrong password --> nothing happens, an empty vault opens instead
 
 All three cases look identical from the outside, same derivation steps happen in the browser, same network requests go out, even the exact same `DELETE /vault` request shape gets sent to the server every time. Nothing about the traffic, timing, or server behavior reveals which one occurred.
- 
+
+An empty decoy vault can itself be a tell, "let me in" followed by a suspiciously bare vault invites questions. So user can pre-stock the decoy with a handful of harmless files ahead of time, from inside the real vault's settings.
+
 This also means an observer can't even confirm that a duress code exists for a given vault, the possibility is baked in silently, not something that shows up as a special "duress mode" anywhere.
 
 ## Access Tokens
 
 Uploading files requires an access token, issued by whoever operates the server. Each token comes with a default 10 GB quota, and it's a one-time pairing, the first vault it's used with is the only vault it will ever work with.
 Server operators manage these tokens from the command line:
- 
+
 ```bash
 cd backend
 python manage_tokens.py create --label alice --quota-gb 15    # issue a new token
