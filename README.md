@@ -67,8 +67,6 @@ python manage_tokens.py revoke <token-or-id>                   # disable a token
 python manage_tokens.py migrate                                # migration to hashed storage
 ```
 
-`create` issues two tokens by default: one for the real vault, and one for the decoy vault, both with the same quota.
-
 ## Setup
 
 ```bash
