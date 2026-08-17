@@ -22,7 +22,7 @@ def cmd_create(args):
         print(f"Quota: {quota_display}")
         print("Not yet bound to a vault, it will bind automatically to whichever")
         print("vault first uploads with it. Give this token to the person who")
-        print("should use it; they enter it in the app alongside their passphrase.")
+        print("should use it; they enter it in the app alongside their password.")
         return
 
     decoy_label = f"{args.label} (decoy)" if args.label else "(decoy)"
@@ -36,7 +36,7 @@ def cmd_create(args):
     print("Neither is bound to a vault yet, each binds automatically to")
     print("whichever vault first uploads with it. Give both to the person who")
     print("should use them: the real token goes in the app's main Access token")
-    print("field alongside their passphrase; the decoy token goes in the")
+    print("field alongside their password; the decoy token goes in the")
     print("Duress Code panel, under 'Decoy files'.")
 
 
