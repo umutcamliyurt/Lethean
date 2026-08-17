@@ -54,14 +54,20 @@ This also means an observer can't even confirm that a duress code exists for a g
 ## Access Tokens
 
 Uploading files requires an access token, issued by whoever operates the server. Each token comes with a default 10 GB quota, and it's a one-time pairing, the first vault it's used with is the only vault it will ever work with.
+
+Tokens are hashed (SHA-256) before they're written to disk, so a leaked `tokens.json` doesn't hand out upload tokens.
+
 Server operators manage these tokens from the command line:
 
 ```bash
 cd backend
-python manage_tokens.py create --label alice --quota-gb 15    # issue a new token
-python manage_tokens.py list                                  # see all tokens
-python manage_tokens.py revoke <token>                        # disable a token
+python manage_tokens.py create --label alice --quota-gb 15     # issue a real token + a matching decoy token
+python manage_tokens.py list                                   # see all tokens
+python manage_tokens.py revoke <token-or-id>                   # disable a token
+python manage_tokens.py migrate                                # migration to hashed storage
 ```
+
+`create` issues two tokens by default: one for the real vault, and one for the decoy vault used by the Duress Code feature, both with the same quota, so the decoy is never distinguishable by a smaller number. Pass `--no-decoy` to skip the second one.
 
 ## Setup
 
