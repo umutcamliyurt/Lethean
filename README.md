@@ -67,7 +67,7 @@ python manage_tokens.py revoke <token-or-id>                   # disable a token
 python manage_tokens.py migrate                                # migration to hashed storage
 ```
 
-`create` issues two tokens by default: one for the real vault, and one for the decoy vault used by the Duress Code feature, both with the same quota, so the decoy is never distinguishable by a smaller number. Pass `--no-decoy` to skip the second one.
+`create` issues two tokens by default: one for the real vault, and one for the decoy vault, both with the same quota.
 
 ## Setup
 
