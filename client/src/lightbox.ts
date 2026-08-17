@@ -14,6 +14,190 @@ let lightboxNavLock = false;
 
 let currentPreviewId: string | null = null;
 
+let currentMediaCtx: { record: FileRecord; meta: FileMeta; url: string } | null = null;
+
+
+interface VendorFullscreenDoc {
+  webkitFullscreenElement?: Element | null;
+  webkitFullscreenEnabled?: boolean;
+  webkitExitFullscreen?: () => void;
+  webkitCancelFullScreen?: () => void;
+  mozFullScreenElement?: Element | null;
+  mozFullScreenEnabled?: boolean;
+  mozCancelFullScreen?: () => void;
+  msFullscreenElement?: Element | null;
+  msFullscreenEnabled?: boolean;
+  msExitFullscreen?: () => void;
+}
+
+interface VendorFullscreenEl {
+  webkitRequestFullscreen?: () => void;
+  webkitRequestFullScreen?: () => void;
+  webkitEnterFullscreen?: () => void;
+  mozRequestFullScreen?: () => void;
+  msRequestFullscreen?: () => void;
+}
+
+function getNativeFullscreenElement(): Element | null {
+  const d = document as unknown as VendorFullscreenDoc;
+  return document.fullscreenElement || d.webkitFullscreenElement || d.mozFullScreenElement || d.msFullscreenElement || null;
+}
+
+function isNativeFullscreenActive(): boolean {
+  return !!getNativeFullscreenElement();
+}
+
+function supportsElementFullscreen(el: HTMLElement): boolean {
+  const d = document as unknown as VendorFullscreenDoc;
+  const enabled = document.fullscreenEnabled ?? d.webkitFullscreenEnabled ?? d.mozFullScreenEnabled ?? d.msFullscreenEnabled ?? false;
+  if (!enabled) return false;
+  const e = el as unknown as VendorFullscreenEl;
+  return typeof el.requestFullscreen === 'function'
+    || typeof e.webkitRequestFullscreen === 'function'
+    || typeof e.webkitRequestFullScreen === 'function'
+    || typeof e.mozRequestFullScreen === 'function'
+    || typeof e.msRequestFullscreen === 'function';
+}
+
+async function requestFullscreenCompat(el: HTMLElement): Promise<void> {
+  const e = el as unknown as VendorFullscreenEl;
+  if (typeof el.requestFullscreen === 'function') {
+    await el.requestFullscreen();
+    return;
+  }
+  if (typeof e.webkitRequestFullscreen === 'function') { e.webkitRequestFullscreen(); return; }
+  if (typeof e.webkitRequestFullScreen === 'function') { e.webkitRequestFullScreen(); return; }
+  if (typeof e.mozRequestFullScreen === 'function') { e.mozRequestFullScreen(); return; }
+  if (typeof e.msRequestFullscreen === 'function') { e.msRequestFullscreen(); return; }
+  throw new Error('Fullscreen API not supported');
+}
+
+async function exitFullscreenCompat(): Promise<void> {
+  const d = document as unknown as VendorFullscreenDoc;
+  if (document.exitFullscreen) { await document.exitFullscreen(); return; }
+  if (d.webkitExitFullscreen) { d.webkitExitFullscreen(); return; }
+  if (d.webkitCancelFullScreen) { d.webkitCancelFullScreen(); return; }
+  if (d.mozCancelFullScreen) { d.mozCancelFullScreen(); return; }
+  if (d.msExitFullscreen) { d.msExitFullscreen(); return; }
+}
+
+function fixNativeFullscreenSizing(el: Element | null): void {
+  if (!(el instanceof HTMLElement)) return;
+  el.style.objectFit = 'contain';
+  el.style.backgroundColor = '#000';
+}
+
+let pseudoFullscreenActive = false;
+
+function applyPseudoFullscreenStyles(mediaEl: HTMLElement, active: boolean): void {
+  if (active) {
+    mediaEl.dataset.pseudoFsStyle = mediaEl.getAttribute('style') || '';
+    Object.assign(mediaEl.style, {
+      position: 'fixed',
+      inset: '0',
+      width: '100vw',
+      height: '100dvh',
+      maxWidth: 'none',
+      maxHeight: 'none',
+      objectFit: 'contain',
+      background: '#000',
+      zIndex: '2147483000',
+      margin: '0',
+    });
+  } else {
+    const prev = mediaEl.dataset.pseudoFsStyle;
+    if (prev) mediaEl.setAttribute('style', prev);
+    else mediaEl.removeAttribute('style');
+    delete mediaEl.dataset.pseudoFsStyle;
+  }
+}
+
+function layoutPseudoFullscreenChrome(active: boolean): void {
+  const setFixed = (el: HTMLElement | null, styles: Partial<CSSStyleDeclaration>): void => {
+    if (!el) return;
+    if (active) {
+      el.dataset.pseudoFsStyle = el.getAttribute('style') || '';
+      Object.assign(el.style, { position: 'fixed', zIndex: '2147483001' }, styles);
+    } else {
+      const prev = el.dataset.pseudoFsStyle;
+      if (prev) el.setAttribute('style', prev);
+      else el.removeAttribute('style');
+      delete el.dataset.pseudoFsStyle;
+    }
+  };
+
+  setFixed(document.getElementById('lightbox-close'), { top: '12px', right: '12px' });
+  setFixed(document.getElementById('lightbox-prev'), { top: '50%', left: '12px', transform: 'translateY(-50%)' });
+  setFixed(document.getElementById('lightbox-next'), { top: '50%', right: '12px', transform: 'translateY(-50%)' });
+  setFixed(lightbox.querySelector<HTMLElement>('.lightbox-meta'), { left: '0', right: '0', bottom: '0' });
+}
+
+function updateFullscreenButton(): void {
+  const btn = document.getElementById('lightbox-fullscreen');
+  if (!btn) return;
+  const active = isNativeFullscreenActive() || pseudoFullscreenActive;
+  btn.innerHTML = icon(active ? 'collapse' : 'expand');
+  const label = active ? 'Exit full screen' : 'Full screen';
+  btn.title = label;
+  btn.setAttribute('aria-label', label);
+}
+
+async function tryNativeFullscreen(mediaEl: HTMLElement): Promise<boolean> {
+  if (!supportsElementFullscreen(mediaEl)) return false;
+  try {
+    await Promise.race([
+      requestFullscreenCompat(mediaEl),
+      new Promise<void>((resolve) => setTimeout(resolve, 400)),
+    ]);
+  } catch {
+    return false;
+  }
+  return getNativeFullscreenElement() === mediaEl;
+}
+
+async function toggleFullscreen(mediaEl: HTMLElement): Promise<void> {
+  if (isNativeFullscreenActive()) {
+    await exitFullscreenCompat().catch(() => {});
+    return;
+  }
+  if (pseudoFullscreenActive) {
+    applyPseudoFullscreenStyles(mediaEl, false);
+    layoutPseudoFullscreenChrome(false);
+    pseudoFullscreenActive = false;
+    updateFullscreenButton();
+    return;
+  }
+
+  if (await tryNativeFullscreen(mediaEl)) return;
+
+  const legacyVideoEl = mediaEl as unknown as VendorFullscreenEl;
+  if (mediaEl instanceof HTMLVideoElement && typeof legacyVideoEl.webkitEnterFullscreen === 'function') {
+    try {
+      legacyVideoEl.webkitEnterFullscreen!();
+      return;
+    } catch {
+    }
+  }
+
+  pseudoFullscreenActive = true;
+  applyPseudoFullscreenStyles(mediaEl, true);
+  layoutPseudoFullscreenChrome(true);
+  updateFullscreenButton();
+}
+
+document.addEventListener('fullscreenchange', () => {
+  fixNativeFullscreenSizing(getNativeFullscreenElement());
+  updateFullscreenButton();
+});
+document.addEventListener('webkitfullscreenchange', () => {
+  fixNativeFullscreenSizing(getNativeFullscreenElement());
+  updateFullscreenButton();
+});
+document.addEventListener('MSFullscreenChange', () => {
+  fixNativeFullscreenSizing(getNativeFullscreenElement());
+  updateFullscreenButton();
+});
+
 function isThumbnailedKind(meta: FileMeta | undefined | null): boolean {
   return fileKind(meta?.mime) === 'image';
 }
@@ -174,6 +358,13 @@ async function openOtherPreview(record: FileRecord, meta: FileMeta, kind: 'pdf' 
   }
 }
 
+function updateMediaMetaLabel(meta: FileMeta, showNav: boolean): void {
+  const fnameEl = lightbox.querySelector('.lightbox-meta .fname');
+  if (fnameEl) {
+    fnameEl.textContent = showNav ? `${meta.name} \u00b7 ${lightboxIndex + 1}/${lightboxMediaList.length}` : meta.name;
+  }
+}
+
 async function openMediaAt(list: FileRecord[], index: number): Promise<void> {
   if (!list.length) return;
   index = ((index % list.length) + list.length) % list.length;
@@ -183,40 +374,82 @@ async function openMediaAt(list: FileRecord[], index: number): Promise<void> {
 
   lightboxMediaList = list;
   lightboxIndex = index;
-  lightbox.classList.toggle('has-nav', list.length > 1);
   switchPreview(record.id);
+
+  const kind = fileKind(meta.mime);
+  const showNav = lightboxMediaList.length > 1;
+
+  const existingMedia = !lightbox.classList.contains('hidden')
+    ? (document.getElementById('lightbox-media') as (HTMLImageElement | HTMLVideoElement | null))
+    : null;
+  const existingHasNav = !!document.getElementById('lightbox-prev') || !!document.getElementById('lightbox-next');
+  const canUpdateInPlace = !!existingMedia
+    && ((kind === 'image' && existingMedia.tagName === 'IMG') || (kind === 'video' && existingMedia.tagName === 'VIDEO'))
+    && existingHasNav === showNav;
+
+  const wasNativeFullscreen = !canUpdateInPlace && isNativeFullscreenActive();
+  const wasPseudoFullscreen = !canUpdateInPlace && pseudoFullscreenActive;
 
   const tileEl = boxGrid.querySelector(`[data-id="${CSS.escape(record.id)}"]`);
   tileEl?.classList.add('decrypting');
-  showLightbox(`<div class="lightbox-content"><div class="spinner spinner-lg"></div></div>`, { keepMedia: true });
+
+  if (!canUpdateInPlace) {
+    lightbox.classList.toggle('has-nav', showNav);
+    showLightbox(`<div class="lightbox-content"><div class="spinner spinner-lg"></div></div>`, { keepMedia: true });
+  }
 
   try {
     const url = await getDecryptedUrl(record);
-    const kind = fileKind(meta.mime);
-    const inner = kind === 'image'
-      ? `<img src="${url}" alt="${escapeHtml(meta.name)}" id="lightbox-media">`
-      : `<video src="${url}" controls autoplay id="lightbox-media"></video>`;
-    const showNav = lightboxMediaList.length > 1;
-    showLightbox(`
-      <div class="lightbox-content">
-        ${showNav ? `<button class="btn-icon lightbox-nav lightbox-nav-prev" id="lightbox-prev" aria-label="Previous">${icon('chevronLeft')}</button>` : ''}
-        ${inner}
-        ${showNav ? `<button class="btn-icon lightbox-nav lightbox-nav-next" id="lightbox-next" aria-label="Next">${icon('chevronRight')}</button>` : ''}
-        <div class="lightbox-meta">
-          <span class="fname">${escapeHtml(meta.name)}${showNav ? ` \u00b7 ${lightboxIndex + 1}/${lightboxMediaList.length}` : ''}</span>
-          <button class="btn-icon" id="lightbox-fullscreen" title="Full screen" aria-label="Full screen">${icon('expand')}</button>
-          <button class="btn-icon" id="lightbox-download" title="Download" aria-label="Download">${icon('download')}</button>
-        </div>
-      </div>
-    `, { keepMedia: true });
+    currentMediaCtx = { record, meta, url };
 
-    document.getElementById('lightbox-download')!.addEventListener('click', () => downloadAndSave(record, meta, url));
-    document.getElementById('lightbox-fullscreen')!.addEventListener('click', () => {
-      const mediaEl = document.getElementById('lightbox-media') as (HTMLVideoElement | HTMLImageElement | null);
-      if (mediaEl?.requestFullscreen) mediaEl.requestFullscreen().catch(() => {});
-    });
-    document.getElementById('lightbox-prev')?.addEventListener('click', () => navigateLightbox(-1));
-    document.getElementById('lightbox-next')?.addEventListener('click', () => navigateLightbox(1));
+    if (canUpdateInPlace && existingMedia) {
+      existingMedia.src = url;
+      if (existingMedia instanceof HTMLImageElement) {
+        existingMedia.alt = meta.name;
+      } else {
+        existingMedia.load();
+        existingMedia.play().catch(() => {});
+      }
+      updateMediaMetaLabel(meta, showNav);
+    } else {
+      const inner = kind === 'image'
+        ? `<img src="${url}" alt="${escapeHtml(meta.name)}" id="lightbox-media">`
+        : `<video src="${url}" controls autoplay id="lightbox-media"></video>`;
+      showLightbox(`
+        <div class="lightbox-content">
+          ${showNav ? `<button class="btn-icon lightbox-nav lightbox-nav-prev" id="lightbox-prev" aria-label="Previous">${icon('chevronLeft')}</button>` : ''}
+          ${inner}
+          ${showNav ? `<button class="btn-icon lightbox-nav lightbox-nav-next" id="lightbox-next" aria-label="Next">${icon('chevronRight')}</button>` : ''}
+          <div class="lightbox-meta">
+            <span class="fname">${escapeHtml(meta.name)}${showNav ? ` \u00b7 ${lightboxIndex + 1}/${lightboxMediaList.length}` : ''}</span>
+            <button class="btn-icon" id="lightbox-fullscreen" title="Full screen" aria-label="Full screen">${icon('expand')}</button>
+            <button class="btn-icon" id="lightbox-download" title="Download" aria-label="Download">${icon('download')}</button>
+          </div>
+        </div>
+      `, { keepMedia: true });
+
+      document.getElementById('lightbox-download')!.addEventListener('click', () => {
+        if (currentMediaCtx) downloadAndSave(currentMediaCtx.record, currentMediaCtx.meta, currentMediaCtx.url);
+      });
+      document.getElementById('lightbox-fullscreen')!.addEventListener('click', () => {
+        const mediaEl = document.getElementById('lightbox-media') as (HTMLVideoElement | HTMLImageElement | null);
+        if (mediaEl) toggleFullscreen(mediaEl);
+      });
+      document.getElementById('lightbox-prev')?.addEventListener('click', () => navigateLightbox(-1));
+      document.getElementById('lightbox-next')?.addEventListener('click', () => navigateLightbox(1));
+      updateFullscreenButton();
+
+      const newMediaEl = document.getElementById('lightbox-media') as HTMLElement | null;
+      if (newMediaEl && (wasNativeFullscreen || wasPseudoFullscreen)) {
+        const restoredNative = wasNativeFullscreen && await tryNativeFullscreen(newMediaEl);
+        if (!restoredNative) {
+          pseudoFullscreenActive = true;
+          applyPseudoFullscreenStyles(newMediaEl, true);
+          layoutPseudoFullscreenChrome(true);
+        }
+        updateFullscreenButton();
+      }
+    }
   } catch (err) {
     showToast("Couldn't decrypt that file. " + (err as Error).message, 'error');
     closeLightbox();
@@ -252,7 +485,13 @@ export function showLightbox(innerHtml: string, { keepMedia = false }: { keepMed
 export function closeLightbox(): void {
   const av = lightbox.querySelector('video, audio') as (HTMLVideoElement | HTMLAudioElement | null);
   if (av) av.pause();
-  if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+  if (isNativeFullscreenActive()) exitFullscreenCompat().catch(() => {});
+  if (pseudoFullscreenActive) {
+    const mediaEl = document.getElementById('lightbox-media') as HTMLElement | null;
+    if (mediaEl) applyPseudoFullscreenStyles(mediaEl, false);
+    layoutPseudoFullscreenChrome(false);
+    pseudoFullscreenActive = false;
+  }
   lightbox.classList.add('hidden');
   lightbox.classList.remove('has-nav');
   lightbox.innerHTML = '';
@@ -264,7 +503,15 @@ export function closeLightbox(): void {
 
 document.addEventListener('keydown', (e) => {
   if (lightbox.classList.contains('hidden')) return;
-  if (e.key === 'Escape') { closeLightbox(); return; }
+  if (e.key === 'Escape') {
+    if (pseudoFullscreenActive) {
+      const mediaEl = document.getElementById('lightbox-media') as HTMLElement | null;
+      if (mediaEl) toggleFullscreen(mediaEl);
+      return;
+    }
+    closeLightbox();
+    return;
+  }
   if (e.key === 'ArrowLeft') { e.preventDefault(); navigateLightbox(-1); }
   else if (e.key === 'ArrowRight') { e.preventDefault(); navigateLightbox(1); }
 });
