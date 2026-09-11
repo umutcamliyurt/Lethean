@@ -80,7 +80,10 @@ Then run the backend:
 
 ```bash
 cd ../backend
-pip install -r requirements.txt
+python3.13 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
