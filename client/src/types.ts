@@ -59,3 +59,17 @@ export type FileKind = 'image' | 'video' | 'other';
 export type ViewMode = 'grid' | 'list';
 
 export type ProgressCallback = (fraction: number) => void;
+
+export interface ShareCreateResponse {
+  shareToken: string;
+  expiresAt?: string | null;
+  maxDownloads: number;
+}
+
+export interface ShareRecord {
+  content_iv: string;
+  encrypted_metadata: string;
+  metadata_iv: string;
+  downloads_used: number;
+  max_downloads: number;
+}

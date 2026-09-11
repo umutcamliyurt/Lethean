@@ -101,6 +101,7 @@ const ICONS: Record<string, string> = {
   play: '<circle cx="13" cy="13" r="12" fill="rgba(20,22,26,0.6)"/><path d="M10.5 8.5l7 4.5-7 4.5z" fill="white"/>',
   trash: '<path d="M4 6h14M9 6V4.5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1V6M6 6l.7 12a1 1 0 0 0 1 .9h6.6a1 1 0 0 0 1-.9L16 6" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/>',
   download: '<path d="M10 3v10m0 0l-4-4m4 4l4-4M4 16v2a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-2" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
+  share: '<circle cx="15" cy="4.5" r="2.2" stroke="currentColor" stroke-width="1.4"/><circle cx="5" cy="10" r="2.2" stroke="currentColor" stroke-width="1.4"/><circle cx="15" cy="15.5" r="2.2" stroke="currentColor" stroke-width="1.4"/><path d="M7 8.8l6-3M7 11.2l6 3" stroke="currentColor" stroke-width="1.4"/>',
   close: '<path d="M5 5l14 14M19 5L5 19" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
   chevronLeft: '<path d="M12.5 4.5L6 11l6.5 6.5" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
   chevronRight: '<path d="M7.5 4.5L14 11l-6.5 6.5" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',

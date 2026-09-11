@@ -21,3 +21,20 @@ class UsageResponse(BaseModel):
     file_count: int
     total_bytes: int
     quota_bytes: int | None = None
+
+
+class ShareCreateResponse(BaseModel):
+    shareToken: str
+    expiresAt: datetime
+    maxDownloads: int
+
+
+class ShareFileResponse(BaseModel):
+    content_iv: str
+    encrypted_metadata: str
+    metadata_iv: str
+    downloads_used: int
+    max_downloads: int
+
+    class Config:
+        from_attributes = True

@@ -8,6 +8,7 @@ import { fileKeyCache, metaCache, objectUrlCache, getWrappingKeyRaw } from './st
 import { getStoredViewMode, setStoredViewMode } from './storage.js';
 import { fileKind, fileTypeLabel, formatBytes, decryptedSize, icon, showToast } from './utils.js';
 import { openTile, downloadAndSave } from './lightbox.js';
+import { shareFile } from './share.js';
 import type { FileMeta, FileRecord, UsageResponse, ViewMode } from './types.js';
 
 let viewMode: ViewMode = getStoredViewMode();
@@ -320,6 +321,7 @@ function renderTile(record: FileRecord): HTMLDivElement {
 
   tile.innerHTML = `
     <div class="box-menu">
+      ${isFolder ? '' : `<button type="button" class="btn-icon share-btn" title="Share">${icon('share')}</button>`}
       <button type="button" class="btn-icon delete-btn" title="Delete">${icon('trash')}</button>
     </div>
     <div class="box-body">
@@ -331,11 +333,12 @@ function renderTile(record: FileRecord): HTMLDivElement {
   `;
   tile.querySelector('.box-name')!.textContent = meta.name;
   tile.querySelector('.delete-btn')!.setAttribute('aria-label', `Delete ${meta.name}`);
+  tile.querySelector('.share-btn')?.setAttribute('aria-label', `Share ${meta.name}`);
 
   const openThisTile = () => (isFolder ? navigateToFolder(record.id) : openTile(record.id));
 
   tile.addEventListener('click', (e) => {
-    if ((e.target as HTMLElement).closest('.delete-btn')) return;
+    if ((e.target as HTMLElement).closest('.delete-btn') || (e.target as HTMLElement).closest('.share-btn')) return;
     openThisTile();
   });
   tile.addEventListener('keydown', (e) => {
@@ -344,6 +347,10 @@ function renderTile(record: FileRecord): HTMLDivElement {
   tile.querySelector('.delete-btn')!.addEventListener('click', (e) => {
     e.stopPropagation();
     handleDelete(record.id);
+  });
+  tile.querySelector('.share-btn')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    shareFile(record);
   });
 
   if (!isFolder && kind === 'image') {
@@ -386,23 +393,31 @@ function renderListRow(record: FileRecord): HTMLDivElement {
     <span class="file-row-type" role="cell"></span>
     <span class="file-row-size" role="cell">${isFolder ? '\u2014' : formatBytes(decryptedSize(record, meta))}</span>
     <span class="file-row-actions" role="cell">
+      ${isFolder ? '' : `<button type="button" class="btn-icon file-share-btn" title="Share">${icon('share')}</button>`}
       ${isFolder ? '' : `<button type="button" class="btn-icon file-download-btn" title="Download">${icon('download')}</button>`}
       <button type="button" class="btn-icon file-delete-btn" title="Delete">${icon('trash')}</button>
     </span>
   `;
   row.querySelector('.file-row-text')!.textContent = meta.name;
   row.querySelector('.file-row-type')!.textContent = fileTypeLabel(meta);
+  row.querySelector('.file-share-btn')?.setAttribute('aria-label', `Share ${meta.name}`);
   row.querySelector('.file-download-btn')?.setAttribute('aria-label', `Download ${meta.name}`);
   row.querySelector('.file-delete-btn')!.setAttribute('aria-label', `Delete ${meta.name}`);
 
   const openThisRow = () => (isFolder ? navigateToFolder(record.id) : openTile(record.id));
 
   row.addEventListener('click', (e) => {
-    if ((e.target as HTMLElement).closest('.file-download-btn') || (e.target as HTMLElement).closest('.file-delete-btn')) return;
+    if ((e.target as HTMLElement).closest('.file-download-btn')
+      || (e.target as HTMLElement).closest('.file-share-btn')
+      || (e.target as HTMLElement).closest('.file-delete-btn')) return;
     openThisRow();
   });
   row.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openThisRow(); }
+  });
+  row.querySelector('.file-share-btn')?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    shareFile(record);
   });
   row.querySelector('.file-download-btn')?.addEventListener('click', (e) => {
     e.stopPropagation();

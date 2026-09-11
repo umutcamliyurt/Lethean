@@ -3,24 +3,26 @@ import hashlib
 import hmac
 import logging
 import os
+import re
 import threading
 import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 
 import anyio.to_thread
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, Form, BackgroundTasks, Request
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, Form, BackgroundTasks, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import func
+from sqlalchemy import delete as sa_delete, func
 from sqlalchemy.orm import Session
 
 from database import Base, engine, get_db
 from models import EncryptedFile
-from schemas import FileMetaResponse, UsageResponse
+from schemas import FileMetaResponse, UsageResponse, ShareCreateResponse, ShareFileResponse
 from vault_auth import get_vault_id, require_upload_authorization, UploadAuthorization
+import share_store
 import storage
 import token_store
 
@@ -71,6 +73,11 @@ _DEFAULT_LIST_LIMIT = 1000
 _IV_MAX_LEN = 64
 _WRAPPED_KEY_MAX_LEN = 4096
 _ENCRYPTED_METADATA_MAX_LEN = 65536
+
+_SHARE_LINK_TTL_SECONDS = int(os.environ.get("SHARE_LINK_TTL_SECONDS", str(share_store.DEFAULT_SHARE_TTL_SECONDS)))
+_SHARE_LINK_MAX_DOWNLOADS_LIMIT = int(os.environ.get("SHARE_LINK_MAX_DOWNLOADS_LIMIT", "100"))
+_SHARE_LINKS_MAX_ACTIVE_PER_FILE = int(os.environ.get("SHARE_LINKS_MAX_ACTIVE_PER_FILE", "20"))
+_SHARE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,256}$")
 
 _MAX_REQUEST_BYTES = MAX_UPLOAD_BYTES + _ENCRYPTED_METADATA_MAX_LEN + _WRAPPED_KEY_MAX_LEN + (4 * _IV_MAX_LEN) + (64 * 1024)
 
@@ -348,12 +355,114 @@ async def get_file_blob(file_id: str, db: Session = Depends(get_db), vault_id: s
     )
 
 
+def _delete_record(db: Session, record: EncryptedFile) -> bool:
+    result = db.execute(sa_delete(EncryptedFile).where(EncryptedFile.id == record.id))
+    db.commit()
+    if result.rowcount != 1:
+        return False
+    storage.shred_blob(record.storage_path)
+    return True
+
+
+@app.post("/files/{file_id}/share", response_model=ShareCreateResponse, status_code=201)
+def create_file_share(
+    file_id: str,
+    max_downloads: int = Query(
+        share_store.DEFAULT_MAX_DOWNLOADS,
+        ge=1,
+        le=_SHARE_LINK_MAX_DOWNLOADS_LIMIT,
+        description="How many times this link can be downloaded before it stops working.",
+    ),
+    db: Session = Depends(get_db),
+    vault_id: str = Depends(get_vault_id),
+):
+    record = _get_owned_file(db, file_id, vault_id)
+    try:
+        raw_token, expires_at, max_downloads = share_store.create_share(
+            db, record.id, vault_id,
+            ttl_seconds=_SHARE_LINK_TTL_SECONDS,
+            max_downloads=max_downloads,
+            max_active_per_file=_SHARE_LINKS_MAX_ACTIVE_PER_FILE,
+        )
+    except share_store.TooManyActiveSharesError:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"This file already has {_SHARE_LINKS_MAX_ACTIVE_PER_FILE} active share link(s). "
+                "Revoke one before creating another."
+            ),
+        )
+    return ShareCreateResponse(shareToken=raw_token, expiresAt=expires_at, maxDownloads=max_downloads)
+
+
+@app.delete("/files/{file_id}/share", status_code=204)
+def revoke_file_share(file_id: str, db: Session = Depends(get_db), vault_id: str = Depends(get_vault_id)):
+    record = _get_owned_file(db, file_id, vault_id)
+    share_store.revoke_shares_for_file(db, record.id, vault_id)
+    return Response(status_code=204)
+
+
 @app.delete("/files/{file_id}", status_code=204)
 def delete_file(file_id: str, db: Session = Depends(get_db), vault_id: str = Depends(get_vault_id)):
     record = _get_owned_file(db, file_id, vault_id)
-    storage.shred_blob(record.storage_path)
-    db.delete(record)
-    db.commit()
+    _delete_record(db, record)
+    return Response(status_code=204)
+
+
+@app.get("/share/{share_token}", response_model=ShareFileResponse)
+def get_shared_file_meta(share_token: str, db: Session = Depends(get_db)):
+    if not _SHARE_TOKEN_RE.match(share_token):
+        raise HTTPException(status_code=404, detail="This link is invalid or has expired")
+    result = share_store.peek_share(db, share_token)
+    if result is None:
+        raise HTTPException(status_code=404, detail="This link is invalid or has expired")
+    record, downloads_used, max_downloads = result
+    return ShareFileResponse(
+        content_iv=record.content_iv,
+        encrypted_metadata=record.encrypted_metadata,
+        metadata_iv=record.metadata_iv,
+        downloads_used=downloads_used,
+        max_downloads=max_downloads,
+    )
+
+
+@app.get("/share/{share_token}/blob")
+async def get_shared_file_blob(share_token: str, db: Session = Depends(get_db)):
+    if not _SHARE_TOKEN_RE.match(share_token):
+        raise HTTPException(status_code=404, detail="This link is invalid, has expired, or has no downloads left")
+
+    record = await asyncio.to_thread(share_store.claim_share, db, share_token)
+    if record is None:
+        raise HTTPException(status_code=404, detail="This link is invalid, has expired, or has no downloads left")
+
+    storage_path = record.storage_path
+    size = record.size
+
+    async def _bounded_stream():
+        async with _download_semaphore:
+            async for chunk in storage.stream_blob(storage_path, chunk_size=_READ_CHUNK):
+                yield chunk
+
+    return StreamingResponse(
+        _bounded_stream(),
+        media_type="application/octet-stream",
+        headers={
+            "X-Content-Type-Options": "nosniff",
+            "Content-Disposition": "attachment",
+            "Content-Length": str(size),
+            "Content-Encoding": "identity",
+        },
+    )
+
+
+@app.delete("/share/{share_token}", status_code=204)
+async def delete_shared_file(share_token: str, db: Session = Depends(get_db)):
+    if not _SHARE_TOKEN_RE.match(share_token):
+        raise HTTPException(status_code=404, detail="This link is invalid or has expired")
+
+    deleted = await asyncio.to_thread(share_store.delete_via_share, db, share_token)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="This link is invalid or has expired")
     return Response(status_code=204)
 
 

@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta http-equiv="Content-Security-Policy" content="
+  default-src 'self';
+  script-src 'self';
+  style-src 'self';
+  img-src 'self';
+  connect-src 'self' http://localhost:8000;
+  object-src 'none';
+  base-uri 'self';
+  form-action 'self';
+  frame-ancestors 'none';
+">
+<meta name="referrer" content="no-referrer">
+<title>Lethean &mdash; Shared file</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div id="share-screen">
+  <div class="auth-card share-card">
+    <div class="wordmark">
+      <svg width="18" height="18" viewBox="0 0 18 18" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <rect x="4" y="8" width="10" height="7" rx="1" stroke="currentColor" stroke-width="1.3"/>
+        <path d="M6.5 8V5.5a2.5 2.5 0 0 1 5 0V8" stroke="currentColor" stroke-width="1.3"/>
+      </svg>
+      <span>Lethean</span>
+    </div>
+
+    <h1>Shared file</h1>
+    <p class="subtitle">This link decrypts a file in your browser.</p>
+
+    <div class="share-status" id="share-status" role="status" aria-live="polite">Loading&hellip;</div>
+
+    <div id="share-body" class="hidden">
+      <p class="share-filename" id="share-filename"></p>
+      <p class="share-filesize" id="share-filesize"></p>
+      <button type="button" class="btn-primary" id="share-download-btn">Download</button>
+      <button type="button" class="btn-danger hidden" id="share-delete-btn">Delete this file</button>
+      <p class="field-hint" id="share-usage-hint"></p>
+    </div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+
+<script type="module" src="share-view.js"></script>
+</body>
+</html>

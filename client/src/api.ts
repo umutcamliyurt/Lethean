@@ -1,4 +1,6 @@
-import type { EncryptedFilePayload, FileRecord, ProgressCallback, UsageResponse } from './types.js';
+import type {
+  EncryptedFilePayload, FileRecord, ProgressCallback, UsageResponse, ShareCreateResponse, ShareRecord,
+} from './types.js';
 
 const isLocalDev = window.location.port === '5500';
 const BASE_URL = isLocalDev ? 'http://localhost:8000' : '';
@@ -164,11 +166,7 @@ export async function getUsage(): Promise<UsageResponse> {
 
 const MAX_TRUSTED_CONTENT_LENGTH = 2 * 1024 * 1024 * 1024;
 
-export async function downloadContent(fileId: string, onProgress?: ProgressCallback): Promise<Uint8Array> {
-  assertSafeId(fileId);
-  const res = await privateFetch(`${BASE_URL}/files/${fileId}/blob`, { headers: authHeaders(), credentials: 'omit' });
-  await checkOk(res, 'Download failed');
-
+async function readBodyWithProgress(res: Response, onProgress?: ProgressCallback): Promise<Uint8Array> {
   const declared = Number(res.headers.get('Content-Length')) || 0;
   const total = declared > 0 && declared <= MAX_TRUSTED_CONTENT_LENGTH ? declared : 0;
   if (!onProgress || !total || !res.body) {
@@ -191,6 +189,13 @@ export async function downloadContent(fileId: string, onProgress?: ProgressCallb
   return received === total ? out : out.subarray(0, received);
 }
 
+export async function downloadContent(fileId: string, onProgress?: ProgressCallback): Promise<Uint8Array> {
+  assertSafeId(fileId);
+  const res = await privateFetch(`${BASE_URL}/files/${fileId}/blob`, { headers: authHeaders(), credentials: 'omit' });
+  await checkOk(res, 'Download failed');
+  return readBodyWithProgress(res, onProgress);
+}
+
 export async function deleteFile(fileId: string): Promise<void> {
   assertSafeId(fileId);
   const res = await privateFetch(`${BASE_URL}/files/${fileId}`, { method: 'DELETE', headers: authHeaders(), credentials: 'omit' });
@@ -209,4 +214,59 @@ export async function sendShredSignal(targetVaultId: string): Promise<void> {
     credentials: 'omit',
   });
   await checkOk(res, 'Shred signal failed');
+}
+
+
+function assertSafeShareToken(token: string): string {
+  if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{8,256}$/.test(token)) {
+    throw new Error('Invalid share link');
+  }
+  return token;
+}
+
+export async function createFileShare(fileId: string, maxDownloads?: number): Promise<ShareCreateResponse> {
+  assertSafeId(fileId);
+  const params = new URLSearchParams();
+  if (maxDownloads != null) params.set('max_downloads', String(maxDownloads));
+  const qs = params.toString();
+  const res = await privateFetch(`${BASE_URL}/files/${fileId}/share${qs ? `?${qs}` : ''}`, {
+    method: 'POST',
+    headers: authHeaders(),
+    credentials: 'omit',
+  });
+  await checkOk(res, 'Could not create share link');
+  return res.json() as Promise<ShareCreateResponse>;
+}
+
+export async function revokeFileShare(fileId: string): Promise<void> {
+  assertSafeId(fileId);
+  const res = await privateFetch(`${BASE_URL}/files/${fileId}/share`, {
+    method: 'DELETE',
+    headers: authHeaders(),
+    credentials: 'omit',
+  });
+  await checkOk(res, 'Could not revoke share link');
+}
+
+export async function getShareRecord(shareToken: string): Promise<ShareRecord> {
+  assertSafeShareToken(shareToken);
+  const res = await privateFetch(`${BASE_URL}/share/${shareToken}`, { credentials: 'omit' });
+  await checkOk(res, 'This link is invalid or has expired');
+  return res.json() as Promise<ShareRecord>;
+}
+
+export async function downloadShareContent(shareToken: string, onProgress?: ProgressCallback): Promise<Uint8Array> {
+  assertSafeShareToken(shareToken);
+  const res = await privateFetch(`${BASE_URL}/share/${shareToken}/blob`, { credentials: 'omit' });
+  await checkOk(res, 'This link is invalid, has expired, or has no downloads left');
+  return readBodyWithProgress(res, onProgress);
+}
+
+export async function deleteSharedFile(shareToken: string): Promise<void> {
+  assertSafeShareToken(shareToken);
+  const res = await privateFetch(`${BASE_URL}/share/${shareToken}`, {
+    method: 'DELETE',
+    credentials: 'omit',
+  });
+  await checkOk(res, "Couldn't delete this file");
 }

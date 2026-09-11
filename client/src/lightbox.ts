@@ -6,6 +6,7 @@ import {
   fileKind, previewKind, looksLikePdf, decryptedSize, formatBytes, icon, escapeHtml, showToast,
 } from './utils.js';
 import { visibleRecords, getRecords, getDecryptedBytes, getDecryptedUrl } from './gallery.js';
+import { shareFile } from './share.js';
 import type { FileMeta, FileRecord } from './types.js';
 
 let lightboxMediaList: FileRecord[] = [];
@@ -280,10 +281,14 @@ export async function openTile(fileId: string): Promise<void> {
         <p class="lightbox-generic-name">${escapeHtml(meta.name)}</p>
         <p class="lightbox-generic-size">${formatBytes(decryptedSize(record, meta))} \u00b7 encrypted</p>
         ${note ? `<p class="lightbox-generic-note">${note}</p>` : ''}
-        <button class="btn-primary lightbox-generic-btn" id="lightbox-download">Decrypt &amp; download</button>
+        <div class="lightbox-generic-actions">
+          <button class="btn-primary lightbox-generic-btn" id="lightbox-download">Decrypt &amp; download</button>
+          <button class="btn-icon" id="lightbox-share" title="Share" aria-label="Share">${icon('share')}</button>
+        </div>
       </div>
     `);
     document.getElementById('lightbox-download')!.addEventListener('click', () => downloadAndSave(record, meta));
+    document.getElementById('lightbox-share')!.addEventListener('click', () => shareFile(record));
     tileEl?.classList.remove('opening');
     return;
   }
@@ -330,11 +335,13 @@ async function openOtherPreview(record: FileRecord, meta: FileMeta, kind: 'pdf' 
         ${inner}
         <div class="lightbox-meta">
           <span class="fname">${escapeHtml(meta.name)}</span>
+          <button class="btn-icon" id="lightbox-share" title="Share" aria-label="Share">${icon('share')}</button>
           <button class="btn-icon" id="lightbox-download" title="Download" aria-label="Download">${icon('download')}</button>
         </div>
       </div>
     `, { keepMedia: true });
 
+    document.getElementById('lightbox-share')!.addEventListener('click', () => shareFile(record));
     document.getElementById('lightbox-download')!.addEventListener('click', () => downloadAndSave(record, meta, objectUrl ?? undefined));
   } catch (err) {
     const unsafeErr = err as UnsafePdfError;
@@ -423,11 +430,15 @@ async function openMediaAt(list: FileRecord[], index: number): Promise<void> {
           <div class="lightbox-meta">
             <span class="fname">${escapeHtml(meta.name)}${showNav ? ` \u00b7 ${lightboxIndex + 1}/${lightboxMediaList.length}` : ''}</span>
             <button class="btn-icon" id="lightbox-fullscreen" title="Full screen" aria-label="Full screen">${icon('expand')}</button>
+            <button class="btn-icon" id="lightbox-share" title="Share" aria-label="Share">${icon('share')}</button>
             <button class="btn-icon" id="lightbox-download" title="Download" aria-label="Download">${icon('download')}</button>
           </div>
         </div>
       `, { keepMedia: true });
 
+      document.getElementById('lightbox-share')!.addEventListener('click', () => {
+        if (currentMediaCtx) shareFile(currentMediaCtx.record);
+      });
       document.getElementById('lightbox-download')!.addEventListener('click', () => {
         if (currentMediaCtx) downloadAndSave(currentMediaCtx.record, currentMediaCtx.meta, currentMediaCtx.url);
       });
