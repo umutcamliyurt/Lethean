@@ -49,7 +49,7 @@ async function deriveSalt(Salt: string | null | undefined): Promise<Uint8Array> 
 }
 
 export function generateSalt(): string {
-  return toHex(randomBytes(10));
+  return toHex(randomBytes(16));
 }
 
 export async function deriveMasterKey(password: string, Salt: string | null | undefined): Promise<Uint8Array> {
