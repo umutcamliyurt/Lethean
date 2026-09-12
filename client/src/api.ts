@@ -196,10 +196,43 @@ export async function downloadContent(fileId: string, onProgress?: ProgressCallb
   return readBodyWithProgress(res, onProgress);
 }
 
-export async function deleteFile(fileId: string): Promise<void> {
+export async function deleteFile(fileId: string, vaultIdOverride?: string): Promise<void> {
   assertSafeId(fileId);
-  const res = await privateFetch(`${BASE_URL}/files/${fileId}`, { method: 'DELETE', headers: authHeaders(), credentials: 'omit' });
+  const res = await privateFetch(`${BASE_URL}/files/${fileId}`, { method: 'DELETE', headers: authHeaders(vaultIdOverride), credentials: 'omit' });
   await checkOk(res, 'Delete failed');
+}
+
+export interface RewrapEntry {
+  fileId: string;
+  wrappedFileKey: string;
+  wrapIv: string;
+}
+
+export interface VaultRotateResult {
+  filesMoved: number;
+  tokensRebound: number;
+}
+
+export async function rotateVault(newVaultId: string, rewraps: RewrapEntry[]): Promise<VaultRotateResult> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json', ...authHeaders() };
+  if (accessToken) headers['X-Access-Token'] = accessToken;
+
+  const res = await privateFetch(`${BASE_URL}/vault/rotate`, {
+    method: 'POST',
+    headers,
+    credentials: 'omit',
+    body: JSON.stringify({
+      new_vault_id: newVaultId,
+      rewraps: rewraps.map((r) => ({
+        file_id: r.fileId,
+        wrapped_file_key: r.wrappedFileKey,
+        wrap_iv: r.wrapIv,
+      })),
+    }),
+  });
+  await checkOk(res, "Couldn't change vault password");
+  const data = (await res.json()) as { files_moved: number; tokens_rebound: number };
+  return { filesMoved: data.files_moved, tokensRebound: data.tokens_rebound };
 }
 
 export async function wipeVault(vaultIdToWipe: string): Promise<void> {
@@ -224,12 +257,21 @@ function assertSafeShareToken(token: string): string {
   return token;
 }
 
-export async function createFileShare(fileId: string, maxDownloads?: number): Promise<ShareCreateResponse> {
+export interface CreateShareOptions {
+  maxDownloads?: number;
+  expiresInSeconds?: number | null;
+  allowDelete?: boolean;
+}
+
+export async function createFileShare(fileId: string, options: CreateShareOptions = {}): Promise<ShareCreateResponse> {
   assertSafeId(fileId);
+  const { maxDownloads, expiresInSeconds, allowDelete = false } = options;
   const params = new URLSearchParams();
   if (maxDownloads != null) params.set('max_downloads', String(maxDownloads));
+  if (expiresInSeconds != null) params.set('expires_in', String(expiresInSeconds));
+  params.set('allow_delete', String(allowDelete));
   const qs = params.toString();
-  const res = await privateFetch(`${BASE_URL}/files/${fileId}/share${qs ? `?${qs}` : ''}`, {
+  const res = await privateFetch(`${BASE_URL}/files/${fileId}/share?${qs}`, {
     method: 'POST',
     headers: authHeaders(),
     credentials: 'omit',

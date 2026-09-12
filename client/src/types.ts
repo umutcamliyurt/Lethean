@@ -52,6 +52,7 @@ export interface DuressConfig {
   verifier: string;
   encVaultId: string;
   iv: string;
+  kdfVersion?: number;
 }
 
 export type PreviewKind = 'pdf' | 'audio' | 'text' | null;
@@ -62,6 +63,7 @@ export type ProgressCallback = (fraction: number) => void;
 
 export interface ShareCreateResponse {
   shareToken: string;
+  deleteToken?: string | null;
   expiresAt?: string | null;
   maxDownloads: number;
 }
@@ -72,4 +74,6 @@ export interface ShareRecord {
   metadata_iv: string;
   downloads_used: number;
   max_downloads: number;
+  expires_at: string;
+  deletable: boolean;
 }

@@ -156,3 +156,17 @@ def find_by_vault_id(vault_id: str) -> dict | None:
             if existing_vault_id is not None and hmac.compare_digest(existing_vault_id, vault_id):
                 return record
         return None
+
+
+def rebind_vault(old_vault_id: str, new_vault_id: str) -> int:
+    with _lock:
+        data = _load()
+        moved = 0
+        for record in data.values():
+            existing_vault_id = record.get("vault_id")
+            if existing_vault_id is not None and hmac.compare_digest(existing_vault_id, old_vault_id):
+                record["vault_id"] = new_vault_id
+                moved += 1
+        if moved:
+            _write(data)
+        return moved

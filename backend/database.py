@@ -1,4 +1,4 @@
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import sessionmaker, declarative_base
 
 DATABASE_URL = "sqlite:///./lethean.db"
@@ -24,6 +24,23 @@ def _set_sqlite_pragmas(dbapi_connection, connection_record):
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+
+def run_migrations() -> None:
+    inspector = inspect(engine)
+    if "share_tokens" not in inspector.get_table_names():
+        return
+
+    existing_columns = {c["name"] for c in inspector.get_columns("share_tokens")}
+    if "delete_token_hash" in existing_columns:
+        return
+
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE share_tokens ADD COLUMN delete_token_hash VARCHAR"))
+        conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_share_tokens_delete_token_hash "
+            "ON share_tokens (delete_token_hash)"
+        ))
 
 
 def get_db():

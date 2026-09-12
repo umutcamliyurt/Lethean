@@ -50,6 +50,7 @@ button {
   min-height: 40px;
   background: transparent;
   color: var(--text);
+  text-align: center;
   transition: background 0.12s ease, border-color 0.12s ease;
   -webkit-tap-highlight-color: transparent;
   touch-action: manipulation;
@@ -724,6 +725,11 @@ main.vault {
   font-weight: 600;
   margin: 0 0 6px;
 }
+.settings-panel h3 {
+  font-size: 0.88rem;
+  font-weight: 600;
+  margin: 0 0 8px;
+}
 .settings-panel p.subtitle {
   color: var(--dim);
   font-size: 0.8rem;
@@ -733,7 +739,7 @@ main.vault {
 .settings-panel .panel-actions {
   display: flex;
   gap: 8px;
-  margin-top: 20px;
+  margin-top: 24px;
 }
 .settings-panel .panel-actions button { flex: 1; }
 .settings-panel .status-line {
@@ -741,6 +747,25 @@ main.vault {
   font-size: 0.72rem;
   color: var(--dim);
   margin-bottom: 16px;
+}
+
+.settings-divider {
+  height: 1px;
+  background: var(--border);
+  margin: 22px 0 20px;
+}
+
+.settings-panel .cp-progress {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.8rem;
+  color: var(--dim);
+}
+.settings-panel .cp-progress .spinner {
+  width: 14px;
+  height: 14px;
 }
 .settings-panel .salt-display {
   display: block;
@@ -1017,13 +1042,113 @@ main.vault {
   font-size: 0.85rem;
 }
 
+.share-section {
+  margin-bottom: 18px;
+}
+.share-section:last-of-type {
+  margin-bottom: 0;
+}
+.share-section-label {
+  font-size: 0.68rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--faint);
+  margin: 0 0 8px;
+}
+.share-section .share-download-count {
+  margin-bottom: 0;
+}
+
+.share-summary {
+  display: flex;
+  gap: 20px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface-2);
+  margin: 0 0 16px;
+}
+.share-summary-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.share-summary-item .label {
+  font-size: 0.64rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--faint);
+}
+.share-summary-item .value {
+  font-size: 0.85rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.share-checkbox-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  cursor: pointer;
+  transition: border-color 0.12s ease, background-color 0.12s ease;
+}
+.share-checkbox-row:hover {
+  border-color: var(--dim);
+}
+.share-checkbox-row:has(input:checked) {
+  border-color: color-mix(in srgb, #d9583c 50%, var(--border));
+  background: color-mix(in srgb, #d9583c 8%, transparent);
+}
+.share-checkbox-row input[type="checkbox"] {
+  width: 17px;
+  height: 17px;
+  margin: 2px 0 0;
+  flex-shrink: 0;
+  accent-color: var(--text);
+  cursor: pointer;
+}
+.share-checkbox-text {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.share-checkbox-text strong {
+  font-size: 0.84rem;
+  font-weight: 600;
+  color: var(--text);
+}
+.share-checkbox-text small {
+  font-size: 0.75rem;
+  color: var(--dim);
+  line-height: 1.45;
+}
+
 .share-delete-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
   color: #d9583c;
   background: color-mix(in srgb, #d9583c 10%, transparent);
   border: 1px solid color-mix(in srgb, #d9583c 35%, transparent);
   border-radius: var(--radius);
-  padding: 9px 10px;
+  padding: 10px;
   margin: 0 0 14px !important;
+  line-height: 1.45;
+}
+.share-delete-warning-icon {
+  display: flex;
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.share-delete-warning-icon svg {
+  display: block;
+  width: 16px;
+  height: 16px;
 }
 
 .btn-danger {

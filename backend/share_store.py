@@ -35,7 +35,8 @@ def create_share(
     ttl_seconds: int = DEFAULT_SHARE_TTL_SECONDS,
     max_downloads: int = DEFAULT_MAX_DOWNLOADS,
     max_active_per_file: int | None = None,
-) -> tuple[str, datetime, int]:
+    allow_delete: bool = False,
+) -> tuple[str, str | None, datetime, int]:
     if max_downloads < 1:
         max_downloads = 1
 
@@ -45,11 +46,13 @@ def create_share(
         )
 
     raw_token = secrets.token_urlsafe(32)
+    raw_delete_token = secrets.token_urlsafe(32) if allow_delete else None
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(seconds=ttl_seconds)
 
     db.add(ShareToken(
         token_hash=_hash_token(raw_token),
+        delete_token_hash=_hash_token(raw_delete_token) if raw_delete_token else None,
         file_id=file_id,
         vault_id=vault_id,
         max_downloads=max_downloads,
@@ -59,10 +62,10 @@ def create_share(
     ))
     db.commit()
 
-    return raw_token, expires_at, max_downloads
+    return raw_token, raw_delete_token, expires_at, max_downloads
 
 
-def peek_share(db: Session, raw_token: str) -> tuple[EncryptedFile, int, int] | None:
+def peek_share(db: Session, raw_token: str) -> tuple[EncryptedFile, ShareToken] | None:
     now = datetime.now(timezone.utc)
     share = (
         db.query(ShareToken)
@@ -77,15 +80,16 @@ def peek_share(db: Session, raw_token: str) -> tuple[EncryptedFile, int, int] | 
     record = db.query(EncryptedFile).filter(EncryptedFile.id == share.file_id).first()
     if record is None:
         return None
-    return record, share.download_count, share.max_downloads
+    return record, share
 
 
-def delete_via_share(db: Session, raw_token: str) -> bool:
+def delete_via_delete_token(db: Session, raw_delete_token: str) -> bool:
     now = datetime.now(timezone.utc)
     share = (
         db.query(ShareToken)
         .filter(
-            ShareToken.token_hash == _hash_token(raw_token),
+            ShareToken.delete_token_hash.isnot(None),
+            ShareToken.delete_token_hash == _hash_token(raw_delete_token),
             ShareToken.expires_at > now,
         )
         .first()

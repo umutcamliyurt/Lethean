@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class FileMetaResponse(BaseModel):
@@ -25,6 +25,7 @@ class UsageResponse(BaseModel):
 
 class ShareCreateResponse(BaseModel):
     shareToken: str
+    deleteToken: str | None = None
     expiresAt: datetime
     maxDownloads: int
 
@@ -35,6 +36,24 @@ class ShareFileResponse(BaseModel):
     metadata_iv: str
     downloads_used: int
     max_downloads: int
+    expires_at: datetime
+    deletable: bool
 
     class Config:
         from_attributes = True
+
+
+class RewrapItem(BaseModel):
+    file_id: str
+    wrapped_file_key: str = Field(..., max_length=4096)
+    wrap_iv: str = Field(..., max_length=64)
+
+
+class VaultRotateRequest(BaseModel):
+    new_vault_id: str
+    rewraps: list[RewrapItem]
+
+
+class VaultRotateResponse(BaseModel):
+    files_moved: int
+    tokens_rebound: int

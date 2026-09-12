@@ -18,9 +18,12 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete as sa_delete, func
 from sqlalchemy.orm import Session
 
-from database import Base, engine, get_db
-from models import EncryptedFile
-from schemas import FileMetaResponse, UsageResponse, ShareCreateResponse, ShareFileResponse
+from database import Base, engine, get_db, run_migrations
+from models import EncryptedFile, ShareToken
+from schemas import (
+    FileMetaResponse, UsageResponse, ShareCreateResponse, ShareFileResponse,
+    VaultRotateRequest, VaultRotateResponse,
+)
 from vault_auth import get_vault_id, require_upload_authorization, UploadAuthorization
 import share_store
 import storage
@@ -29,6 +32,7 @@ import token_store
 logger = logging.getLogger("lethean")
 
 Base.metadata.create_all(bind=engine)
+run_migrations()
 
 app = FastAPI(title="Lethean API", docs_url=None, redoc_url=None)
 
@@ -75,9 +79,13 @@ _WRAPPED_KEY_MAX_LEN = 4096
 _ENCRYPTED_METADATA_MAX_LEN = 65536
 
 _SHARE_LINK_TTL_SECONDS = int(os.environ.get("SHARE_LINK_TTL_SECONDS", str(share_store.DEFAULT_SHARE_TTL_SECONDS)))
+_SHARE_LINK_MAX_TTL_SECONDS = int(os.environ.get("SHARE_LINK_MAX_TTL_SECONDS", str(30 * 24 * 3600)))
 _SHARE_LINK_MAX_DOWNLOADS_LIMIT = int(os.environ.get("SHARE_LINK_MAX_DOWNLOADS_LIMIT", "100"))
 _SHARE_LINKS_MAX_ACTIVE_PER_FILE = int(os.environ.get("SHARE_LINKS_MAX_ACTIVE_PER_FILE", "20"))
 _SHARE_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{16,256}$")
+
+_MAX_ROTATE_ITEMS = int(os.environ.get("MAX_ROTATE_ITEMS", "50000"))
+_VAULT_ID_RE_MAIN = re.compile(r"^[0-9a-f]{64}$")
 
 _MAX_REQUEST_BYTES = MAX_UPLOAD_BYTES + _ENCRYPTED_METADATA_MAX_LEN + _WRAPPED_KEY_MAX_LEN + (4 * _IV_MAX_LEN) + (64 * 1024)
 
@@ -373,16 +381,27 @@ def create_file_share(
         le=_SHARE_LINK_MAX_DOWNLOADS_LIMIT,
         description="How many times this link can be downloaded before it stops working.",
     ),
+    expires_in: int | None = Query(
+        None,
+        ge=60,
+        le=_SHARE_LINK_MAX_TTL_SECONDS,
+        description="Seconds until the link expires. Omit to use the server default.",
+    ),
+    allow_delete: bool = Query(
+        False,
+        description="If true, also mint a separate token that can delete the file. The view/download token never can.",
+    ),
     db: Session = Depends(get_db),
     vault_id: str = Depends(get_vault_id),
 ):
     record = _get_owned_file(db, file_id, vault_id)
     try:
-        raw_token, expires_at, max_downloads = share_store.create_share(
+        raw_token, raw_delete_token, expires_at, max_downloads = share_store.create_share(
             db, record.id, vault_id,
-            ttl_seconds=_SHARE_LINK_TTL_SECONDS,
+            ttl_seconds=expires_in if expires_in is not None else _SHARE_LINK_TTL_SECONDS,
             max_downloads=max_downloads,
             max_active_per_file=_SHARE_LINKS_MAX_ACTIVE_PER_FILE,
+            allow_delete=allow_delete,
         )
     except share_store.TooManyActiveSharesError:
         raise HTTPException(
@@ -392,7 +411,9 @@ def create_file_share(
                 "Revoke one before creating another."
             ),
         )
-    return ShareCreateResponse(shareToken=raw_token, expiresAt=expires_at, maxDownloads=max_downloads)
+    return ShareCreateResponse(
+        shareToken=raw_token, deleteToken=raw_delete_token, expiresAt=expires_at, maxDownloads=max_downloads,
+    )
 
 
 @app.delete("/files/{file_id}/share", status_code=204)
@@ -416,13 +437,15 @@ def get_shared_file_meta(share_token: str, db: Session = Depends(get_db)):
     result = share_store.peek_share(db, share_token)
     if result is None:
         raise HTTPException(status_code=404, detail="This link is invalid or has expired")
-    record, downloads_used, max_downloads = result
+    record, share = result
     return ShareFileResponse(
         content_iv=record.content_iv,
         encrypted_metadata=record.encrypted_metadata,
         metadata_iv=record.metadata_iv,
-        downloads_used=downloads_used,
-        max_downloads=max_downloads,
+        downloads_used=share.download_count,
+        max_downloads=share.max_downloads,
+        expires_at=share.expires_at,
+        deletable=share.delete_token_hash is not None,
     )
 
 
@@ -460,7 +483,7 @@ async def delete_shared_file(share_token: str, db: Session = Depends(get_db)):
     if not _SHARE_TOKEN_RE.match(share_token):
         raise HTTPException(status_code=404, detail="This link is invalid or has expired")
 
-    deleted = await asyncio.to_thread(share_store.delete_via_share, db, share_token)
+    deleted = await asyncio.to_thread(share_store.delete_via_delete_token, db, share_token)
     if not deleted:
         raise HTTPException(status_code=404, detail="This link is invalid or has expired")
     return Response(status_code=204)
@@ -495,6 +518,65 @@ def _shred_vault_files(vault_id: str, file_infos: list[tuple[str, str]]) -> None
                 storage.shred_blob(path)
             except Exception:
                 logger.exception("Failed to shred blob for file %s in vault %s...", file_id, vault_id[:8])
+
+
+@app.post("/vault/rotate", response_model=VaultRotateResponse)
+def rotate_vault(
+    body: VaultRotateRequest,
+    db: Session = Depends(get_db),
+    auth: UploadAuthorization = Depends(require_upload_authorization),
+):
+    old_vault_id = auth.vault_id
+    new_vault_id = body.new_vault_id.strip().lower()
+
+    if not _VAULT_ID_RE_MAIN.match(new_vault_id):
+        raise HTTPException(status_code=400, detail="Malformed new vault id")
+    if new_vault_id == old_vault_id:
+        raise HTTPException(status_code=400, detail="New vault id must differ from the current one")
+    if len(body.rewraps) > _MAX_ROTATE_ITEMS:
+        raise HTTPException(status_code=413, detail=f"Too many items for a single rotation (max {_MAX_ROTATE_ITEMS})")
+
+    already_at_target = db.query(func.count(EncryptedFile.id)).filter(
+        EncryptedFile.vault_id == new_vault_id
+    ).scalar()
+    if already_at_target:
+        raise HTTPException(status_code=409, detail="Target vault id is already in use")
+
+    owned_ids = {
+        row.id for row in db.query(EncryptedFile.id).filter(EncryptedFile.vault_id == old_vault_id).all()
+    }
+    provided_ids = {item.file_id for item in body.rewraps}
+    if owned_ids != provided_ids:
+        raise HTTPException(
+            status_code=409,
+            detail="Vault contents changed since this rotation was prepared — refresh and try again",
+        )
+
+    for item in body.rewraps:
+        if len(item.wrapped_file_key) > _WRAPPED_KEY_MAX_LEN or len(item.wrap_iv) > _IV_MAX_LEN:
+            raise HTTPException(status_code=400, detail=f"Malformed rewrap entry for {item.file_id}")
+
+    with _lock_for_vault(old_vault_id), _lock_for_vault(new_vault_id):
+        for item in body.rewraps:
+            db.query(EncryptedFile).filter(
+                EncryptedFile.id == item.file_id, EncryptedFile.vault_id == old_vault_id,
+            ).update(
+                {
+                    "wrapped_file_key": item.wrapped_file_key,
+                    "wrap_iv": item.wrap_iv,
+                    "vault_id": new_vault_id,
+                },
+                synchronize_session=False,
+            )
+
+        db.query(ShareToken).filter(ShareToken.vault_id == old_vault_id).update(
+            {"vault_id": new_vault_id}, synchronize_session=False,
+        )
+        db.commit()
+
+    tokens_rebound = token_store.rebind_vault(old_vault_id, new_vault_id)
+
+    return VaultRotateResponse(files_moved=len(body.rewraps), tokens_rebound=tokens_rebound)
 
 
 def _get_owned_file(db: Session, file_id: str, vault_id: str) -> EncryptedFile:

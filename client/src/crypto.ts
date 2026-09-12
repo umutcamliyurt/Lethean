@@ -21,13 +21,26 @@ export {
   unwrapFileKey,
 } from './crypto-encrypt-core.js';
 
-const ARGON2_PARAMS = {
-  parallelism: 1,
-  iterations: 4,
-  memorySize: 98304,
-  hashLength: 32,
-  outputType: 'binary' as const,
+interface Argon2Params {
+  parallelism: number;
+  iterations: number;
+  memorySize: number;
+  hashLength: number;
+  outputType: 'binary';
+}
+
+export const KDF_PARAMS: Record<number, Argon2Params> = {
+  1: { parallelism: 1, iterations: 4, memorySize: 98304, hashLength: 32, outputType: 'binary' },
+  2: { parallelism: 1, iterations: 6, memorySize: 262144, hashLength: 32, outputType: 'binary' },
 };
+export const CURRENT_KDF_VERSION = 2;
+export const DEFAULT_LEGACY_KDF_VERSION = 1;
+
+function resolveKdfParams(kdfVersion: number): Argon2Params {
+  const params = KDF_PARAMS[kdfVersion];
+  if (!params) throw new Error(`Unknown KDF version: ${kdfVersion}. This vault may need a client update.`);
+  return params;
+}
 
 function timingSafeEqualHex(aHex: string, bHex: string): boolean {
   if (typeof aHex !== 'string' || typeof bHex !== 'string') return false;
@@ -52,9 +65,14 @@ export function generateSalt(): string {
   return toHex(randomBytes(16));
 }
 
-export async function deriveMasterKey(password: string, Salt: string | null | undefined): Promise<Uint8Array> {
+export async function deriveMasterKey(
+  password: string,
+  Salt: string | null | undefined,
+  kdfVersion: number = CURRENT_KDF_VERSION
+): Promise<Uint8Array> {
   const salt = await deriveSalt(Salt);
-  const hash = await argon2id({ password, salt, ...ARGON2_PARAMS });
+  const params = resolveKdfParams(kdfVersion);
+  const hash = await argon2id({ password, salt, ...params });
   return new Uint8Array(hash);
 }
 
@@ -82,8 +100,12 @@ export async function deriveConfirmMarker(vaultId: string): Promise<string> {
   return toHex(new Uint8Array(bytes));
 }
 
-export async function unlockVault(password: string, Salt: string | null | undefined): Promise<UnlockResult> {
-  const masterKey = await deriveMasterKey(password, Salt);
+export async function unlockVault(
+  password: string,
+  Salt: string | null | undefined,
+  kdfVersion: number = DEFAULT_LEGACY_KDF_VERSION
+): Promise<UnlockResult> {
+  const masterKey = await deriveMasterKey(password, Salt, kdfVersion);
   const [vaultId, wrappingKeyRaw] = await Promise.all([
     deriveVaultId(masterKey),
     deriveWrappingKey(masterKey),
@@ -103,25 +125,24 @@ async function sha256(bytes: Uint8Array): Promise<Uint8Array> {
   return new Uint8Array(await crypto.subtle.digest('SHA-256', asBufferSource(bytes)));
 }
 
-const DURESS_KDF_PARAMS = {
-  parallelism: 1,
-  iterations: ARGON2_PARAMS.iterations,
-  memorySize: ARGON2_PARAMS.memorySize,
-  hashLength: 32,
-  outputType: 'binary' as const,
-};
-
-async function deriveDuressKey(input: string, saltBytes: Uint8Array, domain: string): Promise<Uint8Array> {
+async function deriveDuressKey(
+  input: string,
+  saltBytes: Uint8Array,
+  domain: string,
+  kdfVersion: number
+): Promise<Uint8Array> {
+  const params = resolveKdfParams(kdfVersion);
   const domainSalt = await sha256(concatBytes(utf8(domain), saltBytes));
-  const hash = await argon2id({ password: input, salt: domainSalt, ...DURESS_KDF_PARAMS });
+  const hash = await argon2id({ password: input, salt: domainSalt, ...params });
   return new Uint8Array(hash);
 }
 
 export async function setupDuress(duressCode: string, realVaultId: string): Promise<DuressConfig> {
   const salt = randomBytes(16);
-  const verifierBytes = await deriveDuressKey(duressCode, salt, 'e2ee-vault|duress-verifier|v1');
+  const kdfVersion = CURRENT_KDF_VERSION;
+  const verifierBytes = await deriveDuressKey(duressCode, salt, 'e2ee-vault|duress-verifier|v1', kdfVersion);
 
-  const wrapKeyBytes = await deriveDuressKey(duressCode, salt, 'e2ee-vault|duress-wrap|v1');
+  const wrapKeyBytes = await deriveDuressKey(duressCode, salt, 'e2ee-vault|duress-wrap|v1', kdfVersion);
   const wrapKey = await importAesKey(wrapKeyBytes, ['encrypt']);
   const { iv, ciphertext } = await aesGcmEncrypt(wrapKey, utf8(realVaultId));
 
@@ -130,6 +151,7 @@ export async function setupDuress(duressCode: string, realVaultId: string): Prom
     verifier: toHex(verifierBytes),
     encVaultId: toBase64(ciphertext),
     iv: toBase64(iv),
+    kdfVersion,
   };
 }
 
@@ -144,16 +166,18 @@ export function generateDecoyDuressConfig(): DuressConfig {
     verifier: toHex(randomBytes(32)),
     encVaultId: toBase64(randomBytes(fakeVaultIdLen + 16)),
     iv: toBase64(randomBytes(12)),
+    kdfVersion: CURRENT_KDF_VERSION,
   };
 }
 
 export async function checkDuress(input: string, duressConfig: DuressConfig): Promise<string | null> {
   try {
+    const kdfVersion = duressConfig.kdfVersion ?? DEFAULT_LEGACY_KDF_VERSION;
     const saltBytes = fromBase64(duressConfig.salt);
-    const verifierBytes = await deriveDuressKey(input, saltBytes, 'e2ee-vault|duress-verifier|v1');
+    const verifierBytes = await deriveDuressKey(input, saltBytes, 'e2ee-vault|duress-verifier|v1', kdfVersion);
     const matches = timingSafeEqualHex(toHex(verifierBytes), duressConfig.verifier);
 
-    const wrapKeyBytes = await deriveDuressKey(input, saltBytes, 'e2ee-vault|duress-wrap|v1');
+    const wrapKeyBytes = await deriveDuressKey(input, saltBytes, 'e2ee-vault|duress-wrap|v1', kdfVersion);
     const wrapKey = await importAesKey(wrapKeyBytes, ['decrypt']);
     let vaultId: string | null = null;
     try {

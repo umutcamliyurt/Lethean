@@ -37,6 +37,7 @@ class ShareToken(Base):
 
     id = Column(String, primary_key=True, default=gen_uuid)
     token_hash = Column(String, nullable=False, unique=True, index=True)
+    delete_token_hash = Column(String, nullable=True, unique=True, index=True)
 
     file_id = Column(String, ForeignKey("files.id", ondelete="CASCADE"), nullable=False, index=True)
     vault_id = Column(String, nullable=False)

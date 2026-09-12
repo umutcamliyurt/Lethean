@@ -29,43 +29,74 @@ function closeShareModal(): void {
   lightbox.removeEventListener('click', onBackdropClick);
 }
 
-function buildShareUrl(shareToken: string, fileKeyRaw: Uint8Array): string {
+function buildShareUrl(shareToken: string, fileKeyRaw: Uint8Array, deleteToken?: string | null): string {
   const keyB64 = toBase64(fileKeyRaw);
   const basePath = window.location.pathname.replace(/[^/]*$/, '');
-  const fragment = `t=${encodeURIComponent(shareToken)}&k=${encodeURIComponent(keyB64)}`;
-  return `${window.location.origin}${basePath}share.html#${fragment}`;
+  const parts = [`t=${encodeURIComponent(shareToken)}`, `k=${encodeURIComponent(keyB64)}`];
+  if (deleteToken) parts.push(`d=${encodeURIComponent(deleteToken)}`);
+  return `${window.location.origin}${basePath}share.html#${parts.join('&')}`;
 }
 
 const DOWNLOAD_COUNT_PRESETS = [1, 5, 10, 25];
 const MAX_CUSTOM_DOWNLOADS = 1000;
+
+interface ExpiryOption { label: string; seconds: number | null }
+const EXPIRY_PRESETS: ExpiryOption[] = [
+  { label: '1 hour', seconds: 3600 },
+  { label: '24 hours', seconds: 86400 },
+  { label: '7 days', seconds: 7 * 86400 },
+  { label: 'Server default', seconds: null },
+];
 
 function renderDownloadCountPicker(record: FileRecord, name: string): void {
   openShareModal(`
     <div class="lightbox-content share-modal">
       <h3>Share &ldquo;${escapeHtml(name)}&rdquo;</h3>
       <p class="field-hint">
-        Anyone with the link can decrypt and download this one file &mdash; without your vault
-        password. Choose how many times it can be downloaded before it stops working.
+        Anyone with the link can decrypt and download this one file.
       </p>
-      <div class="share-download-count" role="radiogroup" aria-label="Allowed downloads">
-        ${DOWNLOAD_COUNT_PRESETS.map((n, i) => `
+
+      <div class="share-section">
+        <p class="share-section-label">Downloads allowed</p>
+        <div class="share-download-count" role="radiogroup" aria-label="Allowed downloads">
+          ${DOWNLOAD_COUNT_PRESETS.map((n, i) => `
+            <label class="share-count-option">
+              <input type="radio" name="share-count" value="${n}" ${i === 0 ? 'checked' : ''}>
+              <span>${n === 1 ? 'Once' : `${n}\u00d7`}</span>
+            </label>
+          `).join('')}
           <label class="share-count-option">
-            <input type="radio" name="share-count" value="${n}" ${i === 0 ? 'checked' : ''}>
-            <span>${n === 1 ? 'Once' : `${n}\u00d7`}</span>
+            <input type="radio" name="share-count" value="custom">
+            <span>Custom</span>
           </label>
-        `).join('')}
-        <label class="share-count-option">
-          <input type="radio" name="share-count" value="custom">
-          <span>Custom</span>
+        </div>
+        <input type="number" id="share-count-custom" class="hidden" min="1" max="${MAX_CUSTOM_DOWNLOADS}" step="1"
+          placeholder="Number of downloads" aria-label="Custom number of downloads">
+      </div>
+
+      <div class="share-section">
+        <p class="share-section-label">Link expires after</p>
+        <div class="share-download-count" role="radiogroup" aria-label="Link expiry">
+          ${EXPIRY_PRESETS.map((opt, i) => `
+            <label class="share-count-option">
+              <input type="radio" name="share-expiry" value="${opt.seconds ?? 'none'}" ${i === 0 ? 'checked' : ''}>
+              <span>${opt.label}</span>
+            </label>
+          `).join('')}
+        </div>
+      </div>
+
+      <div class="share-section">
+        <p class="share-section-label">Permissions</p>
+        <label class="share-checkbox-row" for="share-allow-delete">
+          <input type="checkbox" id="share-allow-delete">
+          <span class="share-checkbox-text">
+            <strong>Allow deleting the file via this link</strong>
+            <small>Off by default. Only enable this if that's actually the point of sharing it, e.g. handing off ownership.</small>
+          </span>
         </label>
       </div>
-      <input type="number" id="share-count-custom" class="hidden" min="1" max="${MAX_CUSTOM_DOWNLOADS}" step="1"
-        placeholder="Number of downloads" aria-label="Custom number of downloads">
-      <p class="field-hint share-delete-warning">
-        Whoever opens this link will also be able to <strong>permanently delete the file</strong>
-        &mdash; for everyone, not just their own access to it. This is built into every share link
-        (it's for preventing abuse) and isn't optional.
-      </p>
+
       <div class="share-link-row">
         <button type="button" class="btn-primary" id="share-create-btn">Create link</button>
       </div>
@@ -81,6 +112,9 @@ function renderDownloadCountPicker(record: FileRecord, name: string): void {
     });
   }
 
+  const expiryRadios = Array.from(document.querySelectorAll<HTMLInputElement>('input[name="share-expiry"]'));
+  const allowDeleteCheckbox = document.getElementById('share-allow-delete') as HTMLInputElement;
+
   document.getElementById('share-create-btn')!.addEventListener('click', () => {
     const chosen = radios.find((r) => r.checked)?.value;
     let maxDownloads = 1;
@@ -94,11 +128,23 @@ function renderDownloadCountPicker(record: FileRecord, name: string): void {
     } else if (chosen) {
       maxDownloads = Number(chosen);
     }
-    createAndShowLink(record, name, maxDownloads);
+
+    const chosenExpiry = expiryRadios.find((r) => r.checked)?.value;
+    const expiresInSeconds = chosenExpiry && chosenExpiry !== 'none' ? Number(chosenExpiry) : null;
+
+    createAndShowLink(record, name, {
+      maxDownloads,
+      expiresInSeconds,
+      allowDelete: allowDeleteCheckbox.checked,
+    });
   });
 }
 
-async function createAndShowLink(record: FileRecord, name: string, maxDownloads: number): Promise<void> {
+async function createAndShowLink(
+  record: FileRecord,
+  name: string,
+  options: { maxDownloads: number; expiresInSeconds: number | null; allowDelete: boolean }
+): Promise<void> {
   const fileKeyRaw = fileKeyCache.get(record.id);
   if (!fileKeyRaw) {
     closeShareModal();
@@ -114,27 +160,59 @@ async function createAndShowLink(record: FileRecord, name: string, maxDownloads:
   `);
 
   try {
-    const { shareToken, maxDownloads: confirmedMax } = await api.createFileShare(record.id, maxDownloads);
-    renderShareLink(buildShareUrl(shareToken, fileKeyRaw), name, confirmedMax);
+    const { shareToken, deleteToken, maxDownloads: confirmedMax } = await api.createFileShare(record.id, options);
+    const url = buildShareUrl(shareToken, fileKeyRaw, options.allowDelete ? deleteToken : null);
+    renderShareLink(url, name, confirmedMax, options.expiresInSeconds, Boolean(options.allowDelete && deleteToken));
   } catch (err) {
     closeShareModal();
     showToast("Couldn't create a share link. " + (err as Error).message, 'error');
   }
 }
 
-function renderShareLink(url: string, name: string, maxDownloads: number): void {
-  const usesLabel = maxDownloads === 1 ? 'once' : `up to ${maxDownloads} times`;
+function expiryValueLabel(expiresInSeconds: number | null): string {
+  if (expiresInSeconds == null) return 'Server default';
+  const hours = expiresInSeconds / 3600;
+  if (hours < 24) return `${hours} hour${hours === 1 ? '' : 's'}`;
+  const days = Math.round(hours / 24);
+  return `${days} day${days === 1 ? '' : 's'}`;
+}
+
+function renderShareLink(
+  url: string,
+  name: string,
+  maxDownloads: number,
+  expiresInSeconds: number | null,
+  isDeletable: boolean
+): void {
   openShareModal(`
     <div class="lightbox-content share-modal">
       <h3>Share &ldquo;${escapeHtml(name)}&rdquo;</h3>
       <p class="field-hint">
-        Anyone with this link can decrypt and download this one file &mdash; without your vault
-        password. It can be downloaded <strong>${usesLabel}</strong>; after that, the link stops working.
+        Anyone with this link can decrypt and download this file.
       </p>
-      <p class="field-hint share-delete-warning">
-        This link can also be used to <strong>permanently delete the file</strong> &mdash; for everyone,
-        not just the link &mdash; at any point until it expires.
-      </p>
+
+      <div class="share-summary">
+        <div class="share-summary-item">
+          <span class="label">Downloads</span>
+          <span class="value">${maxDownloads === 1 ? 'Once' : `Up to ${maxDownloads}`}</span>
+        </div>
+        <div class="share-summary-item">
+          <span class="label">Expires</span>
+          <span class="value">${expiryValueLabel(expiresInSeconds)}</span>
+        </div>
+        <div class="share-summary-item">
+          <span class="label">Deletable</span>
+          <span class="value">${isDeletable ? 'Yes' : 'No'}</span>
+        </div>
+      </div>
+
+      ${isDeletable ? `
+        <p class="field-hint share-delete-warning">
+          <span class="share-delete-warning-icon">${icon('trash')}</span>
+          <span>This link also lets whoever opens it <strong>permanently delete the file</strong>.</span>
+        </p>
+      ` : ''}
+
       <div class="share-link-row">
         <input type="text" readonly id="share-link-input" value="${escapeHtml(url)}" aria-label="Share link">
         <button type="button" class="btn-primary" id="share-copy-btn">Copy</button>

@@ -43,25 +43,28 @@ function showFailure(message: string): void {
 
 function updateUsageHint(record: ShareRecord): void {
   const remaining = record.max_downloads - record.downloads_used;
+  const expiryNote = record.expires_at
+    ? ` It also expires on ${new Date(record.expires_at).toLocaleString()}.`
+    : '';
   if (record.max_downloads === 1) {
-    usageHintEl.textContent = remaining > 0
+    usageHintEl.textContent = (remaining > 0
       ? 'This link works once. After downloading, it stops working.'
-      : 'This link has now been used and will not work again.';
+      : 'This link has now been used and will not work again.') + expiryNote;
     return;
   }
-  usageHintEl.textContent = remaining > 0
+  usageHintEl.textContent = (remaining > 0
     ? `This link can still be downloaded ${remaining} more time${remaining === 1 ? '' : 's'} (of ${record.max_downloads} total). After that, it stops working.`
-    : 'This link has now been fully used and will not work again.';
+    : 'This link has now been fully used and will not work again.') + expiryNote;
 }
 
-function parseFragment(): { token: string | null; keyB64: string | null } {
+function parseFragment(): { token: string | null; keyB64: string | null; deleteToken: string | null } {
   const raw = window.location.hash.replace(/^#/, '');
   const params = new URLSearchParams(raw);
-  return { token: params.get('t'), keyB64: params.get('k') };
+  return { token: params.get('t'), keyB64: params.get('k'), deleteToken: params.get('d') };
 }
 
 async function init(): Promise<void> {
-  const { token, keyB64 } = parseFragment();
+  const { token, keyB64, deleteToken } = parseFragment();
   if (!token || !keyB64) {
     showFailure("This link is missing information it needs and can't be used.");
     return;
@@ -107,7 +110,9 @@ async function init(): Promise<void> {
     downloadBtn.textContent = 'No downloads left';
   }
 
-  deleteBtn.classList.remove('hidden');
+  if (deleteToken) {
+    deleteBtn.classList.remove('hidden');
+  }
 
   downloadBtn.addEventListener('click', async () => {
     downloadBtn.disabled = true;
@@ -142,10 +147,11 @@ async function init(): Promise<void> {
     );
     if (!confirmed) return;
 
+    if (!deleteToken) return;
     deleteBtn.disabled = true;
     deleteBtn.textContent = 'Deleting\u2026';
     try {
-      await deleteSharedFile(token);
+      await deleteSharedFile(deleteToken);
       deleteBtn.textContent = 'Deleted';
       downloadBtn.disabled = true;
       downloadBtn.textContent = 'File deleted';

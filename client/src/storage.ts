@@ -2,6 +2,7 @@ import * as C from './crypto.js';
 import type { DuressConfig, ViewMode } from './types.js';
 
 const LS_SETUP_KEY = 'vault.setupComplete';
+const LS_KDF_VERSION_KEY = 'vault.kdfVersion';
 const LS_DURESS_KEY = 'vault.duress';
 const LS_ACCESS_TOKEN_KEY = 'vault.accessToken';
 const LS_SALT_KEY = 'vault.salt';
@@ -16,6 +17,15 @@ export function isSetupComplete(): boolean {
 }
 export function markSetupComplete(): void {
   localStorage.setItem(LS_SETUP_KEY, '1');
+}
+
+export function getStoredKdfVersion(): number {
+  const raw = localStorage.getItem(LS_KDF_VERSION_KEY);
+  const parsed = raw ? Number(raw) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+}
+export function setStoredKdfVersion(version: number): void {
+  localStorage.setItem(LS_KDF_VERSION_KEY, String(version));
 }
 
 export function getStoredAccessToken(): string {
@@ -87,4 +97,10 @@ export function markVaultConfirmed(marker: string): void {
   markers.push(marker);
   while (markers.length > MAX_CONFIRMED_MARKERS) markers.shift();
   localStorage.setItem(LS_CONFIRMED_MARKERS_KEY, JSON.stringify(markers));
+}
+
+export function forgetThisDevice(): void {
+  setStoredAccessToken('');
+  setStoredSalt('');
+  localStorage.removeItem(LS_CONFIRMED_MARKERS_KEY);
 }
