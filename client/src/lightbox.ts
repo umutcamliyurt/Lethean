@@ -324,7 +324,7 @@ async function openOtherPreview(record: FileRecord, meta: FileMeta, kind: 'pdf' 
       const blob = new Blob([bytes as BlobPart], { type: 'application/pdf' });
       objectUrl = URL.createObjectURL(blob);
       objectUrlCache.set(record.id, objectUrl);
-      inner = `<iframe src="${objectUrl}" id="lightbox-media" title="${escapeHtml(meta.name)}" sandbox="allow-same-origin" referrerpolicy="no-referrer"></iframe>`;
+      inner = `<iframe src="${objectUrl}" id="lightbox-media" title="${escapeHtml(meta.name)}" sandbox="allow-same-origin allow-scripts" referrerpolicy="no-referrer"></iframe>`;
     } else {
       objectUrl = await getDecryptedUrl(record);
       inner = `<audio src="${objectUrl}" controls autoplay id="lightbox-media"></audio>`;
