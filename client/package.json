@@ -8,8 +8,8 @@
     "prebuild": "npm run clean",
     "build": "tsc -p tsconfig.json && npm run fix-imports && npm run copy-assets",
     "watch": "tsc -p tsconfig.json --watch",
-    "fix-imports": "sed -i.bak \"s#from 'hash-wasm'#from './vendor/hash-wasm.esm.min.js'#\" dist/crypto.js && rm -f dist/crypto.js.bak",
-    "copy-assets": "mkdir -p dist/vendor && cp index.html dist/index.html && cp share.html dist/share.html && cp node_modules/hash-wasm/dist/index.esm.min.js dist/vendor/hash-wasm.esm.min.js && ([ -f node_modules/hash-wasm/LICENSE ] && cp node_modules/hash-wasm/LICENSE dist/vendor/hash-wasm.LICENSE || true) && ([ -f common_passwords.txt ] && cp common_passwords.txt dist/ || true) && ([ -f style.css ] && cp style.css dist/ || true)"
+    "fix-imports": "sed -i.bak \"s#from 'hash-wasm'#from './vendor/hash-wasm.esm.min.js'#\" dist/crypto.js && rm -f dist/crypto.js.bak && sed -i.bak \"s#import('pdfjs-dist')#import('./vendor/pdfjs/pdf.min.mjs')#\" dist/pdf-preview.js && rm -f dist/pdf-preview.js.bak",
+    "copy-assets": "mkdir -p dist/vendor/pdfjs && cp index.html dist/index.html && cp share.html dist/share.html && cp node_modules/hash-wasm/dist/index.esm.min.js dist/vendor/hash-wasm.esm.min.js && ([ -f node_modules/hash-wasm/LICENSE ] && cp node_modules/hash-wasm/LICENSE dist/vendor/hash-wasm.LICENSE || true) && cp node_modules/pdfjs-dist/build/pdf.min.mjs dist/vendor/pdfjs/pdf.min.mjs && cp node_modules/pdfjs-dist/build/pdf.worker.min.mjs dist/vendor/pdfjs/pdf.worker.min.mjs && ([ -f node_modules/pdfjs-dist/LICENSE ] && cp node_modules/pdfjs-dist/LICENSE dist/vendor/pdfjs/pdfjs-dist.LICENSE || true) && ([ -f common_passwords.txt ] && cp common_passwords.txt dist/ || true) && ([ -f style.css ] && cp style.css dist/ || true)"
   },
   "keywords": [],
   "author": "",
@@ -18,6 +18,7 @@
     "typescript": "^7.0.2"
   },
   "dependencies": {
-    "hash-wasm": "^4.12.0"
+    "hash-wasm": "^4.12.0",
+    "pdfjs-dist": "^6.3.289"
   }
 }

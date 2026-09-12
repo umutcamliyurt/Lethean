@@ -7,6 +7,8 @@ import {
 } from './utils.js';
 import { visibleRecords, getRecords, getDecryptedBytes, getDecryptedUrl } from './gallery.js';
 import { shareFile } from './share.js';
+import { openPdfPreview } from './pdf-preview.js';
+import type { PdfPreviewHandle } from './pdf-preview.js';
 import type { FileMeta, FileRecord } from './types.js';
 
 let lightboxMediaList: FileRecord[] = [];
@@ -14,6 +16,7 @@ let lightboxIndex = -1;
 let lightboxNavLock = false;
 
 let currentPreviewId: string | null = null;
+let currentPdfHandle: PdfPreviewHandle | null = null;
 
 let currentMediaCtx: { record: FileRecord; meta: FileMeta; url: string } | null = null;
 
@@ -216,6 +219,10 @@ function releaseEphemeralPreview(id: string | null): void {
 
 function switchPreview(newId: string | null): void {
   if (currentPreviewId && currentPreviewId !== newId) releaseEphemeralPreview(currentPreviewId);
+  if (currentPdfHandle) {
+    currentPdfHandle.destroy();
+    currentPdfHandle = null;
+  }
   currentPreviewId = newId;
 }
 
@@ -307,6 +314,11 @@ async function openOtherPreview(record: FileRecord, meta: FileMeta, kind: 'pdf' 
   showLightbox(`<div class="lightbox-content"><div class="spinner spinner-lg"></div></div>`, { keepMedia: true });
 
   try {
+    if (kind === 'pdf') {
+      await renderPdfLightbox(record, meta);
+      return;
+    }
+
     let inner: string;
     let objectUrl: string | null = null;
 
@@ -314,17 +326,6 @@ async function openOtherPreview(record: FileRecord, meta: FileMeta, kind: 'pdf' 
       const bytes = await getDecryptedBytes(record);
       const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
       inner = `<pre class="lightbox-text" id="lightbox-media">${escapeHtml(text)}</pre>`;
-    } else if (kind === 'pdf') {
-      const bytes = await getDecryptedBytes(record);
-      if (!looksLikePdf(bytes)) {
-        const err: UnsafePdfError = new Error("This file is named/labeled as a PDF but its contents don't look like one, so it can't be previewed safely.");
-        err.unsafePdf = true;
-        throw err;
-      }
-      const blob = new Blob([bytes as BlobPart], { type: 'application/pdf' });
-      objectUrl = URL.createObjectURL(blob);
-      objectUrlCache.set(record.id, objectUrl);
-      inner = `<iframe src="${objectUrl}" id="lightbox-media" title="${escapeHtml(meta.name)}" sandbox="allow-same-origin allow-scripts" referrerpolicy="no-referrer"></iframe>`;
     } else {
       objectUrl = await getDecryptedUrl(record);
       inner = `<audio src="${objectUrl}" controls autoplay id="lightbox-media"></audio>`;
@@ -363,6 +364,58 @@ async function openOtherPreview(record: FileRecord, meta: FileMeta, kind: 'pdf' 
   } finally {
     tileEl?.classList.remove('decrypting', 'opening');
   }
+}
+
+async function renderPdfLightbox(record: FileRecord, meta: FileMeta): Promise<void> {
+  const bytes = await getDecryptedBytes(record);
+  if (!looksLikePdf(bytes)) {
+    const err: UnsafePdfError = new Error("This file is named/labeled as a PDF but its contents don't look like one, so it can't be previewed safely.");
+    err.unsafePdf = true;
+    throw err;
+  }
+
+  showLightbox(`
+    <div class="lightbox-content lightbox-content-pdf">
+      <div class="lightbox-pdf-container" id="lightbox-media"></div>
+      <div class="lightbox-pdf-pager hidden" id="lightbox-pdf-pager">
+        <button type="button" class="btn-icon" id="lightbox-pdf-prev" aria-label="Previous page" disabled>${icon('chevronLeft')}</button>
+        <span class="lightbox-pdf-page-indicator" id="lightbox-pdf-page-indicator"></span>
+        <button type="button" class="btn-icon" id="lightbox-pdf-next" aria-label="Next page" disabled>${icon('chevronRight')}</button>
+      </div>
+      <div class="lightbox-meta">
+        <span class="fname" id="lightbox-pdf-fname">${escapeHtml(meta.name)}</span>
+        <button class="btn-icon" id="lightbox-share" title="Share" aria-label="Share">${icon('share')}</button>
+        <button class="btn-icon" id="lightbox-download" title="Download" aria-label="Download">${icon('download')}</button>
+      </div>
+    </div>
+  `, { keepMedia: true });
+
+  document.getElementById('lightbox-share')!.addEventListener('click', () => shareFile(record));
+  document.getElementById('lightbox-download')!.addEventListener('click', () => downloadAndSave(record, meta));
+
+  const container = document.getElementById('lightbox-media') as HTMLDivElement;
+  const pager = document.getElementById('lightbox-pdf-pager') as HTMLDivElement;
+  const prevBtn = document.getElementById('lightbox-pdf-prev') as HTMLButtonElement;
+  const nextBtn = document.getElementById('lightbox-pdf-next') as HTMLButtonElement;
+  const pageIndicatorEl = document.getElementById('lightbox-pdf-page-indicator')!;
+
+  const handle = await openPdfPreview(container, bytes, {
+    onPageChange: (page, pageCount) => {
+      pager.classList.toggle('hidden', pageCount <= 1);
+      pageIndicatorEl.textContent = `${page} / ${pageCount}`;
+      prevBtn.disabled = page <= 1;
+      nextBtn.disabled = page >= pageCount;
+    },
+  });
+
+  if (currentPreviewId !== record.id) {
+    handle.destroy();
+    return;
+  }
+  currentPdfHandle = handle;
+
+  prevBtn.addEventListener('click', () => { void handle.goToPage(handle.currentPage - 1); });
+  nextBtn.addEventListener('click', () => { void handle.goToPage(handle.currentPage + 1); });
 }
 
 function updateMediaMetaLabel(meta: FileMeta, showNav: boolean): void {
@@ -481,6 +534,10 @@ export function showLightbox(innerHtml: string, { keepMedia = false }: { keepMed
     lightbox.classList.remove('has-nav');
     releaseEphemeralPreview(currentPreviewId);
     currentPreviewId = null;
+    if (currentPdfHandle) {
+      currentPdfHandle.destroy();
+      currentPdfHandle = null;
+    }
   }
   lightbox.innerHTML = `
     <button class="btn-icon lightbox-close" id="lightbox-close" aria-label="Close">${icon('close')}</button>
@@ -510,6 +567,10 @@ export function closeLightbox(): void {
   lightboxIndex = -1;
   releaseEphemeralPreview(currentPreviewId);
   currentPreviewId = null;
+  if (currentPdfHandle) {
+    currentPdfHandle.destroy();
+    currentPdfHandle = null;
+  }
 }
 
 document.addEventListener('keydown', (e) => {

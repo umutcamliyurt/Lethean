@@ -654,12 +654,43 @@ main.vault {
   border-radius: 4px;
   background: #000;
 }
-.lightbox-content-pdf iframe {
+.lightbox-pdf-container {
   width: min(900px, 84vw);
-  height: 78vh;
+  max-height: 74vh;
+  overflow: auto;
   border: 1px solid var(--border);
   border-radius: 4px;
   background: #fff;
+  display: flex;
+  justify-content: center;
+}
+.lightbox-pdf-canvas {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+.lightbox-pdf-pager {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  background: rgba(20, 20, 20, 0.55);
+  border-radius: 999px;
+  padding: 3px;
+}
+.lightbox-pdf-pager .btn-icon {
+  width: 32px;
+  height: 32px;
+  color: var(--text);
+}
+.lightbox-pdf-pager .btn-icon:hover { background: rgba(255, 255, 255, 0.12); }
+.lightbox-pdf-pager .btn-icon:disabled { opacity: 0.35; cursor: default; }
+.lightbox-pdf-pager .btn-icon:disabled:hover { background: transparent; }
+.lightbox-pdf-page-indicator {
+  font-family: var(--font-mono);
+  font-size: 0.76rem;
+  color: var(--text);
+  min-width: 3.5em;
+  text-align: center;
 }
 .lightbox-content-audio audio {
   width: min(480px, 84vw);

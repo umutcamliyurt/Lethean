@@ -1,5 +1,6 @@
 {
   "imports": {
-    "hash-wasm": "./vendor/hash-wasm.esm.min.js"
+    "hash-wasm": "./vendor/hash-wasm.esm.min.js",
+    "pdfjs-dist": "./vendor/pdfjs/pdf.min.mjs"
   }
 }
