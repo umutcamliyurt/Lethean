@@ -12,7 +12,19 @@ export function toBase64(bytes: Uint8Array): string {
 }
 
 export function fromBase64(b64: string): Uint8Array {
-  return Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+  let normalized = b64.trim().replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/');
+  const remainder = normalized.length % 4;
+  if (remainder === 2) normalized += '==';
+  else if (remainder === 3) normalized += '=';
+  else if (remainder === 1) throw new Error('Invalid base64 string');
+
+  let binary: string;
+  try {
+    binary = atob(normalized);
+  } catch {
+    throw new Error('Invalid base64 string');
+  }
+  return Uint8Array.from(binary, (c) => c.charCodeAt(0));
 }
 
 export function toHex(bytes: Uint8Array): string {

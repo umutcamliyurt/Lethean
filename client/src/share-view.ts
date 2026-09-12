@@ -41,10 +41,25 @@ function showFailure(message: string): void {
   bodyEl.classList.add('hidden');
 }
 
+function formatRelativeExpiry(expiresAt: string): string {
+  const diffMs = new Date(expiresAt).getTime() - Date.now();
+  if (diffMs <= 0) return 'shortly';
+
+  const minutes = Math.round(diffMs / 60_000);
+  if (minutes < 1) return 'in less than a minute';
+  if (minutes < 60) return `in ${minutes} minute${minutes === 1 ? '' : 's'}`;
+
+  const hours = Math.round(diffMs / 3_600_000);
+  if (hours < 24) return `in ${hours} hour${hours === 1 ? '' : 's'}`;
+
+  const days = Math.round(diffMs / 86_400_000);
+  return `in ${days} day${days === 1 ? '' : 's'}`;
+}
+
 function updateUsageHint(record: ShareRecord): void {
   const remaining = record.max_downloads - record.downloads_used;
   const expiryNote = record.expires_at
-    ? ` It also expires on ${new Date(record.expires_at).toLocaleString()}.`
+    ? ` It also expires ${formatRelativeExpiry(record.expires_at)}.`
     : '';
   if (record.max_downloads === 1) {
     usageHintEl.textContent = (remaining > 0
@@ -57,10 +72,26 @@ function updateUsageHint(record: ShareRecord): void {
     : 'This link has now been fully used and will not work again.') + expiryNote;
 }
 
+function decodeIfStillEncoded(value: string): string {
+  if (!/%[0-9A-Fa-f]{2}/.test(value)) return value;
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
 function parseFragment(): { token: string | null; keyB64: string | null; deleteToken: string | null } {
   const raw = window.location.hash.replace(/^#/, '');
   const params = new URLSearchParams(raw);
-  return { token: params.get('t'), keyB64: params.get('k'), deleteToken: params.get('d') };
+  const token = params.get('t');
+  const keyB64 = params.get('k');
+  const deleteToken = params.get('d');
+  return {
+    token: token !== null ? decodeIfStillEncoded(token) : null,
+    keyB64: keyB64 !== null ? decodeIfStillEncoded(keyB64) : null,
+    deleteToken: deleteToken !== null ? decodeIfStillEncoded(deleteToken) : null,
+  };
 }
 
 async function init(): Promise<void> {
