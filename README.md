@@ -42,8 +42,6 @@ Lethean is a zero-knowledge encrypted storage accountless web app. Your chosen p
 
 **Why the salt matters:** the salt itself doesn't need to be secret, but without it, the same password won't produce the same `masterKey`. So if two people happen to pick the same password, their vaults still end up completely unrelated, different salt, different keys.
 
-**Why this resists brute-forcing:** because `vaultId` only exists after the Argon2id step, someone who steals the server's data can't shortcut anything. Every single password guess still has to pay the full Argon2id cost, there's no faster path in.
-
 ## Duress Code
 
 Think of the duress code as a second, secret password that opens a decoy vault instead of the real one, and silently destroys the real one in the process.
@@ -66,10 +64,9 @@ Server operators manage these tokens from the command line:
 
 ```bash
 cd backend
-python manage_tokens.py create --label alice --quota-gb 15     # issue a real token + a matching decoy token
-python manage_tokens.py list                                   # see all tokens
-python manage_tokens.py revoke <token-or-id>                   # disable a token
-python manage_tokens.py migrate                                # migration to hashed storage
+python manage_tokens.py create --label alice --quota-gb 15
+python manage_tokens.py list
+python manage_tokens.py revoke <token-or-id>
 ```
 
 ## Setup
