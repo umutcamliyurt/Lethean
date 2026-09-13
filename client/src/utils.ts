@@ -27,6 +27,9 @@ const TEXT_PREVIEW_EXTENSION_BLOCKLIST: Set<string> = new Set(['html', 'htm', 'x
 
 const PDF_MAGIC = [0x25, 0x50, 0x44, 0x46, 0x2d];
 
+export const isCoarsePointerDevice = typeof window.matchMedia === 'function'
+  && window.matchMedia('(pointer: coarse)').matches;
+
 export function fileKind(mime: string | undefined | null): FileKind {
   if (mime?.startsWith('image/')) return 'image';
   if (mime?.startsWith('video/')) return 'video';

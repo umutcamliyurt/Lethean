@@ -6,7 +6,7 @@ import {
 } from './dom.js';
 import { fileKeyCache, metaCache, objectUrlCache, getWrappingKeyRaw } from './state.js';
 import { getStoredViewMode, setStoredViewMode } from './storage.js';
-import { fileKind, fileTypeLabel, formatBytes, decryptedSize, icon, showToast } from './utils.js';
+import { fileKind, fileTypeLabel, formatBytes, decryptedSize, icon, showToast, isCoarsePointerDevice } from './utils.js';
 import { openTile, downloadAndSave } from './lightbox.js';
 import { shareFile } from './share.js';
 import type { FileMeta, FileRecord, UsageResponse, ViewMode } from './types.js';
@@ -320,10 +320,12 @@ function renderTile(record: FileRecord): HTMLDivElement {
   tile.setAttribute('aria-label', isFolder ? `Open folder ${meta.name}` : `Open ${meta.name}`);
 
   tile.innerHTML = `
-    <div class="box-menu">
-      ${isFolder ? '' : `<button type="button" class="btn-icon share-btn" title="Share">${icon('share')}</button>`}
-      <button type="button" class="btn-icon delete-btn" title="Delete">${icon('trash')}</button>
-    </div>
+    ${isCoarsePointerDevice ? '' : `
+      <div class="box-menu">
+        ${isFolder ? '' : `<button type="button" class="btn-icon share-btn" title="Share">${icon('share')}</button>`}
+        <button type="button" class="btn-icon delete-btn" title="Delete">${icon('trash')}</button>
+      </div>
+    `}
     <div class="box-body">
       ${isFolder ? `<div class="box-icon">${icon('folder')}</div><div class="box-name"></div>`
         : kind === 'image' ? `<div class="box-icon">${icon('image')}</div><div class="box-name"></div>`
@@ -332,7 +334,7 @@ function renderTile(record: FileRecord): HTMLDivElement {
     </div>
   `;
   tile.querySelector('.box-name')!.textContent = meta.name;
-  tile.querySelector('.delete-btn')!.setAttribute('aria-label', `Delete ${meta.name}`);
+  tile.querySelector('.delete-btn')?.setAttribute('aria-label', `Delete ${meta.name}`);
   tile.querySelector('.share-btn')?.setAttribute('aria-label', `Share ${meta.name}`);
 
   const openThisTile = () => (isFolder ? navigateToFolder(record.id) : openTile(record.id));
@@ -344,7 +346,7 @@ function renderTile(record: FileRecord): HTMLDivElement {
   tile.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openThisTile(); }
   });
-  tile.querySelector('.delete-btn')!.addEventListener('click', (e) => {
+  tile.querySelector('.delete-btn')?.addEventListener('click', (e) => {
     e.stopPropagation();
     handleDelete(record.id);
   });
@@ -481,7 +483,7 @@ export async function createFolder(name: string): Promise<void> {
   }
 }
 
-async function handleDelete(fileId: string): Promise<void> {
+export async function handleDelete(fileId: string): Promise<boolean> {
   const meta = metaCache.get(fileId);
   const isFolder = !!meta?.isFolder;
   const descendantIds = isFolder ? collectDescendantIds(fileId) : [];
@@ -491,7 +493,7 @@ async function handleDelete(fileId: string): Promise<void> {
       ? `Delete "${meta?.name ?? 'this folder'}" and everything inside it (${descendantIds.length} item${descendantIds.length === 1 ? '' : 's'})? This can't be undone.`
       : `Delete "${meta?.name ?? 'this folder'}"? This can't be undone.`
     : `Delete "${meta?.name ?? 'this file'}"? This can't be undone.`;
-  if (!confirm(confirmMsg)) return;
+  if (!confirm(confirmMsg)) return false;
 
   const idsToDelete = [...descendantIds, fileId];
   try {
@@ -505,8 +507,10 @@ async function handleDelete(fileId: string): Promise<void> {
     records = records.filter((r) => !removed.has(r.id));
     renderCurrentView();
     showToast(isFolder ? 'Folder deleted.' : 'Deleted.');
+    return true;
   } catch (err) {
     showToast("Couldn't delete that item. " + (err as Error).message, 'error');
     await refreshGallery();
+    return false;
   }
 }

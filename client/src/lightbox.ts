@@ -3,9 +3,9 @@ import * as api from './api.js';
 import { lightbox, boxGrid } from './dom.js';
 import { fileKeyCache, metaCache, objectUrlCache } from './state.js';
 import {
-  fileKind, previewKind, looksLikePdf, decryptedSize, formatBytes, icon, escapeHtml, showToast,
+  fileKind, previewKind, looksLikePdf, decryptedSize, formatBytes, icon, escapeHtml, showToast, isCoarsePointerDevice,
 } from './utils.js';
-import { visibleRecords, getRecords, getDecryptedBytes, getDecryptedUrl } from './gallery.js';
+import { visibleRecords, getRecords, getDecryptedBytes, getDecryptedUrl, handleDelete } from './gallery.js';
 import { shareFile } from './share.js';
 import { openPdfPreview } from './pdf-preview.js';
 import type { PdfPreviewHandle } from './pdf-preview.js';
@@ -226,8 +226,6 @@ function switchPreview(newId: string | null): void {
   currentPreviewId = newId;
 }
 
-const isCoarsePointerDevice = typeof window.matchMedia === 'function'
-  && window.matchMedia('(pointer: coarse)').matches;
 const MOBILE_INLINE_VIDEO_LIMIT_BYTES = 150 * 1024 * 1024;
 const MOBILE_INLINE_PDF_LIMIT_BYTES = 150 * 1024 * 1024;
 const TEXT_PREVIEW_MAX_BYTES = 2 * 1024 * 1024;
@@ -338,12 +336,16 @@ async function openOtherPreview(record: FileRecord, meta: FileMeta, kind: 'pdf' 
           <span class="fname">${escapeHtml(meta.name)}</span>
           <button class="btn-icon" id="lightbox-share" title="Share" aria-label="Share">${icon('share')}</button>
           <button class="btn-icon" id="lightbox-download" title="Download" aria-label="Download">${icon('download')}</button>
+          <button class="btn-icon" id="lightbox-delete" title="Delete" aria-label="Delete">${icon('trash')}</button>
         </div>
       </div>
     `, { keepMedia: true });
 
     document.getElementById('lightbox-share')!.addEventListener('click', () => shareFile(record));
     document.getElementById('lightbox-download')!.addEventListener('click', () => downloadAndSave(record, meta, objectUrl ?? undefined));
+    document.getElementById('lightbox-delete')!.addEventListener('click', async () => {
+      if (await handleDelete(record.id)) closeLightbox();
+    });
   } catch (err) {
     const unsafeErr = err as UnsafePdfError;
     if (unsafeErr.unsafePdf) {
@@ -386,12 +388,16 @@ async function renderPdfLightbox(record: FileRecord, meta: FileMeta): Promise<vo
         <span class="fname" id="lightbox-pdf-fname">${escapeHtml(meta.name)}</span>
         <button class="btn-icon" id="lightbox-share" title="Share" aria-label="Share">${icon('share')}</button>
         <button class="btn-icon" id="lightbox-download" title="Download" aria-label="Download">${icon('download')}</button>
+        <button class="btn-icon" id="lightbox-delete" title="Delete" aria-label="Delete">${icon('trash')}</button>
       </div>
     </div>
   `, { keepMedia: true });
 
   document.getElementById('lightbox-share')!.addEventListener('click', () => shareFile(record));
   document.getElementById('lightbox-download')!.addEventListener('click', () => downloadAndSave(record, meta));
+  document.getElementById('lightbox-delete')!.addEventListener('click', async () => {
+    if (await handleDelete(record.id)) closeLightbox();
+  });
 
   const container = document.getElementById('lightbox-media') as HTMLDivElement;
   const pager = document.getElementById('lightbox-pdf-pager') as HTMLDivElement;
@@ -485,6 +491,7 @@ async function openMediaAt(list: FileRecord[], index: number): Promise<void> {
             <button class="btn-icon" id="lightbox-fullscreen" title="Full screen" aria-label="Full screen">${icon('expand')}</button>
             <button class="btn-icon" id="lightbox-share" title="Share" aria-label="Share">${icon('share')}</button>
             <button class="btn-icon" id="lightbox-download" title="Download" aria-label="Download">${icon('download')}</button>
+            <button class="btn-icon" id="lightbox-delete" title="Delete" aria-label="Delete">${icon('trash')}</button>
           </div>
         </div>
       `, { keepMedia: true });
@@ -494,6 +501,11 @@ async function openMediaAt(list: FileRecord[], index: number): Promise<void> {
       });
       document.getElementById('lightbox-download')!.addEventListener('click', () => {
         if (currentMediaCtx) downloadAndSave(currentMediaCtx.record, currentMediaCtx.meta, currentMediaCtx.url);
+      });
+      document.getElementById('lightbox-delete')!.addEventListener('click', async () => {
+        if (!currentMediaCtx) return;
+        const { record: mediaRecord } = currentMediaCtx;
+        if (await handleDelete(mediaRecord.id)) closeLightbox();
       });
       document.getElementById('lightbox-fullscreen')!.addEventListener('click', () => {
         const mediaEl = document.getElementById('lightbox-media') as (HTMLVideoElement | HTMLImageElement | null);

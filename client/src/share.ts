@@ -10,10 +10,38 @@ function onBackdropClick(e: MouseEvent): void {
   if (e.target === lightbox) closeShareModal();
 }
 
+const SHARE_MODAL_SCROLL_ID = 'share-modal-scroll';
+const SHARE_MODAL_VIEWPORT_MARGIN = 32;
+
+function currentVisibleViewportHeight(): number {
+  return window.visualViewport?.height ?? window.innerHeight;
+}
+
+function syncShareModalHeight(): void {
+  const scrollEl = document.getElementById(SHARE_MODAL_SCROLL_ID);
+  if (!scrollEl) return;
+  const maxHeight = Math.max(160, currentVisibleViewportHeight() - SHARE_MODAL_VIEWPORT_MARGIN);
+  scrollEl.style.maxHeight = `${maxHeight}px`;
+}
+
+function attachShareModalViewportSync(): void {
+  detachShareModalViewportSync();
+  syncShareModalHeight();
+  window.visualViewport?.addEventListener('resize', syncShareModalHeight);
+  window.addEventListener('resize', syncShareModalHeight);
+}
+
+function detachShareModalViewportSync(): void {
+  window.visualViewport?.removeEventListener('resize', syncShareModalHeight);
+  window.removeEventListener('resize', syncShareModalHeight);
+}
+
 function openShareModal(innerHtml: string): void {
   lightbox.innerHTML = `
     <button class="btn-icon lightbox-close" id="share-modal-close" aria-label="Close">${icon('close')}</button>
-    ${innerHtml}
+    <div id="${SHARE_MODAL_SCROLL_ID}" class="share-modal-scroll">
+      ${innerHtml}
+    </div>
   `;
   lightbox.classList.remove('hidden');
   lightbox.classList.remove('has-nav');
@@ -21,9 +49,11 @@ function openShareModal(innerHtml: string): void {
   lightbox.focus({ preventScroll: true });
   document.getElementById('share-modal-close')!.addEventListener('click', closeShareModal);
   lightbox.addEventListener('click', onBackdropClick);
+  attachShareModalViewportSync();
 }
 
 function closeShareModal(): void {
+  detachShareModalViewportSync();
   lightbox.classList.add('hidden');
   lightbox.innerHTML = '';
   lightbox.removeEventListener('click', onBackdropClick);

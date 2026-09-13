@@ -507,10 +507,6 @@ main.vault {
 }
 .box-tile:hover .box-menu, .box-tile:focus-within .box-menu { opacity: 1; }
 
-@media (hover: none) {
-  .box-menu { opacity: 1; }
-}
-
 .box-tile.decrypting .box-icon { animation: pulse 1.1s ease-in-out infinite; }
 @keyframes pulse { 0%,100% { opacity: 0.4; } 50% { opacity: 1; } }
 
@@ -950,6 +946,15 @@ main.vault {
   .topbar-right button span.btn-label { display: none; }
   .usage-pill { display: none; }
   .box-grid { grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 6px; }
+}
+
+.share-modal-scroll {
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
 }
 
 .share-modal {
