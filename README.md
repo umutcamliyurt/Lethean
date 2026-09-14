@@ -63,7 +63,7 @@ Tokens are hashed (SHA-256) before they're written to disk, so a leaked `tokens.
 Server operators manage these tokens from the command line:
 
 ```bash
-cd backend
+cd server
 python manage_tokens.py create --label alice --quota-gb 15
 python manage_tokens.py list
 python manage_tokens.py revoke <token-or-id>
@@ -78,10 +78,10 @@ npm install
 npm run build
 ```
 
-Then run the backend:
+Then run the server:
 
 ```bash
-cd ../backend
+cd ../server
 python3.13 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip setuptools wheel
