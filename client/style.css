@@ -982,6 +982,35 @@ main.vault {
   line-height: 1.55;
 }
 
+.field.editor-content-field {
+  margin: 0 -28px -28px;
+}
+.editor-content-field .editor-textarea,
+.editor-content-field .editor-preview {
+  border-left: none;
+  border-right: none;
+  border-bottom: none;
+  border-radius: 0 0 16px 16px;
+}
+
+.editor-tabs-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.editor-tabs-row .editor-tabs { margin-bottom: 0; }
+
+#editor-save-btn {
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  flex-shrink: 0;
+}
+#editor-save-btn:hover { background: var(--border); color: var(--text); }
+#editor-save-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+#editor-save-btn:disabled:hover { background: var(--surface-2); }
+
 .editor-tabs {
   display: inline-flex;
   gap: 2px;
@@ -990,7 +1019,6 @@ main.vault {
   background: var(--surface-2);
   padding: 3px;
   width: fit-content;
-  margin-bottom: 10px;
 }
 .editor-tab {
   border: none;
@@ -1118,8 +1146,10 @@ main.vault {
   .settings-panel-editor p.subtitle { margin-bottom: 14px; }
   .settings-panel-editor .field { margin-bottom: 10px; }
   .settings-panel-editor .panel-actions { margin-top: 12px; }
+  .field.editor-content-field { margin: 0 -16px -16px; }
 
-  .editor-tabs { width: 100%; margin-bottom: 8px; }
+  .editor-tabs-row { margin-bottom: 8px; }
+  .editor-tabs { flex: 1; margin-bottom: 0; }
   .editor-tab { flex: 1; padding: 0 8px; }
 
   .editor-toolbar {

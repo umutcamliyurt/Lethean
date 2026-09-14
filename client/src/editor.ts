@@ -269,30 +269,29 @@ function renderEditorPanel(opts: EditorPanelOptions): void {
     <div class="settings-panel settings-panel-editor">
       <h2>${escapeHtml(opts.heading)}</h2>
       ${opts.subtitle ? `<p class="subtitle">${escapeHtml(opts.subtitle)}</p>` : ''}
-      <form id="editor-form">
+      <form id="editor-form" style="display:flex;flex-direction:column;height:100%;min-height:0;">
         <div class="field">
-          <label for="editor-name-input">File name</label>
-          <input type="text" id="editor-name-input" autocomplete="off" spellcheck="false" maxlength="${MAX_NAME_LENGTH}" required>
+          <input type="text" id="editor-name-input" autocomplete="off" spellcheck="false" maxlength="${MAX_NAME_LENGTH}" required
+            placeholder="File name" aria-label="File name">
         </div>
 
-        <div class="editor-tabs" role="tablist">
-          <button type="button" class="editor-tab active" id="editor-tab-write" role="tab" aria-selected="true">Write</button>
-          <button type="button" class="editor-tab" id="editor-tab-preview" role="tab" aria-selected="false">Preview</button>
+        <div class="editor-tabs-row">
+          <div class="editor-tabs" role="tablist">
+            <button type="button" class="editor-tab active" id="editor-tab-write" role="tab" aria-selected="true">Write</button>
+            <button type="button" class="editor-tab" id="editor-tab-preview" role="tab" aria-selected="false">Preview</button>
+          </div>
+          <button type="submit" class="btn-icon" id="editor-save-btn"
+            title="${escapeHtml(opts.saveLabel)}" aria-label="${escapeHtml(opts.saveLabel)}">${icon('save')}</button>
         </div>
 
         <div class="editor-toolbar" id="editor-toolbar" role="toolbar" aria-label="Formatting">
           ${toolbarHtml()}
         </div>
 
-        <div class="field">
+        <div class="field editor-content-field" style="flex:1 1 auto;display:flex;flex-direction:column;min-height:0;">
           <textarea id="editor-content-textarea" class="editor-textarea" spellcheck="false"
-            placeholder="Start typing\u2026" aria-label="File content"></textarea>
-          <div class="editor-preview hidden" id="editor-preview" aria-live="polite"></div>
-        </div>
-
-        <div class="panel-actions">
-          <button type="submit" class="btn-icon btn-icon-primary" id="editor-save-btn"
-            title="${escapeHtml(opts.saveLabel)}" aria-label="${escapeHtml(opts.saveLabel)}">${icon('save')}</button>
+            placeholder="Start typing\u2026" aria-label="File content" style="flex:1 1 auto;min-height:0;max-height:none;resize:none;"></textarea>
+          <div class="editor-preview hidden" id="editor-preview" aria-live="polite" style="flex:1 1 auto;min-height:0;max-height:none;overflow:auto;"></div>
         </div>
       </form>
     </div>
