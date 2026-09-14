@@ -1,7 +1,7 @@
 import * as C from './crypto.js';
 import * as api from './api.js';
 import {
-  authScreen, appScreen, authForm, authSubmit, authStatus, passwordInput,
+  authScreen, appScreen, authHeading, authForm, authSubmit, authStatus, passwordInput,
   confirmField, passwordConfirmInput, accessTokenInput, saltInput,
   logoutBtn, tokenBtn, saltBtn, themeBtn, duressBtn, sourceBtn, settingsBtn, settingsMenu,
 } from './dom.js';
@@ -57,14 +57,12 @@ let pendingConfirmation: PendingConfirmation | null = null;
 
 function configureAuthScreenForRun(): void {
   if (isFirstRun) {
-    document.getElementById('auth-heading')!.textContent = 'Set up';
-    document.getElementById('auth-subtitle')!.textContent = 'Choose a password for this vault.';
+    authHeading.textContent = 'Set up';
     confirmField.classList.remove('hidden');
     passwordConfirmInput.required = true;
     confirmField.querySelector('label')!.textContent = 'Confirm password';
   } else {
-    document.getElementById('auth-heading')!.textContent = 'Unlock';
-    document.getElementById('auth-subtitle')!.textContent = "No accounts. Your password is the only key.";
+    authHeading.textContent = 'Unlock';
     confirmField.querySelector('label')!.textContent = 'Retype to confirm';
   }
 }

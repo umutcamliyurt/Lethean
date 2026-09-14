@@ -6,6 +6,7 @@ export function $<T extends HTMLElement = HTMLElement>(id: string): T {
 
 export const authScreen = $<HTMLDivElement>('auth-screen');
 export const appScreen = $<HTMLDivElement>('app-screen');
+export const authHeading = $<HTMLHeadingElement>('auth-heading');
 export const authForm = $<HTMLFormElement>('auth-form');
 export const authSubmit = $<HTMLButtonElement>('auth-submit');
 export const authStatus = $<HTMLDivElement>('auth-status');
@@ -18,6 +19,7 @@ export const saltInput = $<HTMLInputElement>('salt');
 export const depositSlot = $<HTMLDivElement>('deposit-slot');
 export const chooseFilesBtn = $<HTMLButtonElement>('choose-files-btn');
 export const newFolderBtn = $<HTMLButtonElement>('new-folder-btn');
+export const newTextFileBtn = $<HTMLButtonElement>('new-text-file-btn');
 export const fileInput = $<HTMLInputElement>('file-input');
 export const uploadQueue = $<HTMLDivElement>('upload-queue');
 export const breadcrumbEl = $<HTMLDivElement>('breadcrumb');

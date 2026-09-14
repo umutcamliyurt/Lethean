@@ -110,6 +110,18 @@ const ICONS: Record<string, string> = {
   chevronRight: '<path d="M7.5 4.5L14 11l-6.5 6.5" stroke="currentColor" stroke-width="1.6" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
   expand: '<path d="M7 3H4a1 1 0 0 0-1 1v3M13 3h3a1 1 0 0 1 1 1v3M17 13v3a1 1 0 0 1-1 1h-3M3 13v3a1 1 0 0 0 1 1h3" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
   collapse: '<path d="M8 3v3a1 1 0 0 1-1 1H4M12 3v3a1 1 0 0 0 1 1h3M17 12h-3a1 1 0 0 0-1 1v3M3 12h3a1 1 0 0 1 1 1v3" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
+  edit: '<path d="M13.4 3.6l3 3L7.2 15.8H4.2v-3z" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linejoin="round" stroke-linecap="round"/><path d="M11.6 5.4l3 3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>',
+  mdBold: '<text x="10" y="14.5" text-anchor="middle" font-size="12" font-weight="700" fill="currentColor">B</text>',
+  mdItalic: '<text x="10" y="14.5" text-anchor="middle" font-size="12" font-weight="600" font-style="italic" fill="currentColor">I</text>',
+  mdStrike: '<text x="10" y="14.5" text-anchor="middle" font-size="11" font-weight="600" fill="currentColor">S</text><path d="M4.5 10h11" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>',
+  mdHeading: '<text x="10" y="14.5" text-anchor="middle" font-size="12" font-weight="700" fill="currentColor">H</text>',
+  mdQuote: '<path d="M4.5 12.5v-2.3c0-1.9 1-3.1 2.6-3.6l.4 1.2c-1 .35-1.5 1-1.6 1.9h1.4v2.8H4.5zm6.5 0v-2.3c0-1.9 1-3.1 2.6-3.6l.4 1.2c-1 .35-1.5 1-1.6 1.9h1.4v2.8H11z" fill="currentColor"/>',
+  mdCode: '<path d="M7.5 6L4 10l3.5 4M12.5 6L16 10l-3.5 4" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round" stroke-linejoin="round"/>',
+  mdLink: '<path d="M8.3 11.7a2.8 2.8 0 0 1 0-4l1.8-1.8a2.8 2.8 0 0 1 4 4l-.9.9" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/><path d="M11.7 8.3a2.8 2.8 0 0 1 0 4l-1.8 1.8a2.8 2.8 0 0 1-4-4l.9-.9" stroke="currentColor" stroke-width="1.4" fill="none" stroke-linecap="round"/>',
+  mdListBullet: '<circle cx="4.5" cy="6" r="1" fill="currentColor"/><circle cx="4.5" cy="10" r="1" fill="currentColor"/><circle cx="4.5" cy="14" r="1" fill="currentColor"/><path d="M8 6h8M8 10h8M8 14h8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>',
+  mdListNumbered: '<text x="2.2" y="7.4" font-size="5.2" fill="currentColor">1</text><text x="2.2" y="11.4" font-size="5.2" fill="currentColor">2</text><text x="2.2" y="15.4" font-size="5.2" fill="currentColor">3</text><path d="M8 6h8M8 10h8M8 14h8" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>',
+  mdHr: '<path d="M3.5 10h13" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>',
+  save: '<path d="M4 3.5h9.5L16 6v10a.5.5 0 0 1-.5.5h-11A.5.5 0 0 1 4 16V4a.5.5 0 0 1 .5-.5z" stroke="currentColor" stroke-width="1.3" fill="none" stroke-linejoin="round"/><path d="M6.5 3.5v3.8h5V3.5" stroke="currentColor" stroke-width="1.3" fill="none"/><rect x="6.5" y="11" width="7" height="5" stroke="currentColor" stroke-width="1.3" fill="none"/>',
 };
 
 export function icon(name: string): string {

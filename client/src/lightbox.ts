@@ -7,6 +7,7 @@ import {
 } from './utils.js';
 import { visibleRecords, getRecords, getDecryptedBytes, getDecryptedUrl, handleDelete } from './gallery.js';
 import { shareFile } from './share.js';
+import { editTextFile } from './editor.js';
 import { openPdfPreview } from './pdf-preview.js';
 import type { PdfPreviewHandle } from './pdf-preview.js';
 import type { FileMeta, FileRecord } from './types.js';
@@ -334,6 +335,7 @@ async function openOtherPreview(record: FileRecord, meta: FileMeta, kind: 'pdf' 
         ${inner}
         <div class="lightbox-meta">
           <span class="fname">${escapeHtml(meta.name)}</span>
+          ${kind === 'text' ? `<button class="btn-icon" id="lightbox-edit" title="Edit" aria-label="Edit">${icon('edit')}</button>` : ''}
           <button class="btn-icon" id="lightbox-share" title="Share" aria-label="Share">${icon('share')}</button>
           <button class="btn-icon" id="lightbox-download" title="Download" aria-label="Download">${icon('download')}</button>
           <button class="btn-icon" id="lightbox-delete" title="Delete" aria-label="Delete">${icon('trash')}</button>
@@ -341,6 +343,9 @@ async function openOtherPreview(record: FileRecord, meta: FileMeta, kind: 'pdf' 
       </div>
     `, { keepMedia: true });
 
+    document.getElementById('lightbox-edit')?.addEventListener('click', () => {
+      editTextFile(record, meta);
+    });
     document.getElementById('lightbox-share')!.addEventListener('click', () => shareFile(record));
     document.getElementById('lightbox-download')!.addEventListener('click', () => downloadAndSave(record, meta, objectUrl ?? undefined));
     document.getElementById('lightbox-delete')!.addEventListener('click', async () => {
@@ -596,6 +601,10 @@ document.addEventListener('keydown', (e) => {
     closeLightbox();
     return;
   }
+  const target = e.target as HTMLElement | null;
+  const isTypingTarget = !!target
+    && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable);
+  if (isTypingTarget) return;
   if (e.key === 'ArrowLeft') { e.preventDefault(); navigateLightbox(-1); }
   else if (e.key === 'ArrowRight') { e.preventDefault(); navigateLightbox(1); }
 });

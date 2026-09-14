@@ -483,6 +483,14 @@ export async function createFolder(name: string): Promise<void> {
   }
 }
 
+export function removeRecordLocally(fileId: string): void {
+  if (objectUrlCache.has(fileId)) { URL.revokeObjectURL(objectUrlCache.get(fileId)!); objectUrlCache.delete(fileId); }
+  fileKeyCache.delete(fileId);
+  metaCache.delete(fileId);
+  records = records.filter((r) => r.id !== fileId);
+  renderCurrentView();
+}
+
 export async function handleDelete(fileId: string): Promise<boolean> {
   const meta = metaCache.get(fileId);
   const isFolder = !!meta?.isFolder;
