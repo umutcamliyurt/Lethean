@@ -3,18 +3,21 @@ import * as api from './api.js';
 import {
   authScreen, appScreen, authHeading, authForm, authSubmit, authStatus, passwordInput,
   confirmField, passwordConfirmInput, accessTokenInput, saltInput,
+  serverUrlField, serverUrlInput,
   logoutBtn, tokenBtn, saltBtn, themeBtn, duressBtn, sourceBtn, settingsBtn, settingsMenu,
 } from './dom.js';
 import { fileKeyCache, metaCache, getWrappingKeyRaw, setWrappingKeyRaw, getCurrentVaultId, setCurrentVaultId } from './state.js';
 import {
   isSetupComplete, markSetupComplete, getStoredAccessToken, setStoredAccessToken,
   getStoredSalt, setStoredSalt,
+  getStoredServerUrl, setStoredServerUrl,
   loadDuressConfig, saveDuressConfig, resetDuressConfig,
   getStoredTheme, setStoredTheme,
   isVaultConfirmed, markVaultConfirmed,
   getStoredKdfVersion, setStoredKdfVersion,
   forgetThisDevice,
 } from './storage.js';
+import { isTauri, openExternal } from './platform.js';
 import { rotateVaultPassword } from './vault-rotate.js';
 import { THEMES, getTheme, applyTheme } from './theme.js';
 import type { ThemeDef } from './theme.js';
@@ -26,6 +29,18 @@ import { encryptPool } from './encrypt-pool.js';
 accessTokenInput.value = getStoredAccessToken();
 accessTokenInput.type = 'password';
 saltInput.value = getStoredSalt();
+
+if (isTauri()) {
+  serverUrlField.classList.remove('hidden');
+  serverUrlInput.value = getStoredServerUrl();
+  serverUrlInput.addEventListener('change', () => {
+    const next = serverUrlInput.value.trim();
+    if (next === getStoredServerUrl()) return;
+    setStoredServerUrl(next);
+    showToast('Server URL saved. Reloading\u2026');
+    setTimeout(() => window.location.reload(), 600);
+  });
+}
 
 let currentsalt: string | null = null;
 
@@ -43,6 +58,24 @@ function setAuthStatus(message: string, { error = false, spinning = false }: { e
 }
 
 let isFirstRun = !isSetupComplete();
+
+async function resolveExistingVault(
+  password: string,
+  salt: string
+): Promise<{ vaultId: string; wrappingKeyRaw: Uint8Array; kdfVersion: number } | null> {
+  const versionsToTry = Array.from(new Set([C.CURRENT_KDF_VERSION, ...Object.keys(C.KDF_PARAMS).map(Number)]));
+  for (const kdfVersion of versionsToTry) {
+    const { vaultId, wrappingKeyRaw } = await C.unlockVault(password, salt, kdfVersion);
+    try {
+      const usage = await api.getUsage(vaultId);
+      if ((usage.file_count ?? 0) > 0 || (usage.total_bytes ?? 0) > 0) {
+        return { vaultId, wrappingKeyRaw, kdfVersion };
+      }
+    } catch {
+    }
+  }
+  return null;
+}
 
 interface PendingConfirmation {
   vaultId: string;
@@ -80,6 +113,23 @@ authForm.addEventListener('submit', async (e) => {
         setAuthStatus("Those don't match.", { error: true });
         return;
       }
+
+      setAuthStatus('Checking for an existing vault\u2026', { spinning: true });
+      const existing = await resolveExistingVault(password, saltInput.value.trim());
+      if (existing) {
+        await checkDuressAndMaybeWipe(password);
+        markVaultConfirmed(await C.deriveConfirmMarker(existing.vaultId));
+        markSetupComplete();
+        setStoredKdfVersion(existing.kdfVersion);
+        const salt = saltInput.value.trim();
+        if (salt) setStoredSalt(salt);
+        currentsalt = salt;
+        isFirstRun = false;
+        configureAuthScreenForRun();
+        await finishUnlock(existing.vaultId, existing.wrappingKeyRaw);
+        return;
+      }
+
       const { valid, errors } = await C.validatePasswordStrength(password);
       if (!valid) {
         setAuthStatus(errors[0] || 'Password is too weak.', { error: true });
@@ -152,6 +202,17 @@ authForm.addEventListener('submit', async (e) => {
     }
 
     if (!isVaultConfirmed(marker)) {
+      setAuthStatus('Checking for an existing vault\u2026', { spinning: true });
+      const existing = await resolveExistingVault(password, salt);
+      if (existing) {
+        markVaultConfirmed(await C.deriveConfirmMarker(existing.vaultId));
+        setStoredKdfVersion(existing.kdfVersion);
+        currentsalt = salt;
+        setStoredSalt(salt);
+        await finishUnlock(existing.vaultId, existing.wrappingKeyRaw);
+        return;
+      }
+
       const { valid, errors } = await C.validatePasswordStrength(password);
       if (!valid) {
         setAuthStatus(errors[0] || 'Password is too weak.', { error: true });
@@ -582,7 +643,7 @@ function openTokenPanel(): void {
 }
 
 sourceBtn.addEventListener('click', () => {
-  window.open('https://github.com/umutcamliyurt/Lethean', '_blank', 'noopener,noreferrer');
+  void openExternal('https://github.com/umutcamliyurt/Lethean');
 });
 
 duressBtn.addEventListener('click', openDuressPanel);

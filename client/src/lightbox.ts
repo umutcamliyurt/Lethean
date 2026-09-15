@@ -7,10 +7,11 @@ import {
 } from './utils.js';
 import { visibleRecords, getRecords, getDecryptedBytes, getDecryptedUrl, handleDelete } from './gallery.js';
 import { shareFile } from './share.js';
-import { editTextFile } from './editor.js';
+import { editTextFile, isMarkdownFile, renderMarkdownPreview } from './editor.js';
 import { openPdfPreview } from './pdf-preview.js';
 import type { PdfPreviewHandle } from './pdf-preview.js';
 import type { FileMeta, FileRecord } from './types.js';
+import { isTauri, saveBytes } from './platform.js';
 
 let lightboxMediaList: FileRecord[] = [];
 let lightboxIndex = -1;
@@ -324,7 +325,9 @@ async function openOtherPreview(record: FileRecord, meta: FileMeta, kind: 'pdf' 
     if (kind === 'text') {
       const bytes = await getDecryptedBytes(record);
       const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
-      inner = `<pre class="lightbox-text" id="lightbox-media">${escapeHtml(text)}</pre>`;
+      inner = isMarkdownFile(meta)
+        ? `<div class="editor-preview lightbox-markdown" id="lightbox-media">${renderMarkdownPreview(text)}</div>`
+        : `<pre class="lightbox-text" id="lightbox-media">${escapeHtml(text)}</pre>`;
     } else {
       objectUrl = await getDecryptedUrl(record);
       inner = `<audio src="${objectUrl}" controls autoplay id="lightbox-media"></audio>`;
@@ -636,8 +639,16 @@ lightbox.addEventListener('touchend', (e) => {
 }, { passive: true });
 
 export async function downloadAndSave(record: FileRecord, meta: FileMeta, existingUrl?: string): Promise<void> {
-  let url = existingUrl;
   try {
+    if (isTauri()) {
+      const fileKeyRaw = fileKeyCache.get(record.id)!;
+      const ciphertext = await api.downloadContent(record.id);
+      const bytes = await C.decryptContent(fileKeyRaw, record.content_iv, ciphertext, meta.compressed, meta.unpaddedSize ?? null);
+      await saveBytes(meta.name, meta.mime, bytes);
+      return;
+    }
+
+    let url = existingUrl;
     if (!url) {
       const fileKeyRaw = fileKeyCache.get(record.id)!;
       const ciphertext = await api.downloadContent(record.id);

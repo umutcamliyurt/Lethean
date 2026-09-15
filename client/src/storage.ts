@@ -6,6 +6,7 @@ const LS_KDF_VERSION_KEY = 'vault.kdfVersion';
 const LS_DURESS_KEY = 'vault.duress';
 const LS_ACCESS_TOKEN_KEY = 'vault.accessToken';
 const LS_SALT_KEY = 'vault.salt';
+const LS_SERVER_URL_KEY = 'vault.serverUrl';
 const LS_VIEW_MODE_KEY = 'vault.viewMode';
 const LS_THEME_KEY = 'vault.theme';
 const LS_CONFIRMED_MARKERS_KEY = 'vault.confirmedMarkers';
@@ -42,6 +43,15 @@ export function getStoredSalt(): string {
 export function setStoredSalt(salt: string): void {
   if (salt) localStorage.setItem(LS_SALT_KEY, salt);
   else localStorage.removeItem(LS_SALT_KEY);
+}
+
+export function getStoredServerUrl(): string {
+  return localStorage.getItem(LS_SERVER_URL_KEY) || '';
+}
+export function setStoredServerUrl(url: string): void {
+  const trimmed = url.trim().replace(/\/+$/, '');
+  if (trimmed) localStorage.setItem(LS_SERVER_URL_KEY, trimmed);
+  else localStorage.removeItem(LS_SERVER_URL_KEY);
 }
 
 export function loadDuressConfig(): DuressConfig {

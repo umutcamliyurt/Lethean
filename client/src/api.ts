@@ -1,11 +1,12 @@
 import type {
   EncryptedFilePayload, FileRecord, ProgressCallback, UsageResponse, ShareCreateResponse, ShareRecord,
 } from './types.js';
+import { isTauri, resolveBaseUrl } from './platform.js';
 
 const isLocalDev = window.location.port === '5500';
-const BASE_URL = isLocalDev ? 'http://localhost:8000' : '';
+const BASE_URL = resolveBaseUrl();
 
-if (!isLocalDev && window.isSecureContext !== true) {
+if (!isLocalDev && !isTauri() && window.isSecureContext !== true) {
   throw new Error('This app must be served over HTTPS — refusing to run over an insecure connection.');
 }
 
@@ -158,8 +159,8 @@ export async function listFiles({ offset = 0, limit = null }: ListFilesOptions =
   return res.json() as Promise<FileRecord[]>;
 }
 
-export async function getUsage(): Promise<UsageResponse> {
-  const res = await privateFetch(`${BASE_URL}/usage`, { headers: authHeaders(), credentials: 'omit' });
+export async function getUsage(vaultIdOverride?: string): Promise<UsageResponse> {
+  const res = await privateFetch(`${BASE_URL}/usage`, { headers: authHeaders(vaultIdOverride), credentials: 'omit' });
   await checkOk(res, 'Could not load usage');
   return res.json() as Promise<UsageResponse>;
 }

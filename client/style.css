@@ -95,7 +95,7 @@ button:focus-visible, input:focus-visible, [tabindex]:focus-visible {
   border-top-color: var(--bg);
 }
 
-input[type=password], input[type=text], textarea {
+input[type=password], input[type=text], input[type=url], textarea {
   font-family: inherit;
   font-size: 16px;
   background: var(--bg);

@@ -53,7 +53,7 @@ async def _configure_thread_capacity():
     anyio.to_thread.current_default_thread_limiter().total_tokens = _THREAD_POOL_WORKERS
 
 
-_ALLOWED_ORIGINS = ["tauri://localhost", "https://tauri.localhost"]
+_ALLOWED_ORIGINS = ["tauri://localhost", "https://tauri.localhost", "http://tauri.localhost"]
 _extra_origins = os.environ.get("EXTRA_CORS_ORIGINS", "")
 if _extra_origins:
     _ALLOWED_ORIGINS.extend(o.strip() for o in _extra_origins.split(",") if o.strip())
@@ -68,6 +68,20 @@ else:
         allow_headers=["Authorization", "X-Access-Token", "Content-Type"],
         allow_credentials=False,
     )
+
+@app.middleware("http")
+async def _debug_cors(request: Request, call_next):
+    if request.method == "OPTIONS" and "access-control-request-method" in request.headers:
+        origin = request.headers.get("origin")
+        verdict = "ALLOWED" if origin in _ALLOWED_ORIGINS else "REJECTED"
+        print(
+            f"[DEBUG_CORS] {verdict} origin={origin!r} "
+            f"method={request.headers.get('access-control-request-method')!r} "
+            f"headers={request.headers.get('access-control-request-headers')!r} "
+            f"path={request.url.path} allowed_origins={_ALLOWED_ORIGINS!r}",
+            flush=True,
+        )
+    return await call_next(request)
 
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(5 * 1024**3)))
 _READ_CHUNK = 8 * 1024 * 1024

@@ -15,6 +15,8 @@ export const confirmField = $<HTMLDivElement>('confirm-field');
 export const passwordConfirmInput = $<HTMLInputElement>('password-confirm');
 export const accessTokenInput = $<HTMLInputElement>('access-token');
 export const saltInput = $<HTMLInputElement>('salt');
+export const serverUrlField = $<HTMLDivElement>('server-url-field');
+export const serverUrlInput = $<HTMLInputElement>('server-url');
 
 export const depositSlot = $<HTMLDivElement>('deposit-slot');
 export const chooseFilesBtn = $<HTMLButtonElement>('choose-files-btn');

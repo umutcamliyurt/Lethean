@@ -19,6 +19,7 @@ Lethean is a zero-knowledge encrypted storage accountless web app. Your chosen p
 - Argon2id for key derivation with per-vault salt
 - Minimum 12-character password, checked against a common-password list locally
 - Duress code for wiping the vault under coercion, with an optional decoy vault
+- Desktop and mobile apps (Tauri-based)
 
 ## Screenshots
 
@@ -41,18 +42,6 @@ Lethean is a zero-knowledge encrypted storage accountless web app. Your chosen p
 | `wrappingKey` | Locks and unlocks the individual encryption key for each file user uploads. | Stays in the browser |
 
 **Why the salt matters:** the salt itself doesn't need to be secret, but without it, the same password won't produce the same `masterKey`. So if two people happen to pick the same password, their vaults still end up completely unrelated, different salt, different keys.
-
-## Duress Code
-
-Think of the duress code as a second, secret password that opens a decoy vault instead of the real one, and silently destroys the real one in the process.
-
-Here's what makes it safe to use under coercion: if someone forces user to "unlock their vault," there's no way for them to tell which of these three things actually happened:
-
-- **User entered their real password --> real vault opens normally**
-- **User entered their duress code --> real vault is wiped, a decoy opens instead**
-- **User entered the wrong password --> nothing happens, an empty vault opens instead**
-
-All three cases look identical from the outside, same derivation steps happen in the browser, same network requests go out, even the exact same `DELETE /vault` request shape gets sent to the server every time. Nothing about the traffic, timing, or server behavior reveals which one occurred.
 
 ## Access Tokens
 
@@ -91,6 +80,28 @@ uvicorn main:app --reload
 
 Serves the API and client at `http://localhost:8000`.
 
+## Desktop & Mobile Apps
+
+The desktop and mobile apps are [Tauri](https://v2.tauri.app) wrappers around the same
+`client/` code as the web app.
+
+One-time setup (needs [Rust](https://www.rust-lang.org/tools/install) installed):
+
+```bash
+scripts/setup-tauri.sh
+scripts/setup-tauri-android.sh
+```
+
+After that:
+
+```bash
+cd client
+npm run tauri:build          # desktop
+npm run tauri:android:build  # android
+```
+
+The release APK lands under `client/src-tauri/gen/android/app/build/outputs/apk/`.
+
 ## Threat Model
 
 ### Defends against:
@@ -101,6 +112,10 @@ Serves the API and client at `http://localhost:8000`.
 
 ### Does not defend against:
 - **Active server compromise**: an adversary who can modify server-side data, tamper with responses, alter application behavior, or control the server. This includes replacing or modifying JavaScript delivered to the client, allowing the adversary to capture passwords and encryption keys.
+  - This specific risk is drastically reduced for the desktop/mobile apps: their code ships in a
+    build-time bundle rather than being fetched fresh from the server on every load, so a
+    compromised server can't swap out the JavaScript the way it could for the web app. A
+    compromised server can still see connection metadata.
 - A compromised client, including a malicious browser, extension, or tampered JavaScript
 - Weak or reused passwords
 - Sustained forensic analysis of server-side metadata, including timing and access patterns.
