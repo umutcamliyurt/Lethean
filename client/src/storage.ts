@@ -5,7 +5,6 @@ const LS_SETUP_KEY = 'vault.setupComplete';
 const LS_KDF_VERSION_KEY = 'vault.kdfVersion';
 const LS_DURESS_KEY = 'vault.duress';
 const LS_ACCESS_TOKEN_KEY = 'vault.accessToken';
-const LS_SALT_KEY = 'vault.salt';
 const LS_SERVER_URL_KEY = 'vault.serverUrl';
 const LS_VIEW_MODE_KEY = 'vault.viewMode';
 const LS_THEME_KEY = 'vault.theme';
@@ -35,14 +34,6 @@ export function getStoredAccessToken(): string {
 export function setStoredAccessToken(token: string): void {
   if (token) localStorage.setItem(LS_ACCESS_TOKEN_KEY, token);
   else localStorage.removeItem(LS_ACCESS_TOKEN_KEY);
-}
-
-export function getStoredSalt(): string {
-  return localStorage.getItem(LS_SALT_KEY) || '';
-}
-export function setStoredSalt(salt: string): void {
-  if (salt) localStorage.setItem(LS_SALT_KEY, salt);
-  else localStorage.removeItem(LS_SALT_KEY);
 }
 
 export function getStoredServerUrl(): string {
@@ -111,6 +102,5 @@ export function markVaultConfirmed(marker: string): void {
 
 export function forgetThisDevice(): void {
   setStoredAccessToken('');
-  setStoredSalt('');
   localStorage.removeItem(LS_CONFIRMED_MARKERS_KEY);
 }

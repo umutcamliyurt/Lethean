@@ -56,21 +56,17 @@ function timingSafeEqualHex(aHex: string, bHex: string): boolean {
   return diff === 0;
 }
 
-async function deriveSalt(Salt: string | null | undefined): Promise<Uint8Array> {
-  const bytes = await crypto.subtle.digest('SHA-256', asBufferSource(utf8('e2ee-vault|salt|v1|' + (Salt || ''))));
+async function deriveSalt(accessToken: string | null | undefined): Promise<Uint8Array> {
+  const bytes = await crypto.subtle.digest('SHA-256', asBufferSource(utf8('e2ee-vault|salt|v1|' + (accessToken || ''))));
   return new Uint8Array(bytes);
-}
-
-export function generateSalt(): string {
-  return toHex(randomBytes(16));
 }
 
 export async function deriveMasterKey(
   password: string,
-  Salt: string | null | undefined,
+  accessToken: string | null | undefined,
   kdfVersion: number = CURRENT_KDF_VERSION
 ): Promise<Uint8Array> {
-  const salt = await deriveSalt(Salt);
+  const salt = await deriveSalt(accessToken);
   const params = resolveKdfParams(kdfVersion);
   const hash = await argon2id({ password, salt, ...params });
   return new Uint8Array(hash);
@@ -102,10 +98,10 @@ export async function deriveConfirmMarker(vaultId: string): Promise<string> {
 
 export async function unlockVault(
   password: string,
-  Salt: string | null | undefined,
+  accessToken: string | null | undefined,
   kdfVersion: number = DEFAULT_LEGACY_KDF_VERSION
 ): Promise<UnlockResult> {
-  const masterKey = await deriveMasterKey(password, Salt, kdfVersion);
+  const masterKey = await deriveMasterKey(password, accessToken, kdfVersion);
   const [vaultId, wrappingKeyRaw] = await Promise.all([
     deriveVaultId(masterKey),
     deriveWrappingKey(masterKey),

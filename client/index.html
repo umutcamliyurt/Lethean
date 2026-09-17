@@ -41,11 +41,6 @@
 
     <form id="auth-form">
       <div class="field">
-        <label for="salt">Salt <span class="label-hint">(leave blank to generate one)</span></label>
-        <input type="text" id="salt" autocomplete="off" spellcheck="false" maxlength="64">
-      </div>
-
-      <div class="field">
         <label for="password">Password</label>
         <input type="password" id="password" autocomplete="current-password" required maxlength="256" aria-describedby="password-strength-hint">
       </div>
@@ -70,8 +65,8 @@
       </div>
 
       <div class="field">
-        <label for="access-token">Access token <span class="label-hint">(only needed to upload, ask the operator)</span></label>
-        <input type="text" id="access-token" autocomplete="off" spellcheck="false">
+        <label for="access-token">Access token <span class="label-hint">(ask the operator; required to unlock)</span></label>
+        <input type="text" id="access-token" autocomplete="off" spellcheck="false" required>
       </div>
 
       <div class="auth-actions">
@@ -107,7 +102,7 @@
           </svg>
         </button>
         <div class="settings-menu hidden" id="settings-menu" role="menu">
-          <button type="button" role="menuitem" id="salt-btn">Salt</button>
+          <button type="button" role="menuitem" id="password-btn">Change Password</button>
           <button type="button" role="menuitem" id="token-btn">Access Token</button>
           <button type="button" role="menuitem" id="theme-btn">Theme</button>
           <button type="button" role="menuitem" id="duress-btn">Duress Code</button>

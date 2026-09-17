@@ -2,14 +2,13 @@ import * as C from './crypto.js';
 import * as api from './api.js';
 import {
   authScreen, appScreen, authHeading, authForm, authSubmit, authStatus, passwordInput,
-  confirmField, passwordConfirmInput, accessTokenInput, saltInput,
+  confirmField, passwordConfirmInput, accessTokenInput,
   serverUrlField, serverUrlInput,
-  logoutBtn, tokenBtn, saltBtn, themeBtn, duressBtn, sourceBtn, settingsBtn, settingsMenu,
+  logoutBtn, tokenBtn, passwordBtn, themeBtn, duressBtn, sourceBtn, settingsBtn, settingsMenu,
 } from './dom.js';
 import { fileKeyCache, metaCache, getWrappingKeyRaw, setWrappingKeyRaw, getCurrentVaultId, setCurrentVaultId } from './state.js';
 import {
   isSetupComplete, markSetupComplete, getStoredAccessToken, setStoredAccessToken,
-  getStoredSalt, setStoredSalt,
   getStoredServerUrl, setStoredServerUrl,
   loadDuressConfig, saveDuressConfig, resetDuressConfig,
   getStoredTheme, setStoredTheme,
@@ -18,7 +17,7 @@ import {
   forgetThisDevice,
 } from './storage.js';
 import { isTauri, openExternal } from './platform.js';
-import { rotateVaultPassword } from './vault-rotate.js';
+import { rotateVaultPassword, rotateVaultAccessToken } from './vault-rotate.js';
 import { THEMES, getTheme, applyTheme } from './theme.js';
 import type { ThemeDef } from './theme.js';
 import { escapeHtml, showToast } from './utils.js';
@@ -28,7 +27,6 @@ import { encryptPool } from './encrypt-pool.js';
 
 accessTokenInput.value = getStoredAccessToken();
 accessTokenInput.type = 'password';
-saltInput.value = getStoredSalt();
 
 if (isTauri()) {
   serverUrlField.classList.remove('hidden');
@@ -37,12 +35,10 @@ if (isTauri()) {
     const next = serverUrlInput.value.trim();
     if (next === getStoredServerUrl()) return;
     setStoredServerUrl(next);
-    showToast('Server URL saved. Reloading\u2026');
+    showToast('Server URL saved. Reloading…');
     setTimeout(() => window.location.reload(), 600);
   });
 }
-
-let currentsalt: string | null = null;
 
 function setAuthStatus(message: string, { error = false, spinning = false }: { error?: boolean; spinning?: boolean } = {}): void {
   authStatus.classList.toggle('error', error);
@@ -61,11 +57,11 @@ let isFirstRun = !isSetupComplete();
 
 async function resolveExistingVault(
   password: string,
-  salt: string
+  accessToken: string
 ): Promise<{ vaultId: string; wrappingKeyRaw: Uint8Array; kdfVersion: number } | null> {
   const versionsToTry = Array.from(new Set([C.CURRENT_KDF_VERSION, ...Object.keys(C.KDF_PARAMS).map(Number)]));
   for (const kdfVersion of versionsToTry) {
-    const { vaultId, wrappingKeyRaw } = await C.unlockVault(password, salt, kdfVersion);
+    const { vaultId, wrappingKeyRaw } = await C.unlockVault(password, accessToken, kdfVersion);
     try {
       const usage = await api.getUsage(vaultId);
       if ((usage.file_count ?? 0) > 0 || (usage.total_bytes ?? 0) > 0) {
@@ -81,8 +77,6 @@ interface PendingConfirmation {
   vaultId: string;
   wrappingKeyRaw: Uint8Array;
   password: string;
-  salt: string;
-  generatedsalt: string | null;
   marker: string;
 }
 
@@ -106,6 +100,12 @@ authForm.addEventListener('submit', async (e) => {
   const password = passwordInput.value;
   if (!password) return;
 
+  const accessToken = accessTokenInput.value.trim();
+  if (!accessToken) {
+    setAuthStatus('An access token is required.', { error: true });
+    return;
+  }
+
   authSubmit.disabled = true;
   try {
     if (isFirstRun) {
@@ -114,16 +114,13 @@ authForm.addEventListener('submit', async (e) => {
         return;
       }
 
-      setAuthStatus('Checking for an existing vault\u2026', { spinning: true });
-      const existing = await resolveExistingVault(password, saltInput.value.trim());
+      setAuthStatus('Checking for an existing vault…', { spinning: true });
+      const existing = await resolveExistingVault(password, accessToken);
       if (existing) {
         await checkDuressAndMaybeWipe(password);
         markVaultConfirmed(await C.deriveConfirmMarker(existing.vaultId));
         markSetupComplete();
         setStoredKdfVersion(existing.kdfVersion);
-        const salt = saltInput.value.trim();
-        if (salt) setStoredSalt(salt);
-        currentsalt = salt;
         isFirstRun = false;
         configureAuthScreenForRun();
         await finishUnlock(existing.vaultId, existing.wrappingKeyRaw);
@@ -135,30 +132,16 @@ authForm.addEventListener('submit', async (e) => {
         setAuthStatus(errors[0] || 'Password is too weak.', { error: true });
         return;
       }
-      let salt = saltInput.value.trim();
-      let generatedsalt: string | null = null;
-      if (!salt) {
-        salt = C.generateSalt();
-        generatedsalt = salt;
-      }
 
-      setAuthStatus('Deriving key\u2026', { spinning: true });
+      setAuthStatus('Deriving key…', { spinning: true });
       const kdfVersion = C.CURRENT_KDF_VERSION;
-      const { vaultId, wrappingKeyRaw: wk } = await C.unlockVault(password, salt, kdfVersion);
+      const { vaultId, wrappingKeyRaw: wk } = await C.unlockVault(password, accessToken, kdfVersion);
       await checkDuressAndMaybeWipe(password);
       markVaultConfirmed(await C.deriveConfirmMarker(vaultId));
       markSetupComplete();
       setStoredKdfVersion(kdfVersion);
-      saltInput.value = salt;
-      setStoredSalt(salt);
-      currentsalt = salt;
       isFirstRun = false;
       configureAuthScreenForRun();
-
-      if (generatedsalt) {
-        setAuthStatus('');
-        await showGeneratedSalt(generatedsalt);
-      }
 
       await finishUnlock(vaultId, wk);
       return;
@@ -170,45 +153,23 @@ authForm.addEventListener('submit', async (e) => {
         passwordConfirmInput.value = '';
         return;
       }
-      currentsalt = pendingConfirmation.salt;
-      saltInput.value = pendingConfirmation.salt;
-      setStoredSalt(pendingConfirmation.salt);
       markVaultConfirmed(pendingConfirmation.marker);
-
-      if (pendingConfirmation.generatedsalt) {
-        setAuthStatus('');
-        await showGeneratedSalt(pendingConfirmation.generatedsalt);
-      }
-
       await finishUnlock(pendingConfirmation.vaultId, pendingConfirmation.wrappingKeyRaw);
       return;
     }
 
-    let salt = saltInput.value.trim();
     const kdfVersion = getStoredKdfVersion();
-    setAuthStatus('Deriving key\u2026', { spinning: true });
-    let { vaultId, wrappingKeyRaw: wk } = await C.unlockVault(password, salt, kdfVersion);
+    setAuthStatus('Deriving key…', { spinning: true });
+    const { vaultId, wrappingKeyRaw: wk } = await C.unlockVault(password, accessToken, kdfVersion);
     await checkDuressAndMaybeWipe(password);
-    let marker = await C.deriveConfirmMarker(vaultId);
-
-    let generatedsalt: string | null = null;
-    if (!salt && !isVaultConfirmed(marker)) {
-      salt = C.generateSalt();
-      generatedsalt = salt;
-      setAuthStatus('Deriving key\u2026', { spinning: true });
-      ({ vaultId, wrappingKeyRaw: wk } = await C.unlockVault(password, salt, kdfVersion));
-      await checkDuressAndMaybeWipe(password);
-      marker = await C.deriveConfirmMarker(vaultId);
-    }
+    const marker = await C.deriveConfirmMarker(vaultId);
 
     if (!isVaultConfirmed(marker)) {
-      setAuthStatus('Checking for an existing vault\u2026', { spinning: true });
-      const existing = await resolveExistingVault(password, salt);
+      setAuthStatus('Checking for an existing vault…', { spinning: true });
+      const existing = await resolveExistingVault(password, accessToken);
       if (existing) {
         markVaultConfirmed(await C.deriveConfirmMarker(existing.vaultId));
         setStoredKdfVersion(existing.kdfVersion);
-        currentsalt = salt;
-        setStoredSalt(salt);
         await finishUnlock(existing.vaultId, existing.wrappingKeyRaw);
         return;
       }
@@ -218,7 +179,7 @@ authForm.addEventListener('submit', async (e) => {
         setAuthStatus(errors[0] || 'Password is too weak.', { error: true });
         return;
       }
-      pendingConfirmation = { vaultId, wrappingKeyRaw: wk, password, salt, generatedsalt, marker };
+      pendingConfirmation = { vaultId, wrappingKeyRaw: wk, password, marker };
       confirmField.classList.remove('hidden');
       passwordConfirmInput.required = true;
       passwordConfirmInput.focus();
@@ -226,8 +187,6 @@ authForm.addEventListener('submit', async (e) => {
       return;
     }
 
-    currentsalt = salt;
-    setStoredSalt(salt);
     await finishUnlock(vaultId, wk);
   } catch (err) {
     setAuthStatus("Couldn't reach the vault. " + (err as Error).message, { error: true });
@@ -259,39 +218,6 @@ function sendShredSignalWithRetry(targetVaultId: string): void {
   })();
 }
 
-function showGeneratedSalt(salt: string): Promise<void> {
-  return new Promise((resolve) => {
-    showLightbox(`
-      <div class="settings-panel">
-        <h2>Save your salt</h2>
-        <p class="subtitle">
-          You left this blank, so one was generated for you. It's not secret,
-          but it's required together with your password to unlock this vault.
-        </p>
-        <div class="salt-display" id="generated-salt-value">${escapeHtml(salt)}</div>
-        <div class="panel-actions">
-          <button type="button" id="copy-salt">Copy</button>
-          <button type="button" class="btn-primary" id="ack-salt">Continue</button>
-        </div>
-      </div>
-    `);
-
-    document.getElementById('copy-salt')!.addEventListener('click', async () => {
-      try {
-        await navigator.clipboard.writeText(salt);
-        showToast('Salt copied.');
-      } catch {
-        showToast('Could not copy automatically, please select and copy it manually.', 'error');
-      }
-    });
-
-    document.getElementById('ack-salt')!.addEventListener('click', () => {
-      closeLightbox();
-      resolve();
-    });
-  });
-}
-
 async function finishUnlock(vaultId: string, wk: Uint8Array): Promise<void> {
   setWrappingKeyRaw(wk);
   setCurrentVaultId(vaultId);
@@ -310,7 +236,7 @@ async function enterApp(): Promise<void> {
   metaCache.clear();
   clearRenderedGrid();
 
-  setAuthStatus('Unlocking\u2026', { spinning: true });
+  setAuthStatus('Unlocking…', { spinning: true });
   await refreshGallery();
 
   authScreen.classList.add('hidden');
@@ -378,7 +304,7 @@ for (const item of settingsMenu.querySelectorAll('button')) {
 
 tokenBtn.addEventListener('click', openTokenPanel);
 
-saltBtn.addEventListener('click', opensaltPanel);
+passwordBtn.addEventListener('click', openChangePasswordPanel);
 
 themeBtn.addEventListener('click', openThemePanel);
 
@@ -441,56 +367,13 @@ function paintThemeSwatch(btn: HTMLButtonElement, theme: ThemeDef): void {
   if (chip) chip.style.background = theme.accent;
 }
 
-function opensaltPanel(): void {
-  const current = currentsalt || getStoredSalt();
-
-  showLightbox(`
-    <div class="settings-panel">
-      <h2>Salt</h2>
-      <p class="subtitle">
-        Used together with your password to derive this vault's key.
-      </p>
-      <div class="salt-display" id="salt-view-value">
-        ${current ? escapeHtml(current) : 'None, this vault was set up without one.'}
-      </div>
-      <div class="panel-actions">
-        ${current ? '<button type="button" id="copy-salt-view">Copy</button>' : ''}
-      </div>
-
-      <div class="settings-divider"></div>
-      <h3>Change password</h3>
-      <p class="field-hint">
-        Moves every item in this vault to a brand-new key and permanently destroys the old one
-        server-side.
-      </p>
-      <div class="panel-actions">
-        <button type="button" id="open-change-password-btn">Change password\u2026</button>
-      </div>
-    </div>
-  `);
-
-  const copyBtn = document.getElementById('copy-salt-view');
-  if (copyBtn) {
-    copyBtn.addEventListener('click', async () => {
-      try {
-        await navigator.clipboard.writeText(current);
-        showToast('Salt copied.');
-      } catch {
-        showToast('Could not copy automatically, please select and copy it manually.', 'error');
-      }
-    });
-  }
-
-  document.getElementById('open-change-password-btn')!.addEventListener('click', openChangePasswordPanel);
-}
-
 function openChangePasswordPanel(): void {
   showLightbox(`
     <div class="settings-panel settings-panel-wide">
       <h2>Change password</h2>
       <p class="subtitle">
         Re-wraps every item's key under your new password and moves the vault over to it in one
-        step. Content itself is never re-uploaded, so this is quick even for large vaults \u2014
+        step. Content itself is never re-uploaded, so this is quick even for large vaults —
         but don't close this tab while it's running.
       </p>
       <form id="change-password-form">
@@ -543,13 +426,13 @@ function openChangePasswordPanel(): void {
     submitBtn.disabled = true;
     for (const input of formInputs) input.disabled = true;
     progressEl.classList.remove('hidden');
-    progressTextEl.textContent = 'Re-wrapping file keys and updating the vault\u2026';
+    progressTextEl.textContent = 'Re-wrapping file keys and updating the vault…';
 
     try {
       const result = await rotateVaultPassword(
         oldPassword,
         newPassword,
-        currentsalt,
+        getStoredAccessToken(),
         getStoredKdfVersion(),
         currentVaultId
       );
@@ -561,7 +444,7 @@ function openChangePasswordPanel(): void {
       markVaultConfirmed(await C.deriveConfirmMarker(result.vaultId));
 
       closeLightbox();
-      showToast(`Password changed (${result.filesMoved} item${result.filesMoved === 1 ? '' : 's'} moved). Reloading your files\u2026`);
+      showToast(`Password changed (${result.filesMoved} item${result.filesMoved === 1 ? '' : 's'} moved). Reloading your files…`);
       await enterApp();
     } catch (err) {
       progressEl.classList.add('hidden');
@@ -575,71 +458,108 @@ function openChangePasswordPanel(): void {
 
 function openTokenPanel(): void {
   const current = getStoredAccessToken();
-  const masked = current ? `${current.slice(0, 6)}\u2026${current.slice(-4)}` : null;
+  const masked = current ? `${current.slice(0, 6)}…${current.slice(-4)}` : 'Not set';
 
   showLightbox(`
-    <div class="settings-panel">
+    <div class="settings-panel settings-panel-wide">
       <h2>Access token</h2>
       <p class="subtitle">
-        (Issued by whoever runs this server).
-        Only needed to upload, browsing and downloading never require it.
+        Issued by whoever runs this server. It's required to unlock this vault, since it's now
+        part of how your vault's key is derived, so changing it re-wraps every item under a
+        new key, the same way changing your password does.
       </p>
-      <div class="status-line">${masked ? `Current: ${escapeHtml(masked)}` : 'Not set.'}</div>
+      <div class="status-line">Current: ${escapeHtml(masked)}</div>
 
       <form id="token-form">
         <div class="field">
+          <label for="token-current-password">Current password</label>
+          <input type="password" id="token-current-password" autocomplete="current-password" required>
+        </div>
+        <div class="field">
           <label for="token-input">New access token</label>
-          <input type="text" id="token-input" autocomplete="off" spellcheck="false">
+          <input type="text" id="token-input" autocomplete="off" spellcheck="false" required>
         </div>
         <div class="panel-actions">
-          ${current ? '<button type="button" id="token-remove">Remove</button>' : ''}
-          <button type="submit" class="btn-primary" id="token-save">Save</button>
+          <button type="submit" class="btn-primary" id="token-save">Change token</button>
         </div>
       </form>
+      <div id="token-progress" class="cp-progress hidden">
+        <span class="spinner"></span>
+        <span id="token-progress-text"></span>
+      </div>
 
       <div class="settings-divider"></div>
       <h3>Using a shared or borrowed device?</h3>
       <p class="field-hint">
-        This clears the saved access token, saved salt, etc. \u2014 nothing about your vault or its files changes, only what this
-        browser remembers about it.
+        This clears the saved access token from this browser, nothing about your vault or its
+        files changes, only what this browser remembers about it.
       </p>
       <div class="panel-actions">
         <button type="button" id="forget-device-btn">Forget this device</button>
       </div>
     </div>
   `);
-  (document.getElementById('token-input') as HTMLInputElement).value = current;
 
   document.getElementById('forget-device-btn')!.addEventListener('click', () => {
     if (!window.confirm('Clear the saved data from this device?')) return;
     forgetThisDevice();
     accessTokenInput.value = '';
-    saltInput.value = '';
     api.setAccessToken(null);
     showToast('This device has been forgotten. Nothing about your vault changed.');
     closeLightbox();
   });
 
-  document.getElementById('token-form')!.addEventListener('submit', (e) => {
-    e.preventDefault();
-    const token = (document.getElementById('token-input') as HTMLInputElement).value.trim();
-    setStoredAccessToken(token);
-    api.setAccessToken(token);
-    accessTokenInput.value = token;
-    showToast(token ? 'Access token saved.' : 'Access token cleared.');
-    closeLightbox();
-  });
+  const form = document.getElementById('token-form') as HTMLFormElement;
+  const formInputs = Array.from(form.querySelectorAll<HTMLInputElement>('input'));
+  const submitBtn = document.getElementById('token-save') as HTMLButtonElement;
+  const progressEl = document.getElementById('token-progress') as HTMLDivElement;
+  const progressTextEl = document.getElementById('token-progress-text') as HTMLSpanElement;
 
-  const removeBtn = document.getElementById('token-remove');
-  if (removeBtn) {
-    removeBtn.addEventListener('click', () => {
-      setStoredAccessToken('');
-      api.setAccessToken(null);
-      accessTokenInput.value = '';
-      showToast('Access token removed.');
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const currentPassword = (document.getElementById('token-current-password') as HTMLInputElement).value;
+    const newToken = (document.getElementById('token-input') as HTMLInputElement).value.trim();
+
+    const currentVaultId = getCurrentVaultId();
+    if (!currentVaultId) {
+      showToast('No vault is currently unlocked.', 'error');
+      return;
+    }
+
+    submitBtn.disabled = true;
+    for (const input of formInputs) input.disabled = true;
+    progressEl.classList.remove('hidden');
+    progressTextEl.textContent = 'Re-wrapping file keys and updating the vault…';
+
+    try {
+      const result = await rotateVaultAccessToken(
+        currentPassword,
+        current,
+        newToken,
+        getStoredKdfVersion(),
+        currentVaultId
+      );
+
+      setWrappingKeyRaw(result.wrappingKeyRaw);
+      setCurrentVaultId(result.vaultId);
+      api.setVaultId(result.vaultId);
+      setStoredKdfVersion(result.kdfVersion);
+      setStoredAccessToken(newToken);
+      api.setAccessToken(newToken);
+      accessTokenInput.value = newToken;
+      markVaultConfirmed(await C.deriveConfirmMarker(result.vaultId));
+
       closeLightbox();
-    });
-  }
+      showToast(`Access token changed (${result.filesMoved} item${result.filesMoved === 1 ? '' : 's'} moved). Reloading your files…`);
+      await enterApp();
+    } catch (err) {
+      progressEl.classList.add('hidden');
+      progressTextEl.textContent = '';
+      submitBtn.disabled = false;
+      for (const input of formInputs) input.disabled = false;
+      showToast("Couldn't change access token. " + (err as Error).message, 'error');
+    }
+  });
 }
 
 sourceBtn.addEventListener('click', () => {
@@ -688,7 +608,7 @@ function openDuressPanel(): void {
             <label for="decoy-pin">Duress password</label>
             <input type="password" id="decoy-pin" autocomplete="off" placeholder="Type it here to add files">
           </div>
-          <button type="button" id="decoy-choose-files">Choose files\u2026</button>
+          <button type="button" id="decoy-choose-files">Choose files…</button>
         </div>
         <input type="file" id="decoy-file-input" multiple class="hidden">
         <div id="decoy-upload-queue" class="upload-queue"></div>
@@ -711,7 +631,7 @@ function openDuressPanel(): void {
     }
     if (pin !== pinConfirm) { showToast("Passwords don't match.", 'error'); return; }
 
-    const { vaultId: pinVaultId } = await C.unlockVault(pin, currentsalt, getStoredKdfVersion());
+    const { vaultId: pinVaultId } = await C.unlockVault(pin, getStoredAccessToken(), getStoredKdfVersion());
     if (pinVaultId === getCurrentVaultId()) {
       const hint = document.getElementById('duress-pin-hint')!;
       showToast('Duress password must be different from your real password.', 'error');
@@ -746,7 +666,7 @@ function openDuressPanel(): void {
       return;
     }
     if (!decoyTokenInput.value.trim()) {
-      showToast('Enter a decoy access token first — it needs its own, separate from your real one.', 'error');
+      showToast('Enter a decoy access token first. It needs its own, separate from your real one.', 'error');
       decoyTokenInput.focus();
       return;
     }
@@ -768,7 +688,7 @@ async function addDecoyFiles(pin: string, decoyToken: string, files: File[], que
     return;
   }
 
-  const { vaultId: decoyVaultId, wrappingKeyRaw: decoyWrappingKeyRaw } = await C.unlockVault(pin, currentsalt, getStoredKdfVersion());
+  const { vaultId: decoyVaultId, wrappingKeyRaw: decoyWrappingKeyRaw } = await C.unlockVault(pin, getStoredAccessToken(), getStoredKdfVersion());
 
   await Promise.all(files.map((file) => addOneDecoyFile(file, decoyVaultId, decoyWrappingKeyRaw, decoyToken, queue)));
 }
@@ -784,7 +704,7 @@ async function addOneDecoyFile(
   row.className = 'upload-row';
   row.innerHTML = `
     <span class="name"></span>
-    <span class="status">Encrypting\u2026</span>
+    <span class="status">Encrypting…</span>
     <div class="bar"><div class="bar-fill"></div></div>
   `;
   row.querySelector('.name')!.textContent = file.name;
@@ -794,7 +714,7 @@ async function addOneDecoyFile(
 
   try {
     const encrypted = await encryptPool.encryptFile(decoyWrappingKeyRaw, file, null);
-    statusEl.textContent = 'Uploading\u2026';
+    statusEl.textContent = 'Uploading…';
     await api.uploadFile(encrypted, (fraction) => {
       barEl.style.width = `${Math.max(0, Math.min(100, Math.round(fraction * 100)))}%`;
     }, undefined, decoyVaultId, decoyToken);

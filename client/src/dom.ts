@@ -14,7 +14,6 @@ export const passwordInput = $<HTMLInputElement>('password');
 export const confirmField = $<HTMLDivElement>('confirm-field');
 export const passwordConfirmInput = $<HTMLInputElement>('password-confirm');
 export const accessTokenInput = $<HTMLInputElement>('access-token');
-export const saltInput = $<HTMLInputElement>('salt');
 export const serverUrlField = $<HTMLDivElement>('server-url-field');
 export const serverUrlInput = $<HTMLInputElement>('server-url');
 
@@ -38,7 +37,7 @@ export const gridSentinel = $<HTMLDivElement>('grid-sentinel');
 export const usagePill = $<HTMLSpanElement>('usage-pill');
 export const logoutBtn = $<HTMLButtonElement>('logout-btn');
 export const tokenBtn = $<HTMLButtonElement>('token-btn');
-export const saltBtn = $<HTMLButtonElement>('salt-btn');
+export const passwordBtn = $<HTMLButtonElement>('password-btn');
 export const themeBtn = $<HTMLButtonElement>('theme-btn');
 export const duressBtn = $<HTMLButtonElement>('duress-btn');
 export const sourceBtn = $<HTMLButtonElement>('source-btn');
