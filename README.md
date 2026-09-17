@@ -6,7 +6,7 @@
 
 </div>
 
-Lethean is a zero-knowledge encrypted storage accountless web app. Your chosen password and the salt are the only credentials required to access your personal vault. These credentials never leave the browser. You can upload files and archives, including photos or videos, which you can browse and play (decrypted in memory). By design and for maximum security, the server only ever sees encrypted data, while only you hold the key.
+Lethean is a zero-knowledge encrypted storage accountless web app. Your chosen password and an access token, issued by whoever operates the server, are the only credentials required to access your personal vault. Your password never leaves the browser; the access token is hashed locally into your vault's cryptographic salt and is also sent to the server as your upload credential. You can upload files and archives, including photos or videos, which you can browse and play (decrypted in memory). By design and for maximum security, the server only ever sees encrypted data, while only you hold the key.
 
 > The name comes from the **River of Forgetfulness** in Greek mythology. In the Underworld, souls who drink from the river would lose all memory of their past lives before reincarnation.
 
@@ -16,7 +16,7 @@ Lethean is a zero-knowledge encrypted storage accountless web app. Your chosen p
 - Elegant and customizable UI
 - AES-256-GCM for client-side encryption
 - Ciphertext padding to hide file size metadata
-- Argon2id for key derivation with per-vault salt
+- Argon2id for key derivation
 - Minimum 12-character password, checked against a common-password list locally
 - Duress code for wiping the vault under coercion, with an optional decoy vault
 - Desktop and mobile apps (Tauri-based)
@@ -32,8 +32,8 @@ Lethean is a zero-knowledge encrypted storage accountless web app. Your chosen p
 
 ## How It Works
 
-1. User types their password.
-2. It's combined with a cryptographic salt.
+1. User types their password and access token.
+2. The access token is hashed locally into a cryptographic salt, and combined with the password.
 3. **That process produces one `masterKey`**, which is then split into two separate keys with two separate jobs:
 
 | Key | What it does | Where it lives |
@@ -41,11 +41,10 @@ Lethean is a zero-knowledge encrypted storage accountless web app. Your chosen p
 | `vaultId` | Acts like a "key card", user shows it to the server to prove they can access a vault. Think of it like an unguessable link: possession is access. | Sent to the server on every request |
 | `wrappingKey` | Locks and unlocks the individual encryption key for each file user uploads. | Stays in the browser |
 
-**Why the salt matters:** the salt itself doesn't need to be secret, but without it, the same password won't produce the same `masterKey`. So if two people happen to pick the same password, their vaults still end up completely unrelated, different salt, different keys.
 
 ## Access Tokens
 
-Uploading files requires an access token, issued by whoever operates the server. Each token comes with a default 10 GB quota, and it's a one-time pairing, the first vault it's used with is the only vault it will ever work with.
+An access token, issued by whoever operates the server, is required both to unlock your vault (it's hashed locally into your vault's cryptographic salt) and to upload files (it's sent to the server as a bearer credential). Each token comes with a default 10 GB quota, and it's a one-time pairing, the first vault it's used with is the only vault it will ever work with.
 
 Tokens are hashed (SHA-256) before they're written to disk, so a leaked `tokens.json` doesn't hand out upload tokens.
 
