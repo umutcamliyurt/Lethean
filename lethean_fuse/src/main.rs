@@ -131,14 +131,14 @@ fn unlock_session(cli: &Cli, config: &Config) -> Result<Vault> {
 
     let unlocked = kdf::unlock_vault(&password, access_token.as_deref(), cli.kdf_version)?;
 
-    let mut api = ApiClient::new(server)?;
+    let api = ApiClient::new(server)?;
     api.set_vault_id(Some(unlocked.vault_id));
     api.set_access_token(access_token);
 
-    let mut vault = Vault::new(api, unlocked.wrapping_key_raw);
+    let vault = Vault::new(api, unlocked.wrapping_key_raw);
     eprintln!("Fetching file index…");
     vault.refresh_all().context("could not list vault files (wrong password/access token, or server unreachable?)")?;
-    eprintln!("Loaded {} item(s).", vault.all_entries().count());
+    eprintln!("Loaded {} item(s).", vault.all_entries().len());
     Ok(vault)
 }
 
@@ -257,10 +257,10 @@ fn cmd_rotate_password(cli: &Cli, config: &Config) -> Result<()> {
     let old_password = prompt_hidden("Current vault password: ")?;
     let unlocked = kdf::unlock_vault(&old_password, access_token.as_deref(), cli.kdf_version)?;
 
-    let mut api = ApiClient::new(server)?;
+    let api = ApiClient::new(server)?;
     api.set_vault_id(Some(unlocked.vault_id.clone()));
     api.set_access_token(access_token.clone());
-    let mut vault = Vault::new(api, unlocked.wrapping_key_raw);
+    let vault = Vault::new(api, unlocked.wrapping_key_raw);
     eprintln!("Fetching file index…");
     vault.refresh_all()?;
 

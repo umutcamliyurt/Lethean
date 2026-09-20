@@ -1,4 +1,3 @@
-
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{anyhow, bail, Context, Result};
@@ -47,7 +46,6 @@ pub fn decompress_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// Mirrors `readAndMaybeCompressFile`: try gzip, keep whichever is smaller.
 pub fn maybe_compress(bytes: &[u8]) -> Result<(Vec<u8>, bool)> {
     match compress_bytes(bytes) {
         Ok(compressed) if compressed.len() < bytes.len() => Ok((compressed, true)),
@@ -106,7 +104,6 @@ pub fn padded_metadata_size(n: u64) -> u64 {
     n.div_ceil(step) * step
 }
 
-/// 4-byte big-endian length prefix, then padding to the next metadata bucket.
 pub fn pad_metadata_bytes(bytes: &[u8]) -> Vec<u8> {
     let target = padded_metadata_size(bytes.len() as u64 + 4) as usize;
     let mut out = vec![0u8; target];
@@ -142,8 +139,6 @@ pub struct AesGcmEncryptResult {
     pub ciphertext: Vec<u8>,
 }
 
-/// Encrypts with a random 96-bit nonce and a 128-bit tag appended to the
-/// ciphertext, matching WebCrypto's `AES-GCM` default framing.
 pub fn aes_gcm_encrypt(key_raw: &[u8], plaintext: &[u8]) -> Result<AesGcmEncryptResult> {
     let key = key_from_bytes(key_raw)?;
     let cipher = Aes256Gcm::new(key);
@@ -158,6 +153,9 @@ pub fn aes_gcm_encrypt(key_raw: &[u8], plaintext: &[u8]) -> Result<AesGcmEncrypt
 pub fn aes_gcm_decrypt(key_raw: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
     let key = key_from_bytes(key_raw)?;
     let cipher = Aes256Gcm::new(key);
+    if iv.len() != 12 {
+        bail!("invalid AES-GCM nonce: expected 12 bytes, got {} (corrupted or malformed record)", iv.len());
+    }
     let nonce = Nonce::from_slice(iv);
     cipher
         .decrypt(nonce, Payload { msg: ciphertext, aad: &[] })

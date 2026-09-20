@@ -1,8 +1,10 @@
 
-use std::io::Read;
+use std::io::{Read, Write as _};
+use std::sync::RwLock;
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
+use log::warn;
 use rand::RngCore;
 use serde::Deserialize;
 
@@ -11,8 +13,8 @@ use crate::types::{EncryptedFilePayload, FileRecord, UsageResponse};
 pub struct ApiClient {
     base_url: String,
     agent: ureq::Agent,
-    vault_id: Option<String>,
-    access_token: Option<String>,
+    vault_id: RwLock<Option<String>>,
+    access_token: RwLock<Option<String>>,
 }
 
 #[derive(Deserialize)]
@@ -38,8 +40,6 @@ fn assert_safe_share_token(token: &str) -> Result<()> {
     }
 }
 
-/// Turns a `ureq` result into ours, extracting `{"detail": "..."}` out of
-/// error bodies the way `checkOk` does in api.ts.
 fn finish(label: &str, result: std::result::Result<ureq::Response, ureq::Error>) -> Result<ureq::Response> {
     match result {
         Ok(resp) => Ok(resp),
@@ -53,8 +53,12 @@ fn finish(label: &str, result: std::result::Result<ureq::Response, ureq::Error>)
     }
 }
 
-fn read_body_bytes(resp: ureq::Response) -> Result<Vec<u8>> {
-    let mut out = Vec::new();
+fn read_body_bytes(resp: ureq::Response) -> std::io::Result<Vec<u8>> {
+    let content_length = resp.header("Content-Length").and_then(|v| v.parse::<usize>().ok());
+    let mut out = match content_length {
+        Some(len) => Vec::with_capacity(len),
+        None => Vec::new(),
+    };
     resp.into_reader().read_to_end(&mut out)?;
     Ok(out)
 }
@@ -65,33 +69,114 @@ fn multipart_boundary() -> String {
     format!("----vaultcli{}", hex::encode(buf))
 }
 
-/// Hand-rolled `multipart/form-data` body: `ureq` has no built-in form
-/// encoder, and this keeps the dependency tree small.
 fn build_multipart(text_fields: &[(&str, &str)], file_field: &str, file_name: &str, file_bytes: &[u8]) -> (String, Vec<u8>) {
     let boundary = multipart_boundary();
-    let mut body = Vec::new();
+
+    let estimated_len = text_fields.iter().map(|(k, v)| k.len() + v.len() + 64).sum::<usize>() + file_field.len() + file_name.len() + file_bytes.len() + 128;
+    let mut body = Vec::with_capacity(estimated_len);
+
     for (name, value) in text_fields {
-        body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes());
+        let _ = write!(body, "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n");
     }
-    body.extend_from_slice(format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{file_field}\"; filename=\"{file_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes());
+    let _ = write!(body, "--{boundary}\r\nContent-Disposition: form-data; name=\"{file_field}\"; filename=\"{file_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n");
     body.extend_from_slice(file_bytes);
     body.extend_from_slice(b"\r\n");
-    body.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+    let _ = write!(body, "--{boundary}--\r\n");
     (boundary, body)
 }
 
+mod retry {
+    use super::*;
+
+    pub const MAX_ATTEMPTS: u32 = 5;
+    const BASE_DELAY: Duration = Duration::from_millis(250);
+    const MAX_DELAY: Duration = Duration::from_secs(8);
+
+    pub enum AttemptError {
+        Ureq(Box<ureq::Error>),
+        Io(std::io::Error),
+    }
+
+    impl AttemptError {
+        fn is_transient(&self) -> bool {
+            match self {
+                AttemptError::Ureq(e) => match e.as_ref() {
+                    ureq::Error::Transport(_) => true,
+                    ureq::Error::Status(code, _) => matches!(code, 502..=504),
+                },
+                AttemptError::Io(e) => matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::BrokenPipe
+                        | std::io::ErrorKind::UnexpectedEof
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::NotConnected
+                ),
+            }
+        }
+
+        fn into_anyhow(self, label: &str) -> anyhow::Error {
+            match self {
+                AttemptError::Ureq(e) => finish(label, Err(*e)).unwrap_err(),
+                AttemptError::Io(e) => anyhow!("{label}: connection dropped while reading the response ({e})"),
+            }
+        }
+    }
+
+    impl From<ureq::Error> for AttemptError {
+        fn from(e: ureq::Error) -> Self {
+            AttemptError::Ureq(Box::new(e))
+        }
+    }
+
+    impl From<std::io::Error> for AttemptError {
+        fn from(e: std::io::Error) -> Self {
+            AttemptError::Io(e)
+        }
+    }
+
+    fn backoff_delay(attempt: u32) -> Duration {
+        let mult = 1u64 << attempt.min(6);
+        (BASE_DELAY * mult as u32).min(MAX_DELAY)
+    }
+
+    pub fn run<T>(label: &str, mut attempt: impl FnMut() -> Result<T, AttemptError>) -> Result<T> {
+        let mut tries = 0u32;
+        loop {
+            match attempt() {
+                Ok(v) => return Ok(v),
+                Err(e) if tries + 1 < MAX_ATTEMPTS && e.is_transient() => {
+                    tries += 1;
+                    warn!("[lethean-cli] {label}: transient error, retrying (attempt {tries}/{MAX_ATTEMPTS})");
+                    std::thread::sleep(backoff_delay(tries));
+                }
+                Err(e) => return Err(e.into_anyhow(label)),
+            }
+        }
+    }
+}
+
+use retry::AttemptError;
+
 impl ApiClient {
     pub fn new(base_url: String) -> Result<Self> {
-        let agent = ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(15)).timeout(Duration::from_secs(120)).build();
-        Ok(Self { base_url: base_url.trim_end_matches('/').to_string(), agent, vault_id: None, access_token: None })
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(15))
+            .timeout_read(Duration::from_secs(90))
+            .timeout_write(Duration::from_secs(90))
+            .timeout(Duration::from_secs(180))
+            .build();
+        Ok(Self { base_url: base_url.trim_end_matches('/').to_string(), agent, vault_id: RwLock::new(None), access_token: RwLock::new(None) })
     }
 
-    pub fn set_vault_id(&mut self, id: Option<String>) {
-        self.vault_id = id;
+    pub fn set_vault_id(&self, id: Option<String>) {
+        *self.vault_id.write().unwrap() = id;
     }
 
-    pub fn set_access_token(&mut self, token: Option<String>) {
-        self.access_token = token.filter(|t| !t.is_empty());
+    pub fn set_access_token(&self, token: Option<String>) {
+        *self.access_token.write().unwrap() = token.filter(|t| !t.is_empty());
     }
 
     fn url(&self, path: &str) -> String {
@@ -99,14 +184,14 @@ impl ApiClient {
     }
 
     fn with_auth(&self, req: ureq::Request, vault_id_override: Option<&str>) -> ureq::Request {
-        match vault_id_override.map(|s| s.to_string()).or_else(|| self.vault_id.clone()) {
+        match vault_id_override.map(|s| s.to_string()).or_else(|| self.vault_id.read().unwrap().clone()) {
             Some(id) => req.set("Authorization", &format!("Bearer {id}")),
             None => req,
         }
     }
 
     pub fn upload_file(&self, encrypted: &EncryptedFilePayload, vault_id_override: Option<&str>, access_token_override: Option<&str>) -> Result<FileRecord> {
-        let token = access_token_override.map(|s| s.to_string()).or_else(|| self.access_token.clone());
+        let token = access_token_override.map(|s| s.to_string()).or_else(|| self.access_token.read().unwrap().clone());
 
         let (boundary, body) = build_multipart(
             &[
@@ -121,46 +206,56 @@ impl ApiClient {
             &encrypted.ciphertext,
         );
 
-        let mut req = self.agent.post(&self.url("/files")).set("Content-Type", &format!("multipart/form-data; boundary={boundary}"));
-        req = self.with_auth(req, vault_id_override);
-        if let Some(t) = &token {
-            req = req.set("X-Access-Token", t);
-        }
-        let resp = finish("Upload failed", req.send_bytes(&body))?;
-        Ok(resp.into_json::<FileRecord>()?)
+        retry::run("Upload failed", || {
+            let mut req = self.agent.post(&self.url("/files")).set("Content-Type", &format!("multipart/form-data; boundary={boundary}"));
+            req = self.with_auth(req, vault_id_override);
+            if let Some(t) = &token {
+                req = req.set("X-Access-Token", t);
+            }
+            let resp = req.send_bytes(&body).map_err(AttemptError::from)?;
+            resp.into_json::<FileRecord>().map_err(AttemptError::from)
+        })
     }
 
     pub fn list_files(&self, offset: u64, limit: Option<u64>) -> Result<Vec<FileRecord>> {
-        let mut req = self.agent.get(&self.url("/files"));
-        if offset != 0 {
-            req = req.query("offset", &offset.to_string());
-        }
-        if let Some(l) = limit {
-            req = req.query("limit", &l.to_string());
-        }
-        req = self.with_auth(req, None);
-        let resp = finish("Could not load files", req.call())?;
-        Ok(resp.into_json::<Vec<FileRecord>>()?)
+        retry::run("Could not load files", || {
+            let mut req = self.agent.get(&self.url("/files"));
+            if offset != 0 {
+                req = req.query("offset", &offset.to_string());
+            }
+            if let Some(l) = limit {
+                req = req.query("limit", &l.to_string());
+            }
+            req = self.with_auth(req, None);
+            let resp = req.call().map_err(AttemptError::from)?;
+            resp.into_json::<Vec<FileRecord>>().map_err(AttemptError::from)
+        })
     }
 
     pub fn get_usage(&self, vault_id_override: Option<&str>) -> Result<UsageResponse> {
-        let req = self.with_auth(self.agent.get(&self.url("/usage")), vault_id_override);
-        let resp = finish("Could not load usage", req.call())?;
-        Ok(resp.into_json::<UsageResponse>()?)
+        retry::run("Could not load usage", || {
+            let req = self.with_auth(self.agent.get(&self.url("/usage")), vault_id_override);
+            let resp = req.call().map_err(AttemptError::from)?;
+            resp.into_json::<UsageResponse>().map_err(AttemptError::from)
+        })
     }
 
     pub fn download_content(&self, file_id: &str) -> Result<Vec<u8>> {
         assert_safe_id(file_id)?;
-        let req = self.with_auth(self.agent.get(&self.url(&format!("/files/{file_id}/blob"))), None);
-        let resp = finish("Download failed", req.call())?;
-        read_body_bytes(resp)
+        retry::run("Download failed", || {
+            let req = self.with_auth(self.agent.get(&self.url(&format!("/files/{file_id}/blob"))), None);
+            let resp = req.call().map_err(AttemptError::from)?;
+            Ok(read_body_bytes(resp)?)
+        })
     }
 
     pub fn delete_file(&self, file_id: &str, vault_id_override: Option<&str>) -> Result<()> {
         assert_safe_id(file_id)?;
-        let req = self.with_auth(self.agent.delete(&self.url(&format!("/files/{file_id}"))), vault_id_override);
-        finish("Delete failed", req.call())?;
-        Ok(())
+        retry::run("Delete failed", || {
+            let req = self.with_auth(self.agent.delete(&self.url(&format!("/files/{file_id}"))), vault_id_override);
+            req.call().map_err(AttemptError::from)?;
+            Ok(())
+        })
     }
 
     pub fn rotate_vault(&self, new_vault_id: &str, rewraps: &[RewrapEntry]) -> Result<VaultRotateResult> {
@@ -185,60 +280,75 @@ impl ApiClient {
             new_vault_id,
             rewraps: rewraps.iter().map(|r| RewrapWire { file_id: &r.file_id, wrapped_file_key: &r.wrapped_file_key, wrap_iv: &r.wrap_iv }).collect(),
         };
+        let json_body = serde_json::to_value(&body)?;
 
-        let mut req = self.with_auth(self.agent.post(&self.url("/vault/rotate")), None);
-        if let Some(t) = &self.access_token {
-            req = req.set("X-Access-Token", t);
-        }
-        let resp = finish("Couldn't change vault password", req.send_json(serde_json::to_value(&body)?))?;
-        let data: Wire = resp.into_json()?;
+        let data: Wire = retry::run("Couldn't change vault password", || {
+            let mut req = self.with_auth(self.agent.post(&self.url("/vault/rotate")), None);
+            if let Some(t) = self.access_token.read().unwrap().as_deref() {
+                req = req.set("X-Access-Token", t);
+            }
+            let resp = req.send_json(json_body.clone()).map_err(AttemptError::from)?;
+            resp.into_json::<Wire>().map_err(AttemptError::from)
+        })?;
         Ok(VaultRotateResult { files_moved: data.files_moved, tokens_rebound: data.tokens_rebound })
     }
 
     pub fn send_shred_signal(&self, target_vault_id: &str) -> Result<()> {
-        let req = self.agent.delete(&self.url("/vault")).set("Authorization", &format!("Bearer {target_vault_id}"));
-        finish("Shred signal failed", req.call())?;
-        Ok(())
+        retry::run("Shred signal failed", || {
+            let req = self.agent.delete(&self.url("/vault")).set("Authorization", &format!("Bearer {target_vault_id}"));
+            req.call().map_err(AttemptError::from)?;
+            Ok(())
+        })
     }
 
     pub fn create_file_share(&self, file_id: &str, opts: &CreateShareOptions) -> Result<ShareCreateResponse> {
         assert_safe_id(file_id)?;
-        let mut req = self.agent.post(&self.url(&format!("/files/{file_id}/share")));
-        if let Some(m) = opts.max_downloads {
-            req = req.query("max_downloads", &m.to_string());
-        }
-        if let Some(e) = opts.expires_in_seconds {
-            req = req.query("expires_in", &e.to_string());
-        }
-        req = req.query("allow_delete", &opts.allow_delete.to_string());
-        req = self.with_auth(req, None);
-        let resp = finish("Could not create share link", req.call())?;
-        Ok(resp.into_json::<ShareCreateResponse>()?)
+        retry::run("Could not create share link", || {
+            let mut req = self.agent.post(&self.url(&format!("/files/{file_id}/share")));
+            if let Some(m) = opts.max_downloads {
+                req = req.query("max_downloads", &m.to_string());
+            }
+            if let Some(e) = opts.expires_in_seconds {
+                req = req.query("expires_in", &e.to_string());
+            }
+            req = req.query("allow_delete", &opts.allow_delete.to_string());
+            req = self.with_auth(req, None);
+            let resp = req.call().map_err(AttemptError::from)?;
+            resp.into_json::<ShareCreateResponse>().map_err(AttemptError::from)
+        })
     }
 
     pub fn revoke_file_share(&self, file_id: &str) -> Result<()> {
         assert_safe_id(file_id)?;
-        let req = self.with_auth(self.agent.delete(&self.url(&format!("/files/{file_id}/share"))), None);
-        finish("Could not revoke share link", req.call())?;
-        Ok(())
+        retry::run("Could not revoke share link", || {
+            let req = self.with_auth(self.agent.delete(&self.url(&format!("/files/{file_id}/share"))), None);
+            req.call().map_err(AttemptError::from)?;
+            Ok(())
+        })
     }
 
     pub fn get_share_record(&self, share_token: &str) -> Result<ShareRecord> {
         assert_safe_share_token(share_token)?;
-        let resp = finish("This link is invalid or has expired", self.agent.get(&self.url(&format!("/share/{share_token}"))).call())?;
-        Ok(resp.into_json::<ShareRecord>()?)
+        retry::run("This link is invalid or has expired", || {
+            let resp = self.agent.get(&self.url(&format!("/share/{share_token}"))).call().map_err(AttemptError::from)?;
+            resp.into_json::<ShareRecord>().map_err(AttemptError::from)
+        })
     }
 
     pub fn download_share_content(&self, share_token: &str) -> Result<Vec<u8>> {
         assert_safe_share_token(share_token)?;
-        let resp = finish("This link is invalid, has expired, or has no downloads left", self.agent.get(&self.url(&format!("/share/{share_token}/blob"))).call())?;
-        read_body_bytes(resp)
+        retry::run("This link is invalid, has expired, or has no downloads left", || {
+            let resp = self.agent.get(&self.url(&format!("/share/{share_token}/blob"))).call().map_err(AttemptError::from)?;
+            Ok(read_body_bytes(resp)?)
+        })
     }
 
     pub fn delete_shared_file(&self, share_token: &str) -> Result<()> {
         assert_safe_share_token(share_token)?;
-        finish("Couldn't delete this file", self.agent.delete(&self.url(&format!("/share/{share_token}"))).call())?;
-        Ok(())
+        retry::run("Couldn't delete this file", || {
+            self.agent.delete(&self.url(&format!("/share/{share_token}"))).call().map_err(AttemptError::from)?;
+            Ok(())
+        })
     }
 }
 
