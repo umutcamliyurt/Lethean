@@ -42,6 +42,7 @@ Lethean is a zero-knowledge encrypted storage accountless web app. Your chosen p
 | `vaultId` | Acts like a "key card", user shows it to the server to prove they can access a vault. Think of it like an unguessable link: possession is access. | Sent to the server on every request |
 | `wrappingKey` | Locks and unlocks the individual encryption key for each file user uploads. | Stays in the browser |
 
+For the full design, see [`CRYPTOGRAPHY.md`](CRYPTOGRAPHY.md).
 
 ## Access Tokens
 
