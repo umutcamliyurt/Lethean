@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -10,6 +11,14 @@ pub struct Config {
     pub server_url: Option<String>,
     #[serde(default)]
     pub access_token: Option<String>,
+}
+
+impl Drop for Config {
+    fn drop(&mut self) {
+        if let Some(t) = self.access_token.as_mut() {
+            t.zeroize();
+        }
+    }
 }
 
 fn config_path() -> Result<PathBuf> {

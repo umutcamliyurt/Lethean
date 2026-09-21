@@ -7,6 +7,7 @@ use anyhow::{anyhow, bail, Result};
 use log::warn;
 use rand::RngCore;
 use serde::Deserialize;
+use zeroize::Zeroize;
 
 use crate::types::{EncryptedFilePayload, FileRecord, UsageResponse};
 
@@ -172,11 +173,17 @@ impl ApiClient {
     }
 
     pub fn set_vault_id(&self, id: Option<String>) {
-        *self.vault_id.write().unwrap() = id;
+        let mut old = std::mem::replace(&mut *self.vault_id.write().unwrap(), id);
+        if let Some(s) = old.as_mut() {
+            s.zeroize();
+        }
     }
 
     pub fn set_access_token(&self, token: Option<String>) {
-        *self.access_token.write().unwrap() = token.filter(|t| !t.is_empty());
+        let mut old = std::mem::replace(&mut *self.access_token.write().unwrap(), token.filter(|t| !t.is_empty()));
+        if let Some(s) = old.as_mut() {
+            s.zeroize();
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -349,6 +356,21 @@ impl ApiClient {
             self.agent.delete(&self.url(&format!("/share/{share_token}"))).call().map_err(AttemptError::from)?;
             Ok(())
         })
+    }
+}
+
+impl Drop for ApiClient {
+    fn drop(&mut self) {
+        if let Ok(mut id) = self.vault_id.write() {
+            if let Some(s) = id.as_mut() {
+                s.zeroize();
+            }
+        }
+        if let Ok(mut token) = self.access_token.write() {
+            if let Some(s) = token.as_mut() {
+                s.zeroize();
+            }
+        }
     }
 }
 

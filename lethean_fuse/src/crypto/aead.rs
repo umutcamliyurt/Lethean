@@ -4,6 +4,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
 use rand::RngCore;
 use std::io::{Read, Write};
+use zeroize::Zeroize;
 
 use crate::types::{EncryptedFilePayload, FileMeta, FOLDER_MIME};
 
@@ -171,8 +172,9 @@ pub fn unwrap_file_key(wrapping_key_raw: &[u8], wrapped_file_key_b64: &str, wrap
 pub fn decrypt_metadata(file_key_raw: &[u8], encrypted_metadata_b64: &str, metadata_iv_b64: &str) -> Result<FileMeta> {
     let iv = from_base64(metadata_iv_b64)?;
     let ct = from_base64(encrypted_metadata_b64)?;
-    let padded = aes_gcm_decrypt(file_key_raw, &iv, &ct)?;
+    let mut padded = aes_gcm_decrypt(file_key_raw, &iv, &ct)?;
     let raw = unpad_metadata_bytes(&padded);
+    padded.zeroize();
     serde_json::from_slice(&raw).context("Could not parse decrypted metadata JSON")
 }
 
@@ -184,8 +186,9 @@ pub fn decrypt_content(
     unpadded_size: Option<u64>,
 ) -> Result<Vec<u8>> {
     let iv = from_base64(content_iv_b64)?;
-    let padded = aes_gcm_decrypt(file_key_raw, &iv, ciphertext)?;
+    let mut padded = aes_gcm_decrypt(file_key_raw, &iv, ciphertext)?;
     let bytes = strip_padding(&padded, unpadded_size);
+    padded.zeroize();
     if compressed {
         decompress_bytes(&bytes)
     } else {
@@ -200,20 +203,25 @@ pub fn encrypt_file(
     contents: &[u8],
     parent_id: Option<&str>,
 ) -> Result<EncryptedFilePayload> {
-    let file_key_raw = generate_aes_key_raw();
+    let mut file_key_raw = generate_aes_key_raw();
 
-    let (content_bytes, compressed) = maybe_compress(contents)?;
+    let (mut content_bytes, compressed) = maybe_compress(contents)?;
     let unpadded_size = content_bytes.len() as u64;
-    let padded_content = pad_to_bucket(&content_bytes);
+    let mut padded_content = pad_to_bucket(&content_bytes);
+    content_bytes.zeroize();
 
     let meta = FileMeta::new_file(name.to_string(), mime.to_string(), compressed, unpadded_size, parent_id.map(|s| s.to_string()));
-    let metadata_json = serde_json::to_vec(&meta)?;
-    let metadata_bytes = pad_metadata_bytes(&metadata_json);
+    let mut metadata_json = serde_json::to_vec(&meta)?;
+    let mut metadata_bytes = pad_metadata_bytes(&metadata_json);
+    metadata_json.zeroize();
     let meta_enc = aes_gcm_encrypt(&file_key_raw, &metadata_bytes)?;
+    metadata_bytes.zeroize();
 
     let content_enc = aes_gcm_encrypt(&file_key_raw, &padded_content)?;
+    padded_content.zeroize();
 
     let key_wrap = aes_gcm_encrypt(wrapping_key_raw, &file_key_raw)?;
+    file_key_raw.zeroize();
 
     Ok(EncryptedFilePayload {
         ciphertext: content_enc.ciphertext,
@@ -226,16 +234,19 @@ pub fn encrypt_file(
 }
 
 pub fn encrypt_folder(wrapping_key_raw: &[u8], name: &str, parent_id: Option<&str>) -> Result<EncryptedFilePayload> {
-    let file_key_raw = generate_aes_key_raw();
+    let mut file_key_raw = generate_aes_key_raw();
 
     let meta = FileMeta::new_folder(name.to_string(), parent_id.map(|s| s.to_string()));
-    let metadata_json = serde_json::to_vec(&meta)?;
-    let metadata_bytes = pad_metadata_bytes(&metadata_json);
+    let mut metadata_json = serde_json::to_vec(&meta)?;
+    let mut metadata_bytes = pad_metadata_bytes(&metadata_json);
+    metadata_json.zeroize();
     let meta_enc = aes_gcm_encrypt(&file_key_raw, &metadata_bytes)?;
+    metadata_bytes.zeroize();
 
     let content_enc = aes_gcm_encrypt(&file_key_raw, &[])?;
 
     let key_wrap = aes_gcm_encrypt(wrapping_key_raw, &file_key_raw)?;
+    file_key_raw.zeroize();
 
     Ok(EncryptedFilePayload {
         ciphertext: content_enc.ciphertext,
@@ -248,9 +259,11 @@ pub fn encrypt_folder(wrapping_key_raw: &[u8], name: &str, parent_id: Option<&st
 }
 
 pub fn reencrypt_metadata(file_key_raw: &[u8], meta: &FileMeta) -> Result<(String, String)> {
-    let metadata_json = serde_json::to_vec(meta)?;
-    let metadata_bytes = pad_metadata_bytes(&metadata_json);
+    let mut metadata_json = serde_json::to_vec(meta)?;
+    let mut metadata_bytes = pad_metadata_bytes(&metadata_json);
+    metadata_json.zeroize();
     let enc = aes_gcm_encrypt(file_key_raw, &metadata_bytes)?;
+    metadata_bytes.zeroize();
     Ok((to_base64(&enc.ciphertext), to_base64(&enc.iv)))
 }
 

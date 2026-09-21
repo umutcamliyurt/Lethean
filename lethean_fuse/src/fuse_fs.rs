@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 use fuser::{FileAttr, FileType, Filesystem, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow};
 use libc::{c_int, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOTDIR, ENOTEMPTY, O_ACCMODE, O_TRUNC};
 use log::{error, warn};
+use zeroize::Zeroize;
 
 use crate::vault::Vault;
 
@@ -289,6 +290,12 @@ impl VaultFs {
 
     pub fn refresh(&mut self) -> anyhow::Result<()> {
         self.vault.refresh_all()
+    }
+}
+
+impl Drop for VaultFs {
+    fn drop(&mut self) {
+        self.vault.close();
     }
 }
 
@@ -763,7 +770,16 @@ impl Filesystem for VaultFs {
             let state_arc2 = Arc::clone(&state_arc);
             match run_guarded("release", move || Ok::<bool, c_int>(commit_write_session(&vault, &state_arc, fh))) {
                 Ok(true) => {
-                    lock_state(&state_arc2).handles.remove(&fh);
+                    if let Some(handle) = lock_state(&state_arc2).handles.remove(&fh) {
+                        match handle {
+                            Handle::Write(mut session) => session.buffer.zeroize(),
+                            Handle::Read { mut data, .. } => {
+                                if let Some(bytes) = data.as_mut() {
+                                    bytes.zeroize();
+                                }
+                            }
+                        }
+                    }
                 }
                 Ok(false) => {
                     warn!("[lethean-cli] release: changes are still unsaved after retries; keeping the write buffer for a later attempt");

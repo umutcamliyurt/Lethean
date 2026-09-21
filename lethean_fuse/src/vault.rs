@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use anyhow::{bail, Context, Result};
+use zeroize::Zeroizing;
 
 use crate::api::{ApiClient, RewrapEntry};
 use crate::crypto::aead;
@@ -17,7 +18,7 @@ const CONTENT_CACHE_MAX_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
 pub struct Entry {
     pub record: FileRecord,
     pub meta: FileMeta,
-    pub file_key: Vec<u8>,
+    pub file_key: Zeroizing<Vec<u8>>,
 }
 
 impl Entry {
@@ -56,7 +57,7 @@ struct VaultIndex {
 }
 
 struct ContentCache {
-    entries: HashMap<String, Arc<Vec<u8>>>,
+    entries: HashMap<String, Arc<Zeroizing<Vec<u8>>>>,
     order: VecDeque<String>,
     total_bytes: u64,
 }
@@ -73,7 +74,7 @@ impl ContentCache {
         }
     }
 
-    fn get(&mut self, id: &str) -> Option<Arc<Vec<u8>>> {
+    fn get(&mut self, id: &str) -> Option<Arc<Zeroizing<Vec<u8>>>> {
         let hit = self.entries.get(id).cloned();
         if hit.is_some() {
             self.touch(id);
@@ -81,7 +82,7 @@ impl ContentCache {
         hit
     }
 
-    fn insert(&mut self, id: String, bytes: Arc<Vec<u8>>) {
+    fn insert(&mut self, id: String, bytes: Arc<Zeroizing<Vec<u8>>>) {
         let size = bytes.len() as u64;
         if size > CONTENT_CACHE_MAX_ENTRY_BYTES {
             return;
@@ -109,12 +110,18 @@ impl ContentCache {
     }
 
     fn remove(&mut self, id: &str) {
-        if let Some(bytes) = self.entries.remove(id) {
-            self.total_bytes -= bytes.len() as u64;
+        if let Some(evicted) = self.entries.remove(id) {
+            self.total_bytes -= evicted.len() as u64;
         }
         if let Some(pos) = self.order.iter().position(|x| x == id) {
             self.order.remove(pos);
         }
+    }
+
+    fn wipe(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.total_bytes = 0;
     }
 }
 
@@ -124,7 +131,7 @@ fn lock_cache(cache: &Mutex<ContentCache>) -> MutexGuard<'_, ContentCache> {
 
 pub struct Vault {
     pub api: ApiClient,
-    wrapping_key_raw: RwLock<Vec<u8>>,
+    wrapping_key_raw: RwLock<Zeroizing<Vec<u8>>>,
     index: RwLock<VaultIndex>,
     content_cache: Mutex<ContentCache>,
 }
@@ -133,14 +140,24 @@ impl Vault {
     pub fn new(api: ApiClient, wrapping_key_raw: Vec<u8>) -> Self {
         Self {
             api,
-            wrapping_key_raw: RwLock::new(wrapping_key_raw),
+            wrapping_key_raw: RwLock::new(Zeroizing::new(wrapping_key_raw)),
             index: RwLock::new(VaultIndex { entries: HashMap::new(), children_by_parent: HashMap::new() }),
             content_cache: Mutex::new(ContentCache::new()),
         }
     }
 
-    fn wrapping_key(&self) -> Vec<u8> {
+    fn wrapping_key(&self) -> Zeroizing<Vec<u8>> {
         read_lock(&self.wrapping_key_raw).clone()
+    }
+
+    pub fn close(&self) {
+        *write_lock(&self.wrapping_key_raw) = Zeroizing::new(Vec::new());
+        {
+            let mut index = write_lock(&self.index);
+            index.entries.clear();
+            index.children_by_parent.clear();
+        }
+        lock_cache(&self.content_cache).wipe();
     }
 
     fn index_insert(index: &mut VaultIndex, id: String, parent_id: Option<&str>) {
@@ -157,8 +174,8 @@ impl Vault {
 
     fn ingest_record(&self, record: FileRecord) {
         let wrapping_key = self.wrapping_key();
-        let decoded = (|| -> Result<(FileMeta, Vec<u8>)> {
-            let file_key = aead::unwrap_file_key(&wrapping_key, &record.wrapped_file_key, &record.wrap_iv)?;
+        let decoded = (|| -> Result<(FileMeta, Zeroizing<Vec<u8>>)> {
+            let file_key = Zeroizing::new(aead::unwrap_file_key(&wrapping_key, &record.wrapped_file_key, &record.wrap_iv)?);
             let meta = aead::decrypt_metadata(&file_key, &record.encrypted_metadata, &record.metadata_iv)?;
             Ok((meta, file_key))
         })();
@@ -174,7 +191,7 @@ impl Vault {
                     is_folder: false,
                     parent_id: None,
                 },
-                Vec::new(),
+                Zeroizing::new(Vec::new()),
             ),
         };
 
@@ -263,7 +280,7 @@ impl Vault {
         let record = self.api.upload_file(&payload, None, None).context("upload failed")?;
         let id = record.id.clone();
         self.ingest_record(record);
-        lock_cache(&self.content_cache).insert(id.clone(), Arc::new(contents.to_vec()));
+        lock_cache(&self.content_cache).insert(id.clone(), Arc::new(Zeroizing::new(contents.to_vec())));
         self.get(&id).context("upload succeeded but the new entry vanished (likely deleted concurrently)")
     }
 
@@ -289,7 +306,7 @@ impl Vault {
 
     pub fn download_decrypted(&self, id: &str) -> Result<Vec<u8>> {
         if let Some(cached) = lock_cache(&self.content_cache).get(id) {
-            return Ok((*cached).clone());
+            return Ok(cached.to_vec());
         }
 
         let entry = self.get(id).context("unknown file")?;
@@ -298,7 +315,7 @@ impl Vault {
         }
         let ciphertext = self.api.download_content(id)?;
         let bytes = aead::decrypt_content(&entry.file_key, &entry.record.content_iv, &ciphertext, entry.meta.compressed, entry.meta.unpadded_size)?;
-        lock_cache(&self.content_cache).insert(id.to_string(), Arc::new(bytes.clone()));
+        lock_cache(&self.content_cache).insert(id.to_string(), Arc::new(Zeroizing::new(bytes.clone())));
         Ok(bytes)
     }
 
@@ -365,8 +382,14 @@ impl Vault {
 
         let result = self.api.rotate_vault(new_vault_id, &rewraps)?;
         self.api.set_vault_id(Some(new_vault_id.to_string()));
-        *write_lock(&self.wrapping_key_raw) = new_wrapping_key_raw.to_vec();
+        *write_lock(&self.wrapping_key_raw) = Zeroizing::new(new_wrapping_key_raw.to_vec());
         Ok(result.files_moved)
+    }
+}
+
+impl Drop for Vault {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -377,9 +400,9 @@ mod content_cache_tests {
     #[test]
     fn hit_returns_bytes_and_promotes_recency() {
         let mut cache = ContentCache::new();
-        cache.insert("a".to_string(), Arc::new(vec![1, 2, 3]));
-        assert_eq!(cache.get("a").as_deref(), Some(&vec![1u8, 2, 3]));
-        assert_eq!(cache.get("missing"), None);
+        cache.insert("a".to_string(), Arc::new(Zeroizing::new(vec![1, 2, 3])));
+        assert_eq!(cache.get("a").map(|v| v.to_vec()), Some(vec![1u8, 2, 3]));
+        assert!(cache.get("missing").is_none());
     }
 
     #[test]
@@ -388,7 +411,7 @@ mod content_cache_tests {
         let chunk_size = (CONTENT_CACHE_MAX_BYTES / 5) as usize;
         let chunk = vec![0u8; chunk_size];
         for name in ["a", "b", "c", "d", "e", "f"] {
-            cache.insert(name.to_string(), Arc::new(chunk.clone()));
+            cache.insert(name.to_string(), Arc::new(Zeroizing::new(chunk.clone())));
         }
 
         assert!(cache.get("a").is_none(), "oldest entry should have been evicted to stay under budget");
@@ -396,7 +419,7 @@ mod content_cache_tests {
         assert!(cache.total_bytes <= CONTENT_CACHE_MAX_BYTES);
 
         assert!(cache.get("b").is_some());
-        cache.insert("g".to_string(), Arc::new(chunk));
+        cache.insert("g".to_string(), Arc::new(Zeroizing::new(chunk)));
         assert!(cache.entries.contains_key("b"), "recently touched entry should survive a further eviction round");
     }
 
@@ -404,7 +427,7 @@ mod content_cache_tests {
     fn entries_larger_than_the_single_entry_cap_are_never_cached() {
         let mut cache = ContentCache::new();
         let huge = vec![0u8; (CONTENT_CACHE_MAX_ENTRY_BYTES + 1) as usize];
-        cache.insert("huge".to_string(), Arc::new(huge));
+        cache.insert("huge".to_string(), Arc::new(Zeroizing::new(huge)));
         assert!(cache.get("huge").is_none());
         assert_eq!(cache.total_bytes, 0);
     }
@@ -412,7 +435,7 @@ mod content_cache_tests {
     #[test]
     fn remove_clears_bytes_and_recency_entry() {
         let mut cache = ContentCache::new();
-        cache.insert("a".to_string(), Arc::new(vec![1, 2, 3]));
+        cache.insert("a".to_string(), Arc::new(Zeroizing::new(vec![1, 2, 3])));
         cache.remove("a");
         assert!(cache.get("a").is_none());
         assert_eq!(cache.total_bytes, 0);
@@ -422,9 +445,48 @@ mod content_cache_tests {
     #[test]
     fn rekey_moves_bytes_to_the_new_id_without_a_redundant_fetch() {
         let mut cache = ContentCache::new();
-        cache.insert("old-id".to_string(), Arc::new(vec![9, 9, 9]));
+        cache.insert("old-id".to_string(), Arc::new(Zeroizing::new(vec![9, 9, 9])));
         cache.rekey("old-id", "new-id");
         assert!(cache.get("old-id").is_none());
-        assert_eq!(cache.get("new-id").as_deref(), Some(&vec![9u8, 9, 9]));
+        assert_eq!(cache.get("new-id").map(|v| v.to_vec()), Some(vec![9u8, 9, 9]));
+    }
+
+    #[test]
+    fn wipe_clears_everything_the_cache_is_holding() {
+        let mut cache = ContentCache::new();
+        cache.insert("a".to_string(), Arc::new(Zeroizing::new(vec![1, 2, 3])));
+        cache.insert("b".to_string(), Arc::new(Zeroizing::new(vec![4, 5, 6])));
+        cache.wipe();
+        assert!(cache.get("a").is_none());
+        assert!(cache.get("b").is_none());
+        assert_eq!(cache.total_bytes, 0);
+        assert!(cache.order.is_empty());
+    }
+
+    #[test]
+    fn closing_the_vault_scrubs_wrapping_key_file_keys_and_cache() {
+        let wrapping_key = aead::generate_aes_key_raw();
+        let payload = aead::encrypt_file(&wrapping_key, "secret.txt", "text/plain", b"top secret source material", None).unwrap();
+        let record = FileRecord {
+            id: "closetest0000000000000000000000".to_string(),
+            content_iv: payload.content_iv.clone(),
+            encrypted_metadata: payload.encrypted_metadata.clone(),
+            metadata_iv: payload.metadata_iv.clone(),
+            wrapped_file_key: payload.wrapped_file_key.clone(),
+            wrap_iv: payload.wrap_iv.clone(),
+            size: None,
+        };
+        let id = record.id.clone();
+
+        let api = ApiClient::new("http://127.0.0.1:0".to_string()).expect("client");
+        let vault = Vault::new(api, wrapping_key);
+        vault.ingest_record(record);
+        assert!(vault.get(&id).is_some(), "entry should be present before close");
+
+        vault.close();
+
+        assert!(vault.get(&id).is_none(), "index should be empty after close");
+        assert!(read_lock(&vault.wrapping_key_raw).is_empty(), "wrapping key should be wiped after close");
+        assert_eq!(lock_cache(&vault.content_cache).entries.len(), 0, "content cache should be empty after close");
     }
 }

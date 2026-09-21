@@ -3,6 +3,7 @@ use anyhow::{bail, Result};
 use argon2::{Algorithm, Argon2, Params, Version};
 use hkdf::Hkdf;
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 use crate::crypto::aead::to_hex;
 use crate::types::UnlockResult;
@@ -71,9 +72,10 @@ pub fn derive_confirm_marker(vault_id: &str) -> String {
 }
 
 pub fn unlock_vault(password: &str, access_token: Option<&str>, kdf_version: u32) -> Result<UnlockResult> {
-    let master_key = derive_master_key(password, access_token, kdf_version)?;
+    let mut master_key = derive_master_key(password, access_token, kdf_version)?;
     let vault_id = derive_vault_id(&master_key)?;
     let wrapping_key_raw = derive_wrapping_key(&master_key)?;
+    master_key.zeroize();
     Ok(UnlockResult { vault_id, wrapping_key_raw })
 }
 

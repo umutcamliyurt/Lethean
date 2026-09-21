@@ -5,6 +5,7 @@ use std::process::Command as OsCommand;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
+use zeroize::Zeroize;
 
 use lethean_fuse_lib::api::{self, ApiClient};
 use lethean_fuse_lib::config::Config;
@@ -94,6 +95,7 @@ fn prompt_hidden(label: &str) -> Result<String> {
                     if echo_was_supported {
                         unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
                     }
+                    buf.zeroize();
                     return Err(e.into());
                 }
             }
@@ -102,13 +104,17 @@ fn prompt_hidden(label: &str) -> Result<String> {
             unsafe { libc::tcsetattr(fd, libc::TCSANOW, &original) };
         }
         println!();
-        Ok(String::from_utf8_lossy(&buf).to_string())
+        let result = String::from_utf8_lossy(&buf).to_string();
+        buf.zeroize();
+        Ok(result)
     }
     #[cfg(not(unix))]
     {
         let mut line = String::new();
         io::stdin().read_line(&mut line)?;
-        Ok(line.trim_end_matches(['\n', '\r']).to_string())
+        let result = line.trim_end_matches(['\n', '\r']).to_string();
+        line.zeroize();
+        Ok(result)
     }
 }
 
@@ -124,12 +130,13 @@ fn unlock_session(cli: &Cli, config: &Config) -> Result<Vault> {
     let server = resolve_server(cli, config)?;
     let access_token = resolve_access_token(cli, config);
 
-    let password = prompt_hidden("Vault password: ")?;
+    let mut password = prompt_hidden("Vault password: ")?;
     if password.is_empty() {
         bail!("password cannot be empty");
     }
 
     let unlocked = kdf::unlock_vault(&password, access_token.as_deref(), cli.kdf_version)?;
+    password.zeroize();
 
     let api = ApiClient::new(server)?;
     api.set_vault_id(Some(unlocked.vault_id));
@@ -215,6 +222,7 @@ fn cmd_usage(cli: &Cli, config: &Config) -> Result<()> {
         Some(quota) => println!("{} used / {} quota · {} item(s)", format_bytes(usage.total_bytes), format_bytes(quota), usage.file_count),
         None => println!("{} used · {} item(s)", format_bytes(usage.total_bytes), usage.file_count),
     }
+    vault.close();
     Ok(())
 }
 
@@ -247,6 +255,7 @@ fn cmd_tree(cli: &Cli, config: &Config) -> Result<()> {
         }
     }
     walk(&vault, None, 0);
+    vault.close();
     Ok(())
 }
 
@@ -254,8 +263,9 @@ fn cmd_rotate_password(cli: &Cli, config: &Config) -> Result<()> {
     let server = resolve_server(cli, config)?;
     let access_token = resolve_access_token(cli, config);
 
-    let old_password = prompt_hidden("Current vault password: ")?;
+    let mut old_password = prompt_hidden("Current vault password: ")?;
     let unlocked = kdf::unlock_vault(&old_password, access_token.as_deref(), cli.kdf_version)?;
+    old_password.zeroize();
 
     let api = ApiClient::new(server)?;
     api.set_vault_id(Some(unlocked.vault_id.clone()));
@@ -264,28 +274,39 @@ fn cmd_rotate_password(cli: &Cli, config: &Config) -> Result<()> {
     eprintln!("Fetching file index…");
     vault.refresh_all()?;
 
-    let new_password = prompt_hidden("New vault password: ")?;
-    let confirm = prompt_hidden("Confirm new password: ")?;
+    let mut new_password = prompt_hidden("New vault password: ")?;
+    let mut confirm = prompt_hidden("Confirm new password: ")?;
     if new_password != confirm {
+        new_password.zeroize();
+        confirm.zeroize();
+        vault.close();
         bail!("passwords did not match");
     }
+    confirm.zeroize();
     let strength = kdf::validate_password_strength(&new_password);
     if !strength.valid {
         for e in &strength.errors {
             eprintln!("- {e}");
         }
+        new_password.zeroize();
+        vault.close();
         bail!("new password is too weak");
     }
 
     let new_kdf_version = kdf::CURRENT_KDF_VERSION;
-    let new_unlocked = kdf::unlock_vault(&new_password, access_token.as_deref(), new_kdf_version)?;
+    let mut new_unlocked = kdf::unlock_vault(&new_password, access_token.as_deref(), new_kdf_version)?;
+    new_password.zeroize();
     if new_unlocked.vault_id == unlocked.vault_id {
+        new_unlocked.wrapping_key_raw.zeroize();
+        vault.close();
         bail!("new password must be different from the current one");
     }
 
     let files_moved = vault.rotate_password(&new_unlocked.vault_id, &new_unlocked.wrapping_key_raw)?;
+    new_unlocked.wrapping_key_raw.zeroize();
     println!("Password changed. {files_moved} file(s) re-wrapped under the new key.");
     println!("(Remember: the vault password itself is never stored anywhere — only you know it.)");
+    vault.close();
     Ok(())
 }
 
@@ -298,6 +319,7 @@ fn cmd_share(cli: &Cli, config: &Config, file_id: String, max_downloads: Option<
         println!("expires_at  = {exp}");
     }
     println!("max_downloads = {}", share.max_downloads);
+    vault.close();
     Ok(())
 }
 
@@ -305,6 +327,7 @@ fn cmd_unshare(cli: &Cli, config: &Config, file_id: String) -> Result<()> {
     let vault = unlock_session(cli, config)?;
     vault.api.revoke_file_share(&file_id)?;
     println!("Share link revoked.");
+    vault.close();
     Ok(())
 }
 
