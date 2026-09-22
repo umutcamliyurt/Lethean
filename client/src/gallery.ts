@@ -3,12 +3,15 @@ import * as api from './api.js';
 import {
   boxGrid, fileListEl, fileListBody, viewGridBtn, viewListBtn,
   emptyState, gridLabel, searchInput, searchClearBtn, gridSentinel, usagePill, breadcrumbEl,
+  selectToggleBtn, selectionBarEl, selectionCountEl, selectionSelectAllBtn,
+  selectionDownloadBtn, selectionMoveBtn, selectionDeleteBtn, selectionCancelBtn,
 } from './dom.js';
 import { fileKeyCache, metaCache, objectUrlCache, getWrappingKeyRaw } from './state.js';
 import { getStoredViewMode, setStoredViewMode } from './storage.js';
 import { fileKind, fileTypeLabel, formatBytes, decryptedSize, icon, showToast, isCoarsePointerDevice } from './utils.js';
 import { openTile, downloadAndSave } from './lightbox.js';
 import { shareFile } from './share.js';
+import { openMovePicker } from './move.js';
 import type { FileMeta, FileRecord, UsageResponse, ViewMode } from './types.js';
 
 let viewMode: ViewMode = getStoredViewMode();
@@ -34,6 +37,216 @@ function updateViewToggleUI(): void {
 viewGridBtn?.addEventListener('click', () => setViewMode('grid'));
 viewListBtn?.addEventListener('click', () => setViewMode('list'));
 updateViewToggleUI();
+
+
+let selectionMode = false;
+const selectedIds = new Set<string>();
+
+selectToggleBtn?.addEventListener('click', () => setSelectionMode(!selectionMode));
+selectionSelectAllBtn?.addEventListener('click', () => selectAllVisible());
+selectionDownloadBtn?.addEventListener('click', () => void handleDownloadSelected());
+selectionMoveBtn?.addEventListener('click', () => void handleMoveSelected());
+selectionDeleteBtn?.addEventListener('click', () => void handleDeleteSelected());
+selectionCancelBtn?.addEventListener('click', () => setSelectionMode(false));
+
+function setSelectionMode(on: boolean): void {
+  selectionMode = on;
+  if (!on) selectedIds.clear();
+  selectToggleBtn?.classList.toggle('active', on);
+  selectToggleBtn?.setAttribute('aria-pressed', String(on));
+  updateSelectionBar();
+  renderCurrentView();
+}
+
+function updateSelectionBar(): void {
+  selectionBarEl?.classList.toggle('hidden', !selectionMode);
+  if (selectionCountEl) selectionCountEl.textContent = `${selectedIds.size} selected`;
+  if (selectionDownloadBtn) selectionDownloadBtn.disabled = selectedIds.size === 0;
+  if (selectionMoveBtn) selectionMoveBtn.disabled = selectedIds.size === 0;
+  if (selectionDeleteBtn) selectionDeleteBtn.disabled = selectedIds.size === 0;
+}
+
+function toggleSelect(id: string): void {
+  if (!selectionMode) setSelectionMode(true);
+  if (selectedIds.has(id)) selectedIds.delete(id);
+  else selectedIds.add(id);
+  updateSelectionBar();
+  renderCurrentView();
+}
+
+function selectAllVisible(): void {
+  const shown = visibleRecords();
+  const allSelected = shown.length > 0 && shown.every((r) => selectedIds.has(r.id));
+  if (allSelected) {
+    for (const r of shown) selectedIds.delete(r.id);
+  } else {
+    for (const r of shown) selectedIds.add(r.id);
+  }
+  updateSelectionBar();
+  renderCurrentView();
+}
+
+async function handleDownloadSelected(): Promise<void> {
+  const ids = [...selectedIds];
+  if (!ids.length) return;
+
+  const fileIds = new Set<string>();
+  for (const id of ids) {
+    const meta = metaCache.get(id);
+    if (!meta) continue;
+    if (meta.isFolder) {
+      for (const d of collectDescendantIds(id)) {
+        if (!metaCache.get(d)?.isFolder) fileIds.add(d);
+      }
+    } else {
+      fileIds.add(id);
+    }
+  }
+
+  if (!fileIds.size) {
+    showToast('No files to download in the selection.', 'error');
+    return;
+  }
+
+  for (const id of fileIds) {
+    const record = records.find((r) => r.id === id);
+    const meta = metaCache.get(id);
+    if (!record || !meta) continue;
+    await downloadAndSave(record, meta);
+  }
+}
+
+async function handleDeleteSelected(): Promise<void> {
+  const ids = [...selectedIds];
+  if (!ids.length) return;
+
+  const allIds = new Set<string>();
+  for (const id of ids) {
+    allIds.add(id);
+    if (metaCache.get(id)?.isFolder) {
+      for (const d of collectDescendantIds(id)) allIds.add(d);
+    }
+  }
+  const label = `${ids.length} item${ids.length === 1 ? '' : 's'}`;
+  const extra = allIds.size > ids.length ? ` and everything inside them (${allIds.size} total)` : '';
+  if (!confirm(`Delete ${label}${extra}? This can't be undone.`)) return;
+
+  let failed = 0;
+  for (const id of allIds) {
+    try {
+      await api.deleteFile(id);
+      if (objectUrlCache.has(id)) { URL.revokeObjectURL(objectUrlCache.get(id)!); objectUrlCache.delete(id); }
+      fileKeyCache.delete(id);
+      metaCache.delete(id);
+    } catch {
+      failed++;
+    }
+  }
+  records = records.filter((r) => !allIds.has(r.id));
+  setSelectionMode(false);
+  renderCurrentView();
+  scheduleUsageRefresh();
+  if (failed) showToast(`Deleted ${allIds.size - failed} item(s); ${failed} failed.`, 'error');
+  else showToast(allIds.size === 1 ? 'Deleted.' : `Deleted ${allIds.size} items.`);
+}
+
+async function handleMoveSelected(): Promise<void> {
+  const ids = [...selectedIds];
+  if (!ids.length) return;
+  await openMovePicker(ids, records, async (destinationFolderId) => {
+    await moveRecords(ids, destinationFolderId);
+  });
+}
+
+function isDescendantOf(id: string, ancestorId: string): boolean {
+  let cur: string | null = parentIdOf(id);
+  const seen = new Set<string>();
+  while (cur && !seen.has(cur)) {
+    if (cur === ancestorId) return true;
+    seen.add(cur);
+    cur = parentIdOf(cur);
+  }
+  return false;
+}
+
+async function moveOneRecord(oldId: string, newParentId: string | null): Promise<string> {
+  const fileKeyRaw = fileKeyCache.get(oldId);
+  const meta = metaCache.get(oldId);
+  const record = records.find((r) => r.id === oldId);
+  if (!fileKeyRaw || !meta || !record) {
+    throw new Error(`"${meta?.name ?? oldId}" isn't fully loaded yet — wait for the gallery to finish loading and try again.`);
+  }
+
+  const rawCiphertext = await api.downloadContent(oldId);
+  const updatedMeta: FileMeta = { ...meta, parentId: newParentId };
+  const { encryptedMetadata, metadataIv } = await C.encryptMetadata(fileKeyRaw, updatedMeta);
+
+  const newRecord = await api.uploadFile({
+    ciphertext: rawCiphertext,
+    contentIv: record.content_iv,
+    encryptedMetadata,
+    metadataIv,
+    wrappedFileKey: record.wrapped_file_key,
+    wrapIv: record.wrap_iv,
+  });
+
+  await api.deleteFile(oldId);
+
+  if (objectUrlCache.has(oldId)) { URL.revokeObjectURL(objectUrlCache.get(oldId)!); objectUrlCache.delete(oldId); }
+  fileKeyCache.delete(oldId);
+  metaCache.delete(oldId);
+  fileKeyCache.set(newRecord.id, fileKeyRaw);
+  metaCache.set(newRecord.id, updatedMeta);
+  records = records.filter((r) => r.id !== oldId);
+  records.push(newRecord);
+
+  return newRecord.id;
+}
+
+async function moveSubtree(rootId: string, newParentId: string | null): Promise<void> {
+  const isFolder = !!metaCache.get(rootId)?.isFolder;
+  const descendantIds = isFolder ? collectDescendantIds(rootId) : [];
+
+  const idMap = new Map<string, string>();
+  const newRootId = await moveOneRecord(rootId, newParentId);
+  idMap.set(rootId, newRootId);
+
+  for (const id of descendantIds) {
+    const oldParentId = parentIdOf(id);
+    const mappedParent = oldParentId != null ? (idMap.get(oldParentId) ?? oldParentId) : null;
+    const newId = await moveOneRecord(id, mappedParent);
+    idMap.set(id, newId);
+  }
+}
+
+async function moveRecords(ids: string[], destinationFolderId: string | null): Promise<void> {
+  const idSet = new Set(ids);
+  const targets = ids.filter((id) => ![...idSet].some((other) => other !== id && isDescendantOf(id, other)));
+
+  let moved = 0;
+  let failed = 0;
+  for (const id of targets) {
+    if (id === destinationFolderId) { continue; }
+    if (parentIdOf(id) === destinationFolderId) { continue; }
+    if (destinationFolderId != null && (destinationFolderId === id || isDescendantOf(destinationFolderId, id))) {
+      failed++;
+      continue;
+    }
+    try {
+      await moveSubtree(id, destinationFolderId);
+      moved++;
+    } catch (err) {
+      failed++;
+      showToast((err as Error).message, 'error');
+    }
+  }
+
+  setSelectionMode(false);
+  renderCurrentView();
+  scheduleUsageRefresh();
+  if (failed) showToast(`Moved ${moved} item(s); ${failed} failed.`, 'error');
+  else if (moved) showToast(`Moved ${moved} item${moved === 1 ? '' : 's'}.`);
+}
 
 const PAGE_SIZE = 24;
 let pageOffset = 0;
@@ -313,13 +526,19 @@ function renderTile(record: FileRecord): HTMLDivElement {
   const kind = isFolder ? 'folder' : fileKind(meta.mime);
 
   const tile = document.createElement('div');
-  tile.className = 'box-tile' + (isFolder ? ' is-folder' : '');
+  tile.className = 'box-tile'
+    + (isFolder ? ' is-folder' : '')
+    + (selectionMode ? ' selection-mode' : '')
+    + (selectedIds.has(record.id) ? ' selected' : '');
   tile.dataset.id = record.id;
   tile.tabIndex = 0;
   tile.setAttribute('role', 'button');
   tile.setAttribute('aria-label', isFolder ? `Open folder ${meta.name}` : `Open ${meta.name}`);
 
   tile.innerHTML = `
+    <label class="box-select-label">
+      <input type="checkbox" class="box-select-checkbox">
+    </label>
     ${isCoarsePointerDevice ? '' : `
       <div class="box-menu">
         ${isFolder ? '' : `<button type="button" class="btn-icon share-btn" title="Share">${icon('share')}</button>`}
@@ -337,14 +556,26 @@ function renderTile(record: FileRecord): HTMLDivElement {
   tile.querySelector('.delete-btn')?.setAttribute('aria-label', `Delete ${meta.name}`);
   tile.querySelector('.share-btn')?.setAttribute('aria-label', `Share ${meta.name}`);
 
+  const selectCheckbox = tile.querySelector('.box-select-checkbox') as HTMLInputElement;
+  selectCheckbox.checked = selectedIds.has(record.id);
+  selectCheckbox.setAttribute('aria-label', `Select ${meta.name}`);
+  selectCheckbox.addEventListener('click', (e) => e.stopPropagation());
+  selectCheckbox.addEventListener('change', () => toggleSelect(record.id));
+
   const openThisTile = () => (isFolder ? navigateToFolder(record.id) : openTile(record.id));
 
   tile.addEventListener('click', (e) => {
-    if ((e.target as HTMLElement).closest('.delete-btn') || (e.target as HTMLElement).closest('.share-btn')) return;
+    const target = e.target as HTMLElement;
+    if (target.closest('.delete-btn') || target.closest('.share-btn') || target.closest('.box-select-label')) return;
+    if (selectionMode) { toggleSelect(record.id); return; }
     openThisTile();
   });
   tile.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openThisTile(); }
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      if (selectionMode) toggleSelect(record.id);
+      else openThisTile();
+    }
   });
   tile.querySelector('.delete-btn')?.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -381,7 +612,10 @@ function renderListRow(record: FileRecord): HTMLDivElement {
   const kind = isFolder ? 'folder' : fileKind(meta.mime);
 
   const row = document.createElement('div');
-  row.className = 'file-list-row' + (isFolder ? ' is-folder' : '');
+  row.className = 'file-list-row'
+    + (isFolder ? ' is-folder' : '')
+    + (selectionMode ? ' selection-mode' : '')
+    + (selectedIds.has(record.id) ? ' selected' : '');
   row.dataset.id = record.id;
   row.tabIndex = 0;
   row.setAttribute('role', 'row');
@@ -389,6 +623,7 @@ function renderListRow(record: FileRecord): HTMLDivElement {
 
   row.innerHTML = `
     <span class="file-row-name" role="cell">
+      <span class="file-row-select"><input type="checkbox" class="file-row-checkbox"></span>
       <span class="file-row-icon">${icon(isFolder ? 'folder' : kind === 'image' ? 'image' : kind === 'video' ? 'video' : 'file')}</span>
       <span class="file-row-text"></span>
     </span>
@@ -406,16 +641,29 @@ function renderListRow(record: FileRecord): HTMLDivElement {
   row.querySelector('.file-download-btn')?.setAttribute('aria-label', `Download ${meta.name}`);
   row.querySelector('.file-delete-btn')!.setAttribute('aria-label', `Delete ${meta.name}`);
 
+  const rowCheckbox = row.querySelector('.file-row-checkbox') as HTMLInputElement;
+  rowCheckbox.checked = selectedIds.has(record.id);
+  rowCheckbox.setAttribute('aria-label', `Select ${meta.name}`);
+  rowCheckbox.addEventListener('click', (e) => e.stopPropagation());
+  rowCheckbox.addEventListener('change', () => toggleSelect(record.id));
+
   const openThisRow = () => (isFolder ? navigateToFolder(record.id) : openTile(record.id));
 
   row.addEventListener('click', (e) => {
-    if ((e.target as HTMLElement).closest('.file-download-btn')
-      || (e.target as HTMLElement).closest('.file-share-btn')
-      || (e.target as HTMLElement).closest('.file-delete-btn')) return;
+    const target = e.target as HTMLElement;
+    if (target.closest('.file-download-btn')
+      || target.closest('.file-share-btn')
+      || target.closest('.file-delete-btn')
+      || target.closest('.file-row-select')) return;
+    if (selectionMode) { toggleSelect(record.id); return; }
     openThisRow();
   });
   row.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openThisRow(); }
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      if (selectionMode) toggleSelect(record.id);
+      else openThisRow();
+    }
   });
   row.querySelector('.file-share-btn')?.addEventListener('click', (e) => {
     e.stopPropagation();

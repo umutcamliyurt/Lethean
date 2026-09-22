@@ -18,6 +18,7 @@ export {
   encryptFolder,
   decryptContent,
   decryptMetadata,
+  encryptMetadata,
   unwrapFileKey,
 } from './crypto-encrypt-core.js';
 

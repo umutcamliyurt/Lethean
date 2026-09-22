@@ -177,6 +177,21 @@ export async function decryptMetadata(
   return JSON.parse(new TextDecoder().decode(unpadMetadataBytes(bytes))) as FileMeta;
 }
 
+export interface EncryptedMetadata {
+  encryptedMetadata: string;
+  metadataIv: string;
+}
+
+export async function encryptMetadata(
+  fileKeyRawBytes: Uint8Array,
+  meta: FileMeta
+): Promise<EncryptedMetadata> {
+  const fileKey = await importAesKey(fileKeyRawBytes, ['encrypt']);
+  const metadataBytes = padMetadataBytes(utf8(JSON.stringify(meta)));
+  const { iv, ciphertext } = await aesGcmEncrypt(fileKey, metadataBytes);
+  return { encryptedMetadata: toBase64(ciphertext), metadataIv: toBase64(iv) };
+}
+
 export async function decryptContent(
   fileKeyRawBytes: Uint8Array,
   contentIvB64: string,
