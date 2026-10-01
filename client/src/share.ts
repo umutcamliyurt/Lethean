@@ -3,6 +3,7 @@ import { lightbox } from './dom.js';
 import { fileKeyCache, metaCache } from './state.js';
 import { toBase64 } from './crypto-encrypt-core.js';
 import { icon, escapeHtml, showToast } from './utils.js';
+import { isTauri, resolveBaseUrl } from './platform.js';
 import type { FileRecord } from './types.js';
 
 
@@ -59,12 +60,19 @@ function closeShareModal(): void {
   lightbox.removeEventListener('click', onBackdropClick);
 }
 
+function shareBase(): string {
+  if (isTauri()) {
+    return `${resolveBaseUrl().replace(/\/+$/, '')}/`;
+  }
+  const basePath = window.location.pathname.replace(/[^/]*$/, '');
+  return `${window.location.origin}${basePath}`;
+}
+
 function buildShareUrl(shareToken: string, fileKeyRaw: Uint8Array, deleteToken?: string | null): string {
   const keyB64 = toBase64(fileKeyRaw);
-  const basePath = window.location.pathname.replace(/[^/]*$/, '');
   const parts = [`t=${encodeURIComponent(shareToken)}`, `k=${encodeURIComponent(keyB64)}`];
   if (deleteToken) parts.push(`d=${encodeURIComponent(deleteToken)}`);
-  return `${window.location.origin}${basePath}share.html#${parts.join('&')}`;
+  return `${shareBase()}share.html#${parts.join('&')}`;
 }
 
 const DOWNLOAD_COUNT_PRESETS = [1, 5, 10, 25];
