@@ -132,6 +132,7 @@ textarea[readonly] { color: var(--faint); background: var(--surface-2); }
   margin-bottom: 32px;
 }
 .wordmark svg { flex-shrink: 0; color: var(--text); }
+.wordmark img { flex-shrink: 0; display: block; object-fit: contain; }
 .wordmark span {
   font-size: 0.95rem;
   font-weight: 600;

@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="logo.jpg" width="100" />
+<img src="logo.png" width="75" />
 
 ## Anonymous Zero-Knowledge Encrypted Cloud Storage
 

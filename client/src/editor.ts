@@ -107,18 +107,144 @@ function insertHr(textarea: HTMLTextAreaElement): void {
   dispatchInput(textarea);
 }
 
+function insertTable(textarea: HTMLTextAreaElement): void {
+  const start = textarea.selectionStart;
+  const end = textarea.selectionEnd;
+  const lead = start > 0 && textarea.value[start - 1] !== '\n' ? '\n\n' : '';
+  const header = 'Column 1';
+  const table = `${lead}| ${header} | Column 2 | Column 3 |\n| --- | --- | --- |\n|  |  |  |\n`;
+  textarea.focus();
+  textarea.setRangeText(table, start, end, 'end');
+  const selStart = start + lead.length + 2;
+  textarea.setSelectionRange(selStart, selStart + header.length);
+  dispatchInput(textarea);
+}
+
+function toggleTaskList(textarea: HTMLTextAreaElement): void {
+  const { lineStart, lineEnd } = currentLineRange(textarea);
+  const lines = textarea.value.slice(lineStart, lineEnd).split('\n');
+  const task = /^(\s*)- \[[ xX]\] /;
+  const nonBlank = lines.filter((l) => l.trim() !== '');
+  const allTasks = nonBlank.length > 0 && nonBlank.every((l) => task.test(l));
+  const next = lines.map((l) => {
+    if (l.trim() === '') return l;
+    if (allTasks) return l.replace(task, '$1');
+    const m = l.match(/^(\s*)(?:[-*+]|\d+[.)])\s+(.*)$/);
+    return m ? `${m[1]}- [ ] ${m[2]}` : `- [ ] ${l}`;
+  });
+  textarea.focus();
+  textarea.setRangeText(next.join('\n'), lineStart, lineEnd, 'end');
+  dispatchInput(textarea);
+}
+
+function cycleHeading(textarea: HTMLTextAreaElement): void {
+  const { lineStart, lineEnd } = currentLineRange(textarea);
+  const lines = textarea.value.slice(lineStart, lineEnd).split('\n');
+  const next = lines.map((l) => {
+    if (l.trim() === '') return l;
+    const m = l.match(/^(#{1,6})\s+(.*)$/);
+    if (!m) return `## ${l}`;
+    const level = m[1]!.length;
+    return level >= 4 ? m[2]! : `${'#'.repeat(level + 1)} ${m[2]}`;
+  });
+  textarea.focus();
+  textarea.setRangeText(next.join('\n'), lineStart, lineEnd, 'end');
+  dispatchInput(textarea);
+}
+
 const MARKDOWN_ACTIONS: Record<string, (textarea: HTMLTextAreaElement) => void> = {
   bold: (t) => wrapSelection(t, '**', '**', 'bold text'),
   italic: (t) => wrapSelection(t, '_', '_', 'italic text'),
   strike: (t) => wrapSelection(t, '~~', '~~', 'strikethrough'),
-  heading: (t) => toggleLinePrefix(t, '## '),
+  heading: cycleHeading,
   quote: (t) => toggleLinePrefix(t, '> '),
   code: insertCode,
   link: insertLink,
   bullet: (t) => toggleLinePrefix(t, '- '),
   numbered: toggleNumberedList,
+  task: toggleTaskList,
+  table: insertTable,
   hr: insertHr,
 };
+
+const LIST_LINE = /^(\s*)([-*+]|\d+[.)])(\s+)(\[[ xX]\]\s+)?/;
+
+function indentSelectedLines(textarea: HTMLTextAreaElement, outdent: boolean): void {
+  const { lineStart, lineEnd } = currentLineRange(textarea);
+  const lines = textarea.value.slice(lineStart, lineEnd).split('\n');
+  const next = lines.map((l) => {
+    if (!outdent) return l.trim() === '' ? l : '  ' + l;
+    return l.replace(/^( {1,2}|\t)/, '');
+  });
+  textarea.focus();
+  textarea.setRangeText(next.join('\n'), lineStart, lineEnd, 'select');
+  dispatchInput(textarea);
+}
+
+function handleEnter(textarea: HTMLTextAreaElement, e: KeyboardEvent): void {
+  if (e.shiftKey || e.altKey || e.ctrlKey || e.metaKey || e.isComposing) return;
+  if (textarea.selectionStart !== textarea.selectionEnd) return;
+  const pos = textarea.selectionStart;
+  const lineStart = textarea.value.lastIndexOf('\n', pos - 1) + 1;
+  const before = textarea.value.slice(lineStart, pos);
+
+  const quote = before.match(/^(\s*(?:>\s?)+)(.*)$/);
+  const list = before.match(LIST_LINE);
+  if (!list && !quote) return;
+
+  e.preventDefault();
+  if (list) {
+    const rest = before.slice(list[0].length);
+    if (rest.trim() === '') {
+      textarea.setRangeText('', lineStart, pos, 'end');
+    } else {
+      const marker = list[2]!;
+      const nextMarker = /^\d/.test(marker) ? `${parseInt(marker, 10) + 1}${marker.slice(-1)}` : marker;
+      const task = list[4] ? '[ ] ' : '';
+      textarea.setRangeText(`\n${list[1]}${nextMarker}${list[3]}${task}`, pos, pos, 'end');
+    }
+  } else if (quote) {
+    if (quote[2]!.trim() === '') textarea.setRangeText('', lineStart, pos, 'end');
+    else textarea.setRangeText(`\n${quote[1]}`, pos, pos, 'end');
+  }
+  dispatchInput(textarea);
+}
+
+function handleEditorKeydown(textarea: HTMLTextAreaElement, e: KeyboardEvent): void {
+  if (e.isComposing) return;
+  const mod = e.ctrlKey || e.metaKey;
+
+  if (mod && !e.altKey) {
+    const key = e.key.toLowerCase();
+    if (key === 'b' && !e.shiftKey) { e.preventDefault(); MARKDOWN_ACTIONS.bold!(textarea); return; }
+    if (key === 'i' && !e.shiftKey) { e.preventDefault(); MARKDOWN_ACTIONS.italic!(textarea); return; }
+    if (key === 'k' && !e.shiftKey) { e.preventDefault(); MARKDOWN_ACTIONS.link!(textarea); return; }
+    if (key === 'x' && e.shiftKey) { e.preventDefault(); MARKDOWN_ACTIONS.strike!(textarea); return; }
+    return;
+  }
+
+  if (e.key === 'Enter') { handleEnter(textarea, e); return; }
+
+  if (e.key === 'Tab' && !mod && !e.altKey) {
+    const multiLine = textarea.value.slice(textarea.selectionStart, textarea.selectionEnd).includes('\n');
+    const { lineStart } = currentLineRange(textarea);
+    const onListLine = LIST_LINE.test(textarea.value.slice(lineStart, textarea.selectionStart));
+    if (multiLine || onListLine) {
+      e.preventDefault();
+      indentSelectedLines(textarea, e.shiftKey);
+    }
+  }
+}
+
+function handlePasteUrl(textarea: HTMLTextAreaElement, e: ClipboardEvent): void {
+  const text = e.clipboardData?.getData('text/plain')?.trim() ?? '';
+  const { selectionStart: s, selectionEnd: end } = textarea;
+  if (s === end || !/^https?:\/\/\S+$/i.test(text)) return;
+  e.preventDefault();
+  const label = textarea.value.slice(s, end);
+  textarea.setRangeText(`[${label}](${text})`, s, end, 'end');
+  dispatchInput(textarea);
+}
 
 const ALLOWED_LINK_PROTOCOLS = /^(https?:|mailto:)/i;
 const HAS_CONTROL_OR_MARKUP_CHARS = /[\x00-\x1f\x7f<>`]/;
@@ -130,67 +256,179 @@ function sanitizeHref(escapedUrl: string): string | null {
   return trimmed;
 }
 
-function renderInline(escapedText: string): string {
-  const codeSpans: string[] = [];
-  let text = escapedText.replace(/`([^`\n]+)`/g, (_m, code: string) => {
-    codeSpans.push(`<code>${code}</code>`);
-    return `\u0000${codeSpans.length - 1}\u0000`;
-  });
-
-  text = text.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (_m, label: string, url: string) => {
-    const href = sanitizeHref(url);
-    return href ? `<a href="${href}" target="_blank" rel="noopener noreferrer nofollow">${label}</a>` : `${label} (${url})`;
-  });
-
-  text = text
+function renderEmphasis(text: string): string {
+  return text
+    .replace(/\*\*\*([^*\n]+)\*\*\*/g, '<strong><em>$1</em></strong>')
     .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
     .replace(/__([^_\n]+)__/g, '<strong>$1</strong>')
     .replace(/~~([^~\n]+)~~/g, '<del>$1</del>')
+    .replace(/==([^=\n]+)==/g, '<mark>$1</mark>')
     .replace(/\*([^*\n]+)\*/g, '<em>$1</em>')
     .replace(/(^|[^\w])_([^_\n]+)_(?!\w)/g, '$1<em>$2</em>');
+}
 
-  return text.replace(/\u0000(\d+)\u0000/g, (_m, idx: string) => codeSpans[Number(idx)] ?? '');
+function renderInline(escapedText: string): string {
+  const stash: string[] = [];
+  const hold = (html: string): string => {
+    stash.push(html);
+    return `\u0000${stash.length - 1}\u0000`;
+  };
+  const anchor = (href: string, labelHtml: string): string =>
+    hold(`<a href="${href}" target="_blank" rel="noopener noreferrer nofollow">${labelHtml}</a>`);
+
+  let text = escapedText.replace(/`([^`\n]+)`/g, (_m, code: string) => hold(`<code>${code}</code>`));
+
+  text = text.replace(/\\([\\*_{}\[\]()#+\-.!|~=])/g, (_m, ch: string) => hold(ch));
+
+  text = text.replace(/!\[([^\]\n]*)\]\(([^)\s]+)(?:\s+&quot;[^)]*&quot;)?\)/g, (_m, alt: string, url: string) => {
+    const href = sanitizeHref(url);
+    const label = alt || 'image';
+    return href ? anchor(href, `\u{1F5BC} ${label}`) : `${label} (${url})`;
+  });
+
+  text = text.replace(/\[([^\]\n]+)\]\(([^)\s]+)(?:\s+&quot;[^)]*&quot;)?\)/g, (_m, label: string, url: string) => {
+    const href = sanitizeHref(url);
+    return href ? anchor(href, renderEmphasis(label)) : `${label} (${url})`;
+  });
+
+  text = text.replace(/&lt;((?:https?:\/\/|mailto:)[^\s]+?)&gt;/gi, (_m, url: string) => {
+    const href = sanitizeHref(url);
+    return href ? anchor(href, url) : _m;
+  });
+
+  text = text.replace(/(^|[\s(])(https?:\/\/[^\s\u0000]*[^\s\u0000.,;:!?)'])/gi, (_m, pre: string, url: string) => {
+    const href = sanitizeHref(url);
+    return href ? `${pre}${anchor(href, url)}` : _m;
+  });
+
+  text = renderEmphasis(text);
+
+  for (let pass = 0; pass < 3 && text.includes('\u0000'); pass++) {
+    text = text.replace(/\u0000(\d+)\u0000/g, (_m, idx: string) => stash[Number(idx)] ?? '');
+  }
+  return text;
 }
 
 const MARKDOWN_PREVIEW_MAX_CHARS = 2 * 1024 * 1024;
+const LIST_ITEM_RE = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
+const TABLE_DELIM_RE = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
+const FENCE_RE = /^\s{0,3}(`{3,}|~{3,})\s*([\w+#.-]*)[^`]*$/;
+const MAX_NESTING = 20;
 
-export function renderMarkdownPreview(source: string): string {
-  if (source.length > MARKDOWN_PREVIEW_MAX_CHARS) {
-    return '<p class="editor-preview-empty">This document is too large to preview here. It will still save and open normally.</p>';
+function splitTableRow(line: string): string[] {
+  let s = line.trim();
+  if (s.startsWith('|')) s = s.slice(1);
+  if (s.endsWith('|') && !s.endsWith('\\|')) s = s.slice(0, -1);
+  return s.split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, '|'));
+}
+
+function renderList(lines: string[], start: number, depth: number): { html: string; next: number } {
+  const first = LIST_ITEM_RE.exec(lines[start]!)!;
+  const baseIndent = first[1]!.length;
+  const ordered = /^\d/.test(first[2]!);
+  const items: string[] = [];
+  let hasTask = false;
+  let i = start;
+
+  while (i < lines.length) {
+    const m = LIST_ITEM_RE.exec(lines[i]!);
+    if (!m) break;
+    const indent = m[1]!.length;
+    if (indent !== baseIndent && !(indent < baseIndent + 2 && indent > baseIndent)) break;
+    if (/^\d/.test(m[2]!) !== ordered) break;
+
+    let content = m[3]!;
+    let checkbox = '';
+    const task = content.match(/^\[([ xX])\]\s+(.*)$/);
+    if (task) {
+      hasTask = true;
+      checkbox = `<input type="checkbox" disabled${task[1] !== ' ' ? ' checked' : ''}> `;
+      content = task[2]!;
+    }
+    let body = renderInline(content);
+    let nested = '';
+    i++;
+
+    while (i < lines.length) {
+      const line = lines[i]!;
+      const nm = LIST_ITEM_RE.exec(line);
+      const lead = line.length - line.trimStart().length;
+      if (nm && nm[1]!.length >= baseIndent + 2 && depth < MAX_NESTING) {
+        const sub = renderList(lines, i, depth + 1);
+        nested += sub.html;
+        i = sub.next;
+        continue;
+      }
+      if (!nm && line.trim() !== '' && lead > baseIndent) {
+        body += '<br>' + renderInline(line.trim());
+        i++;
+        continue;
+      }
+      break;
+    }
+    items.push(`<li${task ? ' class="task-list-item"' : ''}>${checkbox}${body}${nested}</li>`);
   }
-  const lines = source.replace(/\r\n?/g, '\n').split('\n').map(escapeHtml);
+
+  const tag = ordered ? 'ol' : 'ul';
+  const startNum = ordered ? parseInt(first[2]!, 10) : 1;
+  const attrs = (ordered && startNum !== 1 ? ` start="${startNum}"` : '') + (hasTask ? ' class="task-list"' : '');
+  return { html: `<${tag}${attrs}>${items.join('')}</${tag}>`, next: i };
+}
+
+function renderBlocks(lines: string[], depth: number): string[] {
   const out: string[] = [];
   let paragraph: string[] = [];
+  let rawParagraph: string[] = [];
   let i = 0;
 
   const flushParagraph = (): void => {
     if (paragraph.length) {
       out.push(`<p>${paragraph.join('<br>')}</p>`);
       paragraph = [];
+      rawParagraph = [];
     }
   };
 
   while (i < lines.length) {
     const line = lines[i]!;
 
-    if (/^```/.test(line)) {
+    const fence = FENCE_RE.exec(line);
+    if (fence) {
       flushParagraph();
+      const marker = fence[1]!;
+      const lang = fence[2]!.replace(/[^\w+#.-]/g, '');
       const code: string[] = [];
       i++;
-      while (i < lines.length && !/^```\s*$/.test(lines[i]!)) { code.push(lines[i]!); i++; }
+      while (i < lines.length) {
+        const close = lines[i]!.trim();
+        if (close.startsWith(marker[0]!.repeat(marker.length)) && /^(`+|~+)$/.test(close)) break;
+        code.push(lines[i]!);
+        i++;
+      }
       i++;
-      out.push(`<pre><code>${code.join('\n')}</code></pre>`);
+      const cls = lang ? ` class="language-${lang}"` : '';
+      out.push(`<pre${lang ? ` data-lang="${lang}"` : ''}><code${cls}>${code.join('\n')}</code></pre>`);
       continue;
     }
 
-    if (/^(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
+    if (rawParagraph.length && /^\s*(=+|-+)\s*$/.test(line)) {
+      const level = line.trim().startsWith('=') ? 1 : 2;
+      const html = renderInline(rawParagraph.join(' '));
+      paragraph = [];
+      rawParagraph = [];
+      out.push(`<h${level}>${html}</h${level}>`);
+      i++;
+      continue;
+    }
+
+    if (/^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(line)) {
       flushParagraph();
       out.push('<hr>');
       i++;
       continue;
     }
 
-    const heading = line.match(/^(#{1,6})\s+(.*)$/);
+    const heading = line.match(/^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+)?\s*$/);
     if (heading) {
       flushParagraph();
       const level = heading[1]!.length;
@@ -199,59 +437,92 @@ export function renderMarkdownPreview(source: string): string {
       continue;
     }
 
-    if (/^&gt;\s?/.test(line)) {
+    if (/^\s{0,3}&gt;/.test(line)) {
       flushParagraph();
       const quote: string[] = [];
-      while (i < lines.length && /^&gt;\s?/.test(lines[i]!)) { quote.push(lines[i]!.replace(/^&gt;\s?/, '')); i++; }
-      out.push(`<blockquote>${quote.map((l) => `<p>${renderInline(l)}</p>`).join('')}</blockquote>`);
+      while (i < lines.length && /^\s{0,3}&gt;/.test(lines[i]!)) {
+        quote.push(lines[i]!.replace(/^\s{0,3}&gt;\s?/, ''));
+        i++;
+      }
+      const inner = depth < MAX_NESTING ? renderBlocks(quote, depth + 1).join('') : quote.map((l) => `<p>${renderInline(l)}</p>`).join('');
+      out.push(`<blockquote>${inner}</blockquote>`);
       continue;
     }
 
-    if (/^[-*]\s+/.test(line)) {
-      flushParagraph();
-      const items: string[] = [];
-      while (i < lines.length && /^[-*]\s+/.test(lines[i]!)) { items.push(lines[i]!.replace(/^[-*]\s+/, '')); i++; }
-      out.push(`<ul>${items.map((it) => `<li>${renderInline(it)}</li>`).join('')}</ul>`);
-      continue;
+    if (line.includes('|') && i + 1 < lines.length && lines[i + 1]!.includes('-') && TABLE_DELIM_RE.test(lines[i + 1]!)) {
+      const headers = splitTableRow(line);
+      const aligns = splitTableRow(lines[i + 1]!).map((c) => {
+        const l = c.startsWith(':');
+        const r = c.endsWith(':');
+        return l && r ? 'center' : r ? 'right' : l ? 'left' : '';
+      });
+      if (headers.length === aligns.length) {
+        flushParagraph();
+        const cell = (tag: string, text: string, idx: number): string =>
+          `<${tag}${aligns[idx] ? ` style="text-align:${aligns[idx]}"` : ''}>${renderInline(text)}</${tag}>`;
+        const rows: string[] = [];
+        i += 2;
+        while (i < lines.length && lines[i]!.trim() !== '' && lines[i]!.includes('|')) {
+          const cells = splitTableRow(lines[i]!);
+          rows.push(`<tr>${headers.map((_h, idx) => cell('td', cells[idx] ?? '', idx)).join('')}</tr>`);
+          i++;
+        }
+        out.push(
+          `<div class="editor-table-wrap"><table><thead><tr>${headers.map((h, idx) => cell('th', h, idx)).join('')}</tr></thead>` +
+          `<tbody>${rows.join('')}</tbody></table></div>`,
+        );
+        continue;
+      }
     }
 
-    if (/^\d+\.\s+/.test(line)) {
+    if (LIST_ITEM_RE.test(line)) {
       flushParagraph();
-      const items: string[] = [];
-      while (i < lines.length && /^\d+\.\s+/.test(lines[i]!)) { items.push(lines[i]!.replace(/^\d+\.\s+/, '')); i++; }
-      out.push(`<ol>${items.map((it) => `<li>${renderInline(it)}</li>`).join('')}</ol>`);
+      const list = renderList(lines, i, 0);
+      out.push(list.html);
+      i = list.next;
       continue;
     }
 
     if (line.trim() === '') { flushParagraph(); i++; continue; }
 
+    rawParagraph.push(line);
     paragraph.push(renderInline(line));
     i++;
   }
 
   flushParagraph();
-  return out.join('\n') || '<p class="editor-preview-empty">Nothing to preview yet.</p>';
+  return out;
 }
 
-const TOOLBAR_BUTTONS: Array<{ action: string; icon: string; label: string } | 'sep'> = [
+export function renderMarkdownPreview(source: string): string {
+  if (source.length > MARKDOWN_PREVIEW_MAX_CHARS) {
+    return '<p class="editor-preview-empty">This document is too large to preview here. It will still save and open normally.</p>';
+  }
+  const lines = source.replace(/\r\n?/g, '\n').replace(/^\t+/gm, (t) => '    '.repeat(t.length)).split('\n').map(escapeHtml);
+  return renderBlocks(lines, 0).join('\n') || '<p class="editor-preview-empty">Nothing to preview yet.</p>';
+}
+
+const TOOLBAR_BUTTONS: Array<{ action: string; icon: string; label: string; text?: string } | 'sep'> = [
   { action: 'bold', icon: 'mdBold', label: 'Bold' },
   { action: 'italic', icon: 'mdItalic', label: 'Italic' },
   { action: 'strike', icon: 'mdStrike', label: 'Strikethrough' },
   'sep',
-  { action: 'heading', icon: 'mdHeading', label: 'Heading' },
+  { action: 'heading', icon: 'mdHeading', label: 'Heading (click again for next level)' },
   { action: 'quote', icon: 'mdQuote', label: 'Quote' },
   { action: 'code', icon: 'mdCode', label: 'Code' },
   'sep',
   { action: 'link', icon: 'mdLink', label: 'Link' },
   { action: 'bullet', icon: 'mdListBullet', label: 'Bulleted list' },
   { action: 'numbered', icon: 'mdListNumbered', label: 'Numbered list' },
+  { action: 'task', icon: '', label: 'Task list', text: '\u2611' },
+  { action: 'table', icon: '', label: 'Table', text: '\u25A6' },
   { action: 'hr', icon: 'mdHr', label: 'Horizontal rule' },
 ];
 
 function toolbarHtml(): string {
   return TOOLBAR_BUTTONS.map((btn) => {
     if (btn === 'sep') return '<span class="editor-toolbar-sep"></span>';
-    return `<button type="button" class="btn-icon" data-md="${btn.action}" title="${btn.label}" aria-label="${btn.label}">${icon(btn.icon)}</button>`;
+    return `<button type="button" class="btn-icon" data-md="${btn.action}" title="${btn.label}" aria-label="${btn.label}">${btn.text ? `<span aria-hidden="true">${btn.text}</span>` : icon(btn.icon)}</button>`;
   }).join('');
 }
 
@@ -333,6 +604,9 @@ function renderEditorPanel(opts: EditorPanelOptions): void {
   };
   tabWrite.addEventListener('click', () => setMode('write'));
   tabPreview.addEventListener('click', () => setMode('preview'));
+
+  textarea.addEventListener('keydown', (e) => handleEditorKeydown(textarea, e));
+  textarea.addEventListener('paste', (e) => handlePasteUrl(textarea, e));
 
   toolbar.addEventListener('click', (e) => {
     const btn = (e.target as HTMLElement).closest<HTMLButtonElement>('button[data-md]');
