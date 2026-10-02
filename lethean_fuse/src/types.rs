@@ -1,4 +1,3 @@
-
 use serde::{Deserialize, Serialize};
 
 pub const FOLDER_MIME: &str = "application/x-lethean-folder";
@@ -55,6 +54,15 @@ pub struct FileRecord {
 }
 
 #[derive(Debug, Clone)]
+pub struct EncryptedHeader {
+    pub content_iv: String,
+    pub encrypted_metadata: String,
+    pub metadata_iv: String,
+    pub wrapped_file_key: String,
+    pub wrap_iv: String,
+}
+
+#[derive(Debug, Clone)]
 pub struct EncryptedFilePayload {
     pub ciphertext: Vec<u8>,
     pub content_iv: String,
@@ -62,6 +70,18 @@ pub struct EncryptedFilePayload {
     pub metadata_iv: String,
     pub wrapped_file_key: String,
     pub wrap_iv: String,
+}
+
+impl EncryptedFilePayload {
+    pub fn header(&self) -> EncryptedHeader {
+        EncryptedHeader {
+            content_iv: self.content_iv.clone(),
+            encrypted_metadata: self.encrypted_metadata.clone(),
+            metadata_iv: self.metadata_iv.clone(),
+            wrapped_file_key: self.wrapped_file_key.clone(),
+            wrap_iv: self.wrap_iv.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

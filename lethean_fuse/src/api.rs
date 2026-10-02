@@ -1,5 +1,5 @@
 
-use std::io::{Read, Write as _};
+use std::io::{self, Cursor, Read, Write as _};
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -9,11 +9,12 @@ use rand::RngCore;
 use serde::Deserialize;
 use zeroize::Zeroize;
 
-use crate::types::{EncryptedFilePayload, FileRecord, UsageResponse};
+use crate::types::{EncryptedFilePayload, EncryptedHeader, FileRecord, UsageResponse};
 
 pub struct ApiClient {
     base_url: String,
     agent: ureq::Agent,
+    stream_agent: ureq::Agent,
     vault_id: RwLock<Option<String>>,
     access_token: RwLock<Option<String>>,
 }
@@ -70,20 +71,40 @@ fn multipart_boundary() -> String {
     format!("----vaultcli{}", hex::encode(buf))
 }
 
-fn build_multipart(text_fields: &[(&str, &str)], file_field: &str, file_name: &str, file_bytes: &[u8]) -> (String, Vec<u8>) {
-    let boundary = multipart_boundary();
-
-    let estimated_len = text_fields.iter().map(|(k, v)| k.len() + v.len() + 64).sum::<usize>() + file_field.len() + file_name.len() + file_bytes.len() + 128;
-    let mut body = Vec::with_capacity(estimated_len);
-
+fn multipart_head(boundary: &str, text_fields: &[(&str, &str)], file_field: &str, file_name: &str) -> Vec<u8> {
+    let mut head = Vec::with_capacity(text_fields.iter().map(|(k, v)| k.len() + v.len() + 64).sum::<usize>() + file_field.len() + file_name.len() + 128);
     for (name, value) in text_fields {
-        let _ = write!(body, "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n");
+        let _ = write!(head, "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n");
     }
-    let _ = write!(body, "--{boundary}\r\nContent-Disposition: form-data; name=\"{file_field}\"; filename=\"{file_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n");
-    body.extend_from_slice(file_bytes);
-    body.extend_from_slice(b"\r\n");
-    let _ = write!(body, "--{boundary}--\r\n");
-    (boundary, body)
+    let _ = write!(head, "--{boundary}\r\nContent-Disposition: form-data; name=\"{file_field}\"; filename=\"{file_name}\"\r\nContent-Type: application/octet-stream\r\n\r\n");
+    head
+}
+
+fn multipart_tail(boundary: &str) -> Vec<u8> {
+    format!("\r\n--{boundary}--\r\n").into_bytes()
+}
+
+fn header_fields(h: &EncryptedHeader) -> [(&'static str, &str); 5] {
+    [
+        ("content_iv", h.content_iv.as_str()),
+        ("encrypted_metadata", h.encrypted_metadata.as_str()),
+        ("metadata_iv", h.metadata_iv.as_str()),
+        ("wrapped_file_key", h.wrapped_file_key.as_str()),
+        ("wrap_iv", h.wrap_iv.as_str()),
+    ]
+}
+
+fn build_agent(overall_timeout: Option<Duration>) -> ureq::Agent {
+    let mut b = ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(90))
+        .timeout_write(Duration::from_secs(90))
+        .max_idle_connections(64)
+        .max_idle_connections_per_host(32);
+    if let Some(t) = overall_timeout {
+        b = b.timeout(t);
+    }
+    b.build()
 }
 
 mod retry {
@@ -163,13 +184,13 @@ use retry::AttemptError;
 
 impl ApiClient {
     pub fn new(base_url: String) -> Result<Self> {
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(15))
-            .timeout_read(Duration::from_secs(90))
-            .timeout_write(Duration::from_secs(90))
-            .timeout(Duration::from_secs(180))
-            .build();
-        Ok(Self { base_url: base_url.trim_end_matches('/').to_string(), agent, vault_id: RwLock::new(None), access_token: RwLock::new(None) })
+        Ok(Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            agent: build_agent(Some(Duration::from_secs(180))),
+            stream_agent: build_agent(None),
+            vault_id: RwLock::new(None),
+            access_token: RwLock::new(None),
+        })
     }
 
     pub fn set_vault_id(&self, id: Option<String>) {
@@ -198,28 +219,31 @@ impl ApiClient {
     }
 
     pub fn upload_file(&self, encrypted: &EncryptedFilePayload, vault_id_override: Option<&str>, access_token_override: Option<&str>) -> Result<FileRecord> {
+        let body: &[u8] = &encrypted.ciphertext;
+        self.upload_stream(&encrypted.header(), body.len() as u64, || Ok(Box::new(Cursor::new(body)) as Box<dyn Read + '_>), vault_id_override, access_token_override)
+    }
+
+    pub fn upload_stream<'a, F>(&self, header: &EncryptedHeader, body_len: u64, mut make_body: F, vault_id_override: Option<&str>, access_token_override: Option<&str>) -> Result<FileRecord>
+    where
+        F: FnMut() -> io::Result<Box<dyn Read + 'a>>,
+    {
         let token = access_token_override.map(|s| s.to_string()).or_else(|| self.access_token.read().unwrap().clone());
 
-        let (boundary, body) = build_multipart(
-            &[
-                ("content_iv", &encrypted.content_iv),
-                ("encrypted_metadata", &encrypted.encrypted_metadata),
-                ("metadata_iv", &encrypted.metadata_iv),
-                ("wrapped_file_key", &encrypted.wrapped_file_key),
-                ("wrap_iv", &encrypted.wrap_iv),
-            ],
-            "blob",
-            "blob",
-            &encrypted.ciphertext,
-        );
+        let boundary = multipart_boundary();
+        let head = multipart_head(&boundary, &header_fields(header), "blob", "blob");
+        let tail = multipart_tail(&boundary);
+        let total_len = head.len() as u64 + body_len + tail.len() as u64;
+        let content_type = format!("multipart/form-data; boundary={boundary}");
 
         retry::run("Upload failed", || {
-            let mut req = self.agent.post(&self.url("/files")).set("Content-Type", &format!("multipart/form-data; boundary={boundary}"));
+            let body = make_body().map_err(AttemptError::from)?;
+            let reader = Cursor::new(&head[..]).chain(body).chain(Cursor::new(&tail[..]));
+            let mut req = self.stream_agent.post(&self.url("/files")).set("Content-Type", &content_type).set("Content-Length", &total_len.to_string());
             req = self.with_auth(req, vault_id_override);
             if let Some(t) = &token {
                 req = req.set("X-Access-Token", t);
             }
-            let resp = req.send_bytes(&body).map_err(AttemptError::from)?;
+            let resp = req.send(reader).map_err(AttemptError::from)?;
             resp.into_json::<FileRecord>().map_err(AttemptError::from)
         })
     }
@@ -253,6 +277,16 @@ impl ApiClient {
             let req = self.with_auth(self.agent.get(&self.url(&format!("/files/{file_id}/blob"))), None);
             let resp = req.call().map_err(AttemptError::from)?;
             Ok(read_body_bytes(resp)?)
+        })
+    }
+
+    pub fn open_blob(&self, file_id: &str) -> Result<(Box<dyn Read + Send + Sync + 'static>, Option<u64>)> {
+        assert_safe_id(file_id)?;
+        retry::run("Download failed", || {
+            let req = self.with_auth(self.stream_agent.get(&self.url(&format!("/files/{file_id}/blob"))), None);
+            let resp = req.call().map_err(AttemptError::from)?;
+            let len = resp.header("Content-Length").and_then(|v| v.trim().parse::<u64>().ok());
+            Ok((resp.into_reader(), len))
         })
     }
 

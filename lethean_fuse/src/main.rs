@@ -39,6 +39,10 @@ enum Command {
         mountpoint: PathBuf,
         #[arg(long)]
         allow_other: bool,
+        #[arg(long)]
+        scratch_dir: Option<PathBuf>,
+        #[arg(long, default_value_t = 64)]
+        scratch_ram_mib: u64,
     },
     Usage,
     Tree,
@@ -119,7 +123,7 @@ fn prompt_hidden(label: &str) -> Result<String> {
 }
 
 fn resolve_server(cli: &Cli, config: &Config) -> Result<String> {
-    cli.server.clone().or_else(|| config.server_url.clone()).context("no server URL configured — pass --server or run `lethean-cli config set-server <url>`")
+    cli.server.clone().or_else(|| config.server_url.clone()).context("no server URL configured, pass --server or run `lethean-cli config set-server <url>`")
 }
 
 fn resolve_access_token(cli: &Cli, config: &Config) -> Option<String> {
@@ -180,7 +184,7 @@ fn cleanup_stale_mount(path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    eprintln!("Found a stale mount at {} (likely left behind by a previous run that didn't exit cleanly) — unmounting it first…", path.display());
+    eprintln!("Found a stale mount at {} (likely left behind by a previous run that didn't exit cleanly), unmounting it first…", path.display());
     let unmounted = ["fusermount3", "fusermount", "umount"].iter().any(|cmd| OsCommand::new(cmd).arg("-u").arg(path).status().map(|s| s.success()).unwrap_or(false));
     if !unmounted {
         bail!(
@@ -198,11 +202,11 @@ fn cleanup_stale_mount(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn cmd_mount(cli: &Cli, config: &Config, mountpoint: PathBuf, allow_other: bool) -> Result<()> {
+fn cmd_mount(cli: &Cli, config: &Config, mountpoint: PathBuf, allow_other: bool, fs_options: fuse_fs::FsOptions) -> Result<()> {
     cleanup_stale_mount(&mountpoint)?;
 
     let vault = unlock_session(cli, config)?;
-    let mut fs = fuse_fs::VaultFs::new(vault);
+    let mut fs = fuse_fs::VaultFs::with_options(vault, fs_options);
     fs.refresh()?;
 
     let mut options = vec![fuser::MountOption::FSName("e2ee-vault".to_string()), fuser::MountOption::DefaultPermissions];
@@ -210,8 +214,8 @@ fn cmd_mount(cli: &Cli, config: &Config, mountpoint: PathBuf, allow_other: bool)
         options.push(fuser::MountOption::AllowOther);
     }
 
-    println!("Mounted at {} — Ctrl+C to unmount.", mountpoint.display());
-    fuser::mount2(fs, &mountpoint, &options).context("FUSE mount failed — if this persists, try `fusermount -u <mountpoint>` first")?;
+    println!("Mounted at {}, Ctrl+C to unmount.", mountpoint.display());
+    fuser::mount2(fs, &mountpoint, &options).context("FUSE mount failed, if this persists, try `fusermount -u <mountpoint>` first")?;
     Ok(())
 }
 
@@ -305,7 +309,7 @@ fn cmd_rotate_password(cli: &Cli, config: &Config) -> Result<()> {
     let files_moved = vault.rotate_password(&new_unlocked.vault_id, &new_unlocked.wrapping_key_raw)?;
     new_unlocked.wrapping_key_raw.zeroize();
     println!("Password changed. {files_moved} file(s) re-wrapped under the new key.");
-    println!("(Remember: the vault password itself is never stored anywhere — only you know it.)");
+    println!("(Remember: the vault password itself is never stored anywhere, only you know it.)");
     vault.close();
     Ok(())
 }
@@ -338,7 +342,10 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Config { action } => cmd_config(action),
-        Command::Mount { ref mountpoint, allow_other } => cmd_mount(&cli, &config, mountpoint.clone(), allow_other),
+        Command::Mount { ref mountpoint, allow_other, ref scratch_dir, scratch_ram_mib } => {
+            let opts = fuse_fs::FsOptions { scratch_dir: scratch_dir.clone(), scratch_ram_bytes: scratch_ram_mib.max(1) * 1024 * 1024 };
+            cmd_mount(&cli, &config, mountpoint.clone(), allow_other, opts)
+        }
         Command::Usage => cmd_usage(&cli, &config),
         Command::Tree => cmd_tree(&cli, &config),
         Command::RotatePassword => cmd_rotate_password(&cli, &config),

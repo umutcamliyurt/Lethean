@@ -1,10 +1,10 @@
-use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::aead::{Aead, AeadInPlace, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
 use rand::RngCore;
 use std::io::{Read, Write};
-use zeroize::Zeroize;
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::types::{EncryptedFilePayload, FileMeta, FOLDER_MIME};
 
@@ -19,6 +19,9 @@ pub fn to_base64(bytes: &[u8]) -> String {
 }
 
 pub fn from_base64(s: &str) -> Result<Vec<u8>> {
+    if let Ok(v) = base64::engine::general_purpose::STANDARD.decode(s.as_bytes()) {
+        return Ok(v);
+    }
     let normalized: String = s.trim().chars().filter(|c| !c.is_whitespace()).collect();
     let normalized = normalized.replace('-', "+").replace('_', "/");
     base64::engine::general_purpose::STANDARD
@@ -34,7 +37,7 @@ pub fn to_hex(bytes: &[u8]) -> String {
 pub fn compress_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
     use flate2::write::GzEncoder;
     use flate2::Compression;
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::fast());
     encoder.write_all(bytes)?;
     Ok(encoder.finish()?)
 }
@@ -42,7 +45,7 @@ pub fn compress_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
 pub fn decompress_bytes(bytes: &[u8]) -> Result<Vec<u8>> {
     use flate2::read::GzDecoder;
     let mut decoder = GzDecoder::new(bytes);
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(bytes.len().saturating_mul(2));
     decoder.read_to_end(&mut out)?;
     Ok(out)
 }
@@ -52,6 +55,32 @@ pub fn maybe_compress(bytes: &[u8]) -> Result<(Vec<u8>, bool)> {
         Ok(compressed) if compressed.len() < bytes.len() => Ok((compressed, true)),
         _ => Ok((bytes.to_vec(), false)),
     }
+}
+
+pub fn is_incompressible_mime(mime: &str) -> bool {
+    let m = mime.to_ascii_lowercase();
+    if m.starts_with("video/") {
+        return true;
+    }
+    if m.starts_with("audio/") {
+        return !matches!(m.as_str(), "audio/wav" | "audio/x-wav" | "audio/wave" | "audio/aiff" | "audio/x-aiff");
+    }
+    if m.starts_with("image/") {
+        return matches!(m.as_str(), "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp" | "image/avif" | "image/heic" | "image/heif");
+    }
+    matches!(
+        m.as_str(),
+        "application/zip"
+            | "application/gzip"
+            | "application/x-gzip"
+            | "application/x-7z-compressed"
+            | "application/x-xz"
+            | "application/x-bzip2"
+            | "application/zstd"
+            | "application/x-rar-compressed"
+            | "application/vnd.rar"
+            | "application/java-archive"
+    ) || m.starts_with("application/vnd.openxmlformats-officedocument.")
 }
 
 pub const PADDING_BUCKETS: &[u64] = &[
@@ -84,6 +113,13 @@ pub fn pad_to_bucket(bytes: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; target];
     out[..bytes.len()].copy_from_slice(bytes);
     out
+}
+
+fn pad_owned_for_encryption(mut bytes: Vec<u8>) -> Vec<u8> {
+    let target = padded_size(bytes.len() as u64) as usize;
+    bytes.reserve_exact(target.saturating_sub(bytes.len()) + 16);
+    bytes.resize(target, 0);
+    bytes
 }
 
 pub fn strip_padding(bytes: &[u8], real_length: Option<u64>) -> Vec<u8> {
@@ -151,6 +187,15 @@ pub fn aes_gcm_encrypt(key_raw: &[u8], plaintext: &[u8]) -> Result<AesGcmEncrypt
     Ok(AesGcmEncryptResult { iv, ciphertext })
 }
 
+pub fn aes_gcm_encrypt_in_place(key_raw: &[u8], buf: &mut Vec<u8>) -> Result<Vec<u8>> {
+    let key = key_from_bytes(key_raw)?;
+    let cipher = Aes256Gcm::new(key);
+    let iv = random_bytes(12);
+    let nonce = Nonce::from_slice(&iv);
+    cipher.encrypt_in_place(nonce, &[], buf).map_err(|_| anyhow!("AES-GCM encryption failed"))?;
+    Ok(iv)
+}
+
 pub fn aes_gcm_decrypt(key_raw: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
     let key = key_from_bytes(key_raw)?;
     let cipher = Aes256Gcm::new(key);
@@ -160,6 +205,18 @@ pub fn aes_gcm_decrypt(key_raw: &[u8], iv: &[u8], ciphertext: &[u8]) -> Result<V
     let nonce = Nonce::from_slice(iv);
     cipher
         .decrypt(nonce, Payload { msg: ciphertext, aad: &[] })
+        .map_err(|_| anyhow!("AES-GCM decryption failed (wrong key, or corrupted/tampered data)"))
+}
+
+pub fn aes_gcm_decrypt_in_place(key_raw: &[u8], iv: &[u8], buf: &mut Vec<u8>) -> Result<()> {
+    let key = key_from_bytes(key_raw)?;
+    let cipher = Aes256Gcm::new(key);
+    if iv.len() != 12 {
+        bail!("invalid AES-GCM nonce: expected 12 bytes, got {} (corrupted or malformed record)", iv.len());
+    }
+    let nonce = Nonce::from_slice(iv);
+    cipher
+        .decrypt_in_place(nonce, &[], buf)
         .map_err(|_| anyhow!("AES-GCM decryption failed (wrong key, or corrupted/tampered data)"))
 }
 
@@ -196,6 +253,29 @@ pub fn decrypt_content(
     }
 }
 
+pub fn decrypt_content_owned(
+    file_key_raw: &[u8],
+    content_iv_b64: &str,
+    mut buf: Vec<u8>,
+    compressed: bool,
+    unpadded_size: Option<u64>,
+) -> Result<Vec<u8>> {
+    let iv = from_base64(content_iv_b64)?;
+    aes_gcm_decrypt_in_place(file_key_raw, &iv, &mut buf)?;
+    if let Some(len) = unpadded_size {
+        if (len as usize) <= buf.len() {
+            buf.truncate(len as usize);
+        }
+    }
+    if compressed {
+        let out = decompress_bytes(&buf);
+        buf.zeroize();
+        out
+    } else {
+        Ok(buf)
+    }
+}
+
 pub fn encrypt_file(
     wrapping_key_raw: &[u8],
     name: &str,
@@ -205,10 +285,20 @@ pub fn encrypt_file(
 ) -> Result<EncryptedFilePayload> {
     let mut file_key_raw = generate_aes_key_raw();
 
-    let (mut content_bytes, compressed) = maybe_compress(contents)?;
+    let compressed_copy = if is_incompressible_mime(mime) {
+        None
+    } else {
+        match compress_bytes(contents) {
+            Ok(c) if c.len() < contents.len() => Some(c),
+            _ => None,
+        }
+    };
+    let (compressed, content_bytes) = match compressed_copy {
+        Some(c) => (true, c),
+        None => (false, contents.to_vec()),
+    };
     let unpadded_size = content_bytes.len() as u64;
-    let mut padded_content = pad_to_bucket(&content_bytes);
-    content_bytes.zeroize();
+    let mut padded_content = Zeroizing::new(pad_owned_for_encryption(content_bytes));
 
     let meta = FileMeta::new_file(name.to_string(), mime.to_string(), compressed, unpadded_size, parent_id.map(|s| s.to_string()));
     let mut metadata_json = serde_json::to_vec(&meta)?;
@@ -217,19 +307,60 @@ pub fn encrypt_file(
     let meta_enc = aes_gcm_encrypt(&file_key_raw, &metadata_bytes)?;
     metadata_bytes.zeroize();
 
-    let content_enc = aes_gcm_encrypt(&file_key_raw, &padded_content)?;
-    padded_content.zeroize();
+    let content_iv = aes_gcm_encrypt_in_place(&file_key_raw, &mut padded_content)?;
+    let ciphertext = std::mem::take(&mut *padded_content);
 
     let key_wrap = aes_gcm_encrypt(wrapping_key_raw, &file_key_raw)?;
     file_key_raw.zeroize();
 
     Ok(EncryptedFilePayload {
-        ciphertext: content_enc.ciphertext,
-        content_iv: to_base64(&content_enc.iv),
+        ciphertext,
+        content_iv: to_base64(&content_iv),
         encrypted_metadata: to_base64(&meta_enc.ciphertext),
         metadata_iv: to_base64(&meta_enc.iv),
         wrapped_file_key: to_base64(&key_wrap.ciphertext),
         wrap_iv: to_base64(&key_wrap.iv),
+    })
+}
+
+pub struct StreamUploadPlan {
+    pub file_key: Zeroizing<Vec<u8>>,
+    pub iv: Vec<u8>,
+    pub padded_len: u64,
+    pub header: crate::types::EncryptedHeader,
+}
+
+impl StreamUploadPlan {
+    pub fn body_len(&self) -> u64 {
+        crate::crypto::gcm_stream::GcmEncryptReader::<std::io::Empty>::encrypted_len(self.padded_len)
+    }
+}
+
+pub fn plan_stream_upload(wrapping_key_raw: &[u8], name: &str, mime: &str, plain_size: u64, parent_id: Option<&str>) -> Result<StreamUploadPlan> {
+    let file_key = Zeroizing::new(generate_aes_key_raw());
+    let iv = random_bytes(12);
+    let padded_len = crate::crypto::gcm_stream::padme(plain_size);
+
+    let meta = FileMeta::new_file(name.to_string(), mime.to_string(), false, plain_size, parent_id.map(|s| s.to_string()));
+    let mut metadata_json = serde_json::to_vec(&meta)?;
+    let mut metadata_bytes = pad_metadata_bytes(&metadata_json);
+    metadata_json.zeroize();
+    let meta_enc = aes_gcm_encrypt(&file_key, &metadata_bytes)?;
+    metadata_bytes.zeroize();
+
+    let key_wrap = aes_gcm_encrypt(wrapping_key_raw, &file_key)?;
+
+    Ok(StreamUploadPlan {
+        header: crate::types::EncryptedHeader {
+            content_iv: to_base64(&iv),
+            encrypted_metadata: to_base64(&meta_enc.ciphertext),
+            metadata_iv: to_base64(&meta_enc.iv),
+            wrapped_file_key: to_base64(&key_wrap.ciphertext),
+            wrap_iv: to_base64(&key_wrap.iv),
+        },
+        file_key,
+        iv,
+        padded_len,
     })
 }
 
