@@ -86,8 +86,45 @@ function selectAllVisible(): void {
   renderCurrentView();
 }
 
+function selectEverythingVisible(): void {
+  const shown = visibleRecords();
+  if (!shown.length) return;
+  if (!selectionMode) {
+    selectionMode = true;
+    selectToggleBtn?.classList.add('active');
+    selectToggleBtn?.setAttribute('aria-pressed', 'true');
+  }
+  for (const r of shown) selectedIds.add(r.id);
+  updateSelectionBar();
+  renderCurrentView();
+}
+
+function isTypingTarget(t: EventTarget | null): boolean {
+  const el = t as HTMLElement | null;
+  if (!el) return false;
+  return el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.tagName === 'SELECT' || el.isContentEditable;
+}
+
+document.addEventListener('keydown', (e) => {
+  if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || e.key.toLowerCase() !== 'a') return;
+  if (document.getElementById('app-screen')?.classList.contains('hidden')) return;
+  if (!document.getElementById('lightbox')?.classList.contains('hidden')) return;
+  if (isTypingTarget(e.target)) return;
+  e.preventDefault();
+  selectEverythingVisible();
+});
+
+function finishBulk(ids: Iterable<string>): void {
+  for (const id of ids) selectedIds.delete(id);
+  if (selectionMode && selectedIds.size === 0) setSelectionMode(false);
+  else { updateSelectionBar(); renderCurrentView(); }
+}
+
 async function handleDownloadSelected(): Promise<void> {
-  const ids = [...selectedIds];
+  await downloadIds([...selectedIds]);
+}
+
+async function downloadIds(ids: string[]): Promise<void> {
   if (!ids.length) return;
 
   const fileIds = new Set<string>();
@@ -117,7 +154,10 @@ async function handleDownloadSelected(): Promise<void> {
 }
 
 async function handleDeleteSelected(): Promise<void> {
-  const ids = [...selectedIds];
+  await deleteIds([...selectedIds]);
+}
+
+async function deleteIds(ids: string[]): Promise<void> {
   if (!ids.length) return;
 
   const allIds = new Set<string>();
@@ -143,15 +183,17 @@ async function handleDeleteSelected(): Promise<void> {
     }
   }
   records = records.filter((r) => !allIds.has(r.id));
-  setSelectionMode(false);
-  renderCurrentView();
+  finishBulk(allIds);
   scheduleUsageRefresh();
   if (failed) showToast(`Deleted ${allIds.size - failed} item(s); ${failed} failed.`, 'error');
   else showToast(allIds.size === 1 ? 'Deleted.' : `Deleted ${allIds.size} items.`);
 }
 
 async function handleMoveSelected(): Promise<void> {
-  const ids = [...selectedIds];
+  await moveIds([...selectedIds]);
+}
+
+async function moveIds(ids: string[]): Promise<void> {
   if (!ids.length) return;
   await openMovePicker(ids, records, async (destinationFolderId) => {
     await moveRecords(ids, destinationFolderId);
@@ -241,8 +283,7 @@ async function moveRecords(ids: string[], destinationFolderId: string | null): P
     }
   }
 
-  setSelectionMode(false);
-  renderCurrentView();
+  finishBulk(ids);
   scheduleUsageRefresh();
   if (failed) showToast(`Moved ${moved} item(s); ${failed} failed.`, 'error');
   else if (moved) showToast(`Moved ${moved} item${moved === 1 ? '' : 's'}.`);
@@ -577,6 +618,7 @@ function renderTile(record: FileRecord): HTMLDivElement {
       else openThisTile();
     }
   });
+  tile.addEventListener('contextmenu', (e) => openItemContextMenu(e, record, tile));
   tile.querySelector('.delete-btn')?.addEventListener('click', (e) => {
     e.stopPropagation();
     handleDelete(record.id);
@@ -665,6 +707,7 @@ function renderListRow(record: FileRecord): HTMLDivElement {
       else openThisRow();
     }
   });
+  row.addEventListener('contextmenu', (e) => openItemContextMenu(e, record, row));
   row.querySelector('.file-share-btn')?.addEventListener('click', (e) => {
     e.stopPropagation();
     shareFile(record);
@@ -679,6 +722,112 @@ function renderListRow(record: FileRecord): HTMLDivElement {
   });
 
   return row;
+}
+
+let contextMenuEl: HTMLDivElement | null = null;
+
+function closeContextMenu(): void {
+  if (!contextMenuEl) return;
+  contextMenuEl.remove();
+  contextMenuEl = null;
+  document.removeEventListener('pointerdown', onContextMenuOutside, true);
+  document.removeEventListener('keydown', onContextMenuKey, true);
+  window.removeEventListener('resize', closeContextMenu);
+  window.removeEventListener('blur', closeContextMenu);
+  window.removeEventListener('scroll', closeContextMenu, true);
+}
+
+function onContextMenuOutside(e: Event): void {
+  if (contextMenuEl && !contextMenuEl.contains(e.target as Node)) closeContextMenu();
+}
+
+function onContextMenuKey(e: KeyboardEvent): void {
+  if (!contextMenuEl) return;
+  if (e.key === 'Escape') { e.preventDefault(); closeContextMenu(); return; }
+  if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp' && e.key !== 'Home' && e.key !== 'End') return;
+  e.preventDefault();
+  const items = [...contextMenuEl.querySelectorAll<HTMLButtonElement>('button[role="menuitem"]')];
+  if (!items.length) return;
+  const i = items.indexOf(document.activeElement as HTMLButtonElement);
+  let next = 0;
+  if (e.key === 'ArrowDown') next = (i + 1) % items.length;
+  else if (e.key === 'ArrowUp') next = (i - 1 + items.length) % items.length;
+  else if (e.key === 'End') next = items.length - 1;
+  items[next]?.focus();
+}
+
+function openItemContextMenu(e: MouseEvent, record: FileRecord, anchor: HTMLElement): void {
+  e.preventDefault();
+  e.stopPropagation();
+  closeContextMenu();
+
+  const targetIds = selectedIds.has(record.id) && selectedIds.size > 0 ? [...selectedIds] : [record.id];
+  const single = targetIds.length === 1;
+  const singleId = single ? targetIds[0] : undefined;
+  const singleMeta = singleId !== undefined ? metaCache.get(singleId) : undefined;
+  const singleRecord = singleId !== undefined ? records.find((r) => r.id === singleId) : undefined;
+  const isFolder = !!singleMeta?.isFolder;
+  const noun = single ? '' : ` ${targetIds.length} items`;
+
+  type Entry = { label: string; icon: string; run: () => void; danger?: boolean } | 'sep';
+  const entries: Entry[] = [];
+  if (single && singleRecord) {
+    entries.push({
+      label: isFolder ? 'Open folder' : 'Open',
+      icon: isFolder ? 'folder' : 'file',
+      run: () => (isFolder ? navigateToFolder(singleRecord.id) : openTile(singleRecord.id)),
+    });
+    if (!isFolder) entries.push({ label: 'Share…', icon: 'share', run: () => shareFile(singleRecord) });
+    entries.push('sep');
+  }
+  entries.push({ label: `Download${noun}`, icon: 'download', run: () => void downloadIds(targetIds) });
+  entries.push({ label: `Move${noun}…`, icon: 'folder', run: () => void moveIds(targetIds) });
+  entries.push('sep');
+  entries.push({ label: `Delete${noun}`, icon: 'trash', danger: true, run: () => void deleteIds(targetIds) });
+
+  const menu = document.createElement('div');
+  menu.className = 'context-menu';
+  menu.setAttribute('role', 'menu');
+  for (const entry of entries) {
+    if (entry === 'sep') {
+      const sep = document.createElement('div');
+      sep.className = 'context-menu-sep';
+      sep.setAttribute('role', 'separator');
+      menu.appendChild(sep);
+      continue;
+    }
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.setAttribute('role', 'menuitem');
+    btn.className = 'context-menu-item' + (entry.danger ? ' danger' : '');
+    btn.innerHTML = icon(entry.icon);
+    const label = document.createElement('span');
+    label.textContent = entry.label;
+    btn.appendChild(label);
+    btn.addEventListener('click', () => { closeContextMenu(); entry.run(); });
+    menu.appendChild(btn);
+  }
+  document.body.appendChild(menu);
+  contextMenuEl = menu;
+
+  let x = e.clientX;
+  let y = e.clientY;
+  if (x === 0 && y === 0) {
+    const r = anchor.getBoundingClientRect();
+    x = r.left + 16;
+    y = r.top + 16;
+  }
+  const { width, height } = menu.getBoundingClientRect();
+  const margin = 8;
+  menu.style.left = `${Math.max(margin, Math.min(x, window.innerWidth - width - margin))}px`;
+  menu.style.top = `${Math.max(margin, Math.min(y, window.innerHeight - height - margin))}px`;
+
+  document.addEventListener('pointerdown', onContextMenuOutside, true);
+  document.addEventListener('keydown', onContextMenuKey, true);
+  window.addEventListener('resize', closeContextMenu);
+  window.addEventListener('blur', closeContextMenu);
+  window.addEventListener('scroll', closeContextMenu, true);
+  if (e.detail === 0 || (e.clientX === 0 && e.clientY === 0)) menu.querySelector<HTMLButtonElement>('button')?.focus();
 }
 
 export async function getDecryptedBytes(record: FileRecord): Promise<Uint8Array> {
