@@ -25,6 +25,7 @@ from schemas import (
     VaultRotateRequest, VaultRotateResponse,
 )
 from vault_auth import get_vault_id, require_upload_authorization, UploadAuthorization
+import admin
 import share_store
 import storage
 import token_store
@@ -51,6 +52,16 @@ async def _configure_thread_capacity():
     loop.set_default_executor(ThreadPoolExecutor(max_workers=_THREAD_POOL_WORKERS))
 
     anyio.to_thread.current_default_thread_limiter().total_tokens = _THREAD_POOL_WORKERS
+
+
+@app.on_event("startup")
+async def _start_admin_panel():
+    admin.start_in_background()
+
+
+@app.on_event("shutdown")
+async def _stop_admin_panel():
+    admin.stop()
 
 
 _ALLOWED_ORIGINS = ["tauri://localhost", "https://tauri.localhost", "http://tauri.localhost"]

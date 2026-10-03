@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<title>Lethean Admin</title>
+<link rel="icon" href="logo.png">
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="admin.css">
+</head>
+<body>
+
+<div id="auth-screen" class="hidden">
+  <div class="auth-card">
+    <div class="wordmark">
+      <img src="logo.png" alt="" width="26" height="26">
+      <span>Lethean</span>
+      <span class="admin-badge">Admin</span>
+    </div>
+
+    <h1>Sign in</h1>
+
+    <form id="auth-form">
+      <div class="field">
+        <label for="password">Password</label>
+        <input type="password" id="password" autocomplete="current-password" required maxlength="256">
+      </div>
+      <div class="auth-actions">
+        <button type="submit" class="btn-primary" id="auth-submit">Sign in</button>
+      </div>
+    </form>
+
+    <div class="auth-status" id="auth-status" role="status" aria-live="polite"></div>
+  </div>
+</div>
+
+<div id="app-screen" class="hidden">
+  <header class="topbar">
+    <div class="wordmark">
+      <img src="logo.png" alt="" width="24" height="24">
+      <span>Lethean</span>
+      <span class="admin-badge">Admin</span>
+    </div>
+    <div class="topbar-right">
+      <button type="button" class="btn-icon" id="refresh-btn" title="Refresh" aria-label="Refresh">
+        <svg width="17" height="17" viewBox="0 0 20 20" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M16.5 10a6.5 6.5 0 1 1-2-4.7M16.5 3.5v3.3h-3.3" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </button>
+      <button type="button" id="logout-btn">Sign out</button>
+    </div>
+  </header>
+
+  <main class="vault">
+    <div class="admin-stats" id="admin-stats"></div>
+
+    <div class="admin-section-head">
+      <p class="section-label">Access tokens</p>
+      <button type="button" class="btn-primary" id="new-token-btn">New token</button>
+    </div>
+    <div class="admin-table tokens" id="tokens-table" role="table" aria-label="Access tokens"></div>
+
+    <div class="admin-section-head">
+      <p class="section-label" id="shares-label">Active share links</p>
+      <button type="button" id="purge-btn">Purge expired</button>
+    </div>
+    <div class="admin-table shares" id="shares-table" role="table" aria-label="Active share links"></div>
+  </main>
+</div>
+
+<div id="lightbox" class="hidden"></div>
+<div id="toasts"></div>
+
+<script src="admin.js"></script>
+</body>
+</html>

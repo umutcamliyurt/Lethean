@@ -1,0 +1,168 @@
+
+.admin-badge {
+  font-family: var(--font-mono);
+  font-size: 0.64rem !important;
+  font-weight: 500 !important;
+  text-transform: uppercase;
+  letter-spacing: 0.08em !important;
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 8px;
+  margin-left: 4px;
+}
+
+.admin-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin-bottom: 30px;
+}
+.admin-stat {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px;
+}
+.admin-stat .label {
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  margin: 0 0 8px;
+}
+.admin-stat .value { font-size: 1.3rem; font-weight: 600; margin: 0; }
+.admin-stat .sub {
+  font-family: var(--font-mono);
+  font-size: 0.7rem;
+  color: var(--dim);
+  margin: 4px 0 0;
+}
+
+.admin-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.admin-section-head button {
+  min-height: 34px;
+  padding: 6px 14px;
+  font-size: 0.82rem;
+}
+
+.admin-table {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
+  margin-bottom: 34px;
+}
+.admin-head, .admin-row {
+  display: grid;
+  gap: 10px;
+  align-items: center;
+  padding: 11px 14px;
+}
+.admin-table.tokens .admin-head,
+.admin-table.tokens .admin-row {
+  grid-template-columns: minmax(0, 1.5fr) 130px minmax(0, 1.3fr) 110px 150px;
+}
+.admin-table.shares .admin-head,
+.admin-table.shares .admin-row {
+  grid-template-columns: minmax(0, 1.2fr) 120px 110px 170px 92px;
+}
+.admin-head {
+  font-family: var(--font-mono);
+  font-size: 0.66rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--dim);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+}
+.admin-row {
+  border-bottom: 1px solid var(--border);
+  font-size: 0.85rem;
+  transition: background 0.12s ease;
+}
+.admin-row:last-child { border-bottom: none; }
+.admin-row:hover { background: var(--surface); }
+
+.admin-cell { min-width: 0; }
+.admin-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.admin-title.unlabeled { color: var(--dim); font-style: italic; }
+.admin-sub, .admin-mono {
+  font-family: var(--font-mono);
+  font-size: 0.72rem;
+  color: var(--dim);
+}
+.admin-sub { margin-top: 3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.admin-sub.only-sm { display: none; }
+
+.admin-pill {
+  display: inline-block;
+  font-family: var(--font-mono);
+  font-size: 0.68rem;
+  color: var(--dim);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 2px 9px;
+  white-space: nowrap;
+}
+.admin-pill.on { color: var(--text); border-color: var(--dim); }
+
+.admin-bar {
+  height: 3px;
+  background: var(--border);
+  border-radius: 2px;
+  margin-top: 7px;
+  overflow: hidden;
+}
+.admin-bar-fill { height: 100%; width: 0; background: var(--text); }
+.admin-bar-fill.high { background: #d9a13c; }
+.admin-bar-fill.full { background: #d9583c; }
+
+.admin-actions { display: flex; gap: 6px; justify-content: flex-end; }
+.admin-actions button {
+  min-height: 32px;
+  padding: 5px 12px;
+  font-size: 0.8rem;
+}
+.admin-actions .btn-danger {
+  width: auto;
+  margin: 0;
+  display: inline-block;
+}
+
+.admin-empty {
+  padding: 30px 14px;
+  text-align: center;
+  color: var(--dim);
+  font-size: 0.85rem;
+}
+
+.settings-panel .panel-actions .btn-danger { margin-top: 0; }
+.admin-token-block { margin-bottom: 16px; }
+.admin-token-block .share-section-label { margin-bottom: 6px; }
+.settings-panel .share-link-row input { background: var(--bg); }
+.share-checkbox-row.neutral:has(input:checked) {
+  border-color: var(--text);
+  background: var(--surface-2);
+}
+
+@media (max-width: 760px) {
+  .admin-head { display: none; }
+  .admin-table.tokens .admin-row,
+  .admin-table.shares .admin-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+  .admin-row .col-extra { display: none; }
+  .admin-sub.only-sm { display: block; }
+}

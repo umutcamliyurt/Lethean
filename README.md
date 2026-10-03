@@ -21,6 +21,7 @@ Lethean is a zero-knowledge encrypted storage accountless web app. Your chosen p
 - Minimum 12-character password, checked against a common-password list locally
 - Duress code for wiping the vault under coercion, with an optional decoy vault
 - Desktop and mobile apps (Tauri-based)
+- Optional web admin panel on a separate port for managing access tokens and share links
 
 ## Screenshots
 
@@ -50,7 +51,7 @@ An access token, issued by whoever operates the server, is required both to unlo
 
 Tokens are hashed (SHA-256) before they're written to disk, so a leaked `tokens.json` doesn't hand out upload tokens.
 
-Server operators manage these tokens from the command line:
+Server operators manage these tokens from the command line, or from the [web admin panel](#admin-panel):
 
 ```bash
 cd server
@@ -80,6 +81,36 @@ uvicorn main:app --reload
 ```
 
 Serves the API and client at `http://localhost:8000`.
+
+## Admin Panel
+
+An optional web UI for server operators, served on its own port. It is disabled unless `ADMIN_PASSWORD` is set.
+
+```bash
+cd server
+ADMIN_PASSWORD='a password of 12+ characters' uvicorn main:app
+```
+
+Then open `http://127.0.0.1:8001`. From there you can:
+
+- See total storage, file and vault counts, token counts, and active/expired share links
+- Create access tokens (with an optional paired decoy-vault token), edit a token's label or quota, and revoke tokens. The raw token is shown once, at creation
+- See each token's bound vault (truncated), usage and quota
+- Revoke individual share links and purge expired ones
+
+Revoking a token blocks further uploads and vault rotation with it. It does not delete stored files.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `ADMIN_PASSWORD` | unset (panel disabled) | Admin password, minimum 12 characters |
+| `ADMIN_HOST` | `127.0.0.1` | Bind address |
+| `ADMIN_PORT` | `8001` | Port |
+| `ADMIN_SESSION_TTL` | `43200` | Session lifetime in seconds |
+| `ADMIN_LOGIN_MAX_FAILS` | `5` | Failed logins per IP before lockout |
+| `ADMIN_LOGIN_LOCKOUT` | `900` | Lockout window in seconds |
+| `TRUST_PROXY_HEADERS` | `0` | Set to `1` behind a reverse proxy to honor `X-Forwarded-For` / `X-Forwarded-Proto` |
+
+It binds to localhost by default and should stay there. To reach it remotely, use an SSH tunnel (`ssh -L 8001:127.0.0.1:8001 host`) or put it behind an HTTPS reverse proxy, rather than exposing the port directly.
 
 ## Desktop & Mobile Apps
 
@@ -120,6 +151,7 @@ The release APK lands under `client/src-tauri/gen/android/app/build/outputs/apk/
 - A compromised client, including a malicious browser, extension, or tampered JavaScript
 - Weak or reused passwords
 - Sustained forensic analysis of server-side metadata, including timing and access patterns.
+- A compromised admin password: whoever holds it can create, edit and revoke access tokens and revoke share links, though not read any vault contents.
 
 ## License
 
