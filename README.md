@@ -2,7 +2,7 @@
 
 <img src="logo.png" width="75" />
 
-## Anonymous Zero-Knowledge Encrypted Cloud Storage
+## Zero-Knowledge Encrypted Cloud Storage
 
 </div>
 
