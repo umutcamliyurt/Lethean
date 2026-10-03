@@ -2,15 +2,12 @@ import asyncio
 import os
 import queue as _queue
 import re
-import secrets
 
 STORAGE_ROOT = os.environ.get("STORAGE_ROOT", "./blobs")
 _VAULT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
 _FILE_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
-
-_SHRED_PASSES = int(os.environ.get("SHRED_PASSES", "3"))
 
 _READ_STALL_TIMEOUT_SECONDS = float(os.environ.get("UPLOAD_READ_STALL_TIMEOUT", "60"))
 
@@ -51,14 +48,21 @@ async def write_blob_streamed(
     write_errors: list[BaseException] = []
 
     def _writer() -> None:
+        failed = False
         try:
             while True:
                 item = write_q.get()
                 if item is None:
                     break
-                f.write(item)
-            f.flush()
-            os.fsync(f.fileno())
+                if not failed:
+                    try:
+                        f.write(item)
+                    except Exception as exc:
+                        write_errors.append(exc)
+                        failed = True
+            if not failed:
+                f.flush()
+                os.fsync(f.fileno())
         except Exception as exc:
             write_errors.append(exc)
         finally:
@@ -93,9 +97,13 @@ async def write_blob_streamed(
         if write_errors:
             raise write_errors[0]
 
-    except Exception:
-        await asyncio.to_thread(write_q.put, None)
-        await writer_task
+    except BaseException:
+        sentinel_thread = asyncio.get_running_loop().run_in_executor(None, write_q.put, None)
+        try:
+            await asyncio.shield(sentinel_thread)
+            await asyncio.shield(writer_task)
+        except BaseException:
+            pass
         try:
             os.remove(path)
         except FileNotFoundError:
@@ -128,37 +136,8 @@ async def stream_blob(path: str, chunk_size: int = 8 * 1024 * 1024):
         await asyncio.to_thread(f.close)
 
 
-def shred_blob(path: str) -> None:
-    try:
-        length = os.path.getsize(path)
-    except FileNotFoundError:
-        return
-
-    try:
-        with open(path, "r+b") as f:
-            for _ in range(_SHRED_PASSES):
-                f.seek(0)
-                f.write(secrets.token_bytes(length))
-                f.flush()
-                os.fsync(f.fileno())
-            f.seek(0)
-            f.write(b"\x00" * length)
-            f.flush()
-            os.fsync(f.fileno())
-    except FileNotFoundError:
-        return
-    finally:
-        try:
-            os.remove(path)
-        except FileNotFoundError:
-            pass
-        dir_path = os.path.dirname(path)
-        dir_fd = os.open(dir_path, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-
-
 def delete_blob(path: str) -> None:
-    shred_blob(path)
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass

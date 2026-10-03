@@ -322,7 +322,7 @@
       }
     });
     openModal(el('div', { class: 'settings-panel' }, [
-      el('h2', { text: 'New access token' }),
+      el('h2', { text: 'Create access token' }),
       el('p', { class: 'subtitle', text: 'Tokens bind to the first vault that uploads with them.' }),
       form,
     ]));
@@ -377,7 +377,7 @@
       try {
         await api('PATCH', '/tokens/' + t.id, { label: label.value, quota_gb: q.value });
         closeModal();
-        toast('Token updated');
+        toast('Token saved');
         refresh();
       } catch (ex) {
         err.textContent = ex.message;
@@ -393,10 +393,40 @@
 
   function openRevokeModal(t) {
     const confirm = el('button', { class: 'btn-danger', text: 'Revoke token', attrs: { type: 'button' } });
+
+    let sharesBox = null;
+    const body = [];
+    if (t.active_shares > 0) {
+      sharesBox = el('input', { attrs: { type: 'checkbox', id: 'revoke-shares' } });
+      sharesBox.checked = true;
+      body.push(el('label', { class: 'share-checkbox-row neutral' }, [
+        sharesBox,
+        el('span', { class: 'share-checkbox-text' }, [
+          el('strong', { text: `Also revoke ${plural(t.active_shares, 'active share link')}` }),
+          el('small', { text: 'Links already handed out stop working immediately.' }),
+        ]),
+      ]));
+    }
+
+    let filesBox = null;
+    if (t.bound && t.file_count > 0) {
+      filesBox = el('input', { attrs: { type: 'checkbox', id: 'revoke-files' } });
+      filesBox.checked = true;
+      body.push(el('label', { class: 'share-checkbox-row neutral' }, [
+        filesBox,
+        el('span', { class: 'share-checkbox-text' }, [
+          el('strong', { text: `Also permanently delete ${plural(t.file_count, 'file')} (${formatBytes(t.total_bytes)})` }),
+          el('small', { text: 'Files are shredded and all share links are removed. This cannot be undone.' }),
+        ]),
+      ]));
+    }
+
     confirm.addEventListener('click', async () => {
       confirm.disabled = true;
       try {
-        await api('DELETE', '/tokens/' + t.id);
+        if (sharesBox && sharesBox.checked) await api('DELETE', '/tokens/' + t.id + '/shares');
+        const purge = filesBox && filesBox.checked;
+        await api('DELETE', '/tokens/' + t.id + (purge ? '?delete_contents=true' : ''));
         closeModal();
         toast('Token revoked');
         refresh();
@@ -407,9 +437,9 @@
     });
     openModal(panel(
       'Revoke token?',
-      `${t.label || '(unlabeled)'} (${t.id}). Uploads and vault rotation with this token will stop working. ` +
-        'Files already stored are not deleted, and anyone holding the vault ID can still read them.',
-      [],
+      `${t.label || '(unlabeled)'} (${t.id}). Uploads, vault rotation and new share links with this token will stop working. ` +
+        'Unless you delete the files below, they stay stored and anyone holding the vault ID can still read them.',
+      body,
       [el('button', { text: 'Cancel', attrs: { type: 'button' }, on: { click: closeModal } }), confirm],
     ));
   }

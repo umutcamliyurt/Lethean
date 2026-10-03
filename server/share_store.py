@@ -107,7 +107,7 @@ def delete_via_delete_token(db: Session, raw_delete_token: str) -> bool:
     if result.rowcount != 1:
         return False
 
-    storage.shred_blob(storage_path)
+    storage.delete_blob(storage_path)
     return True
 
 

@@ -10,13 +10,14 @@ from collections import defaultdict, deque
 from datetime import datetime, timezone
 
 import uvicorn
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 import share_store
+import storage
 import token_store
 from database import get_db
 from models import EncryptedFile, ShareToken
@@ -331,18 +332,71 @@ def update_token(token_id: str, body: UpdateTokenBody):
     quota_bytes = int(body.quota_gb * GB) if body.quota_gb is not None else None
     if not _update_token(token_id, _clean_label(body.label), quota_bytes):
         raise HTTPException(status_code=404, detail="No such token")
-    logger.info("admin updated token %s", token_id)
+    logger.info("admin edited token %s", token_id)
     return Response(status_code=204)
+
+
+def _delete_files(file_infos: list[tuple[str, str]]) -> None:
+    for file_id, path in file_infos:
+        try:
+            storage.delete_blob(path)
+        except Exception:
+            logger.exception("admin: failed to delete blob for file %s", file_id)
 
 
 @api.delete("/tokens/{token_id}", status_code=204)
-def revoke_token(token_id: str):
+def revoke_token(
+    token_id: str,
+    background_tasks: BackgroundTasks,
+    delete_contents: bool = False,
+    db: Session = Depends(get_db),
+):
     if not _TOKEN_ID_RE.match(token_id):
         raise HTTPException(status_code=404, detail="No such token")
+    matches = [
+        record for token_hash, record in list(token_store.list_tokens().items())
+        if token_hash.startswith(token_id)
+    ]
+    if len(matches) != 1:
+        raise HTTPException(status_code=404, detail="No such token")
+    vault_id = matches[0].get("vault_id")
+
     if not token_store.revoke_by_id(token_id):
         raise HTTPException(status_code=404, detail="No such token")
     logger.info("admin revoked token %s", token_id)
+
+    if delete_contents and vault_id:
+        rows = (
+            db.query(EncryptedFile.id, EncryptedFile.storage_path)
+            .filter(EncryptedFile.vault_id == vault_id)
+            .all()
+        )
+        file_infos = [(r.id, r.storage_path) for r in rows]
+        db.query(ShareToken).filter(ShareToken.vault_id == vault_id).delete(synchronize_session=False)
+        db.query(EncryptedFile).filter(EncryptedFile.vault_id == vault_id).delete(synchronize_session=False)
+        db.commit()
+        background_tasks.add_task(_delete_files, file_infos)
+        logger.info("admin deleted %d file(s) of token %s", len(file_infos), token_id)
     return Response(status_code=204)
+
+
+@api.delete("/tokens/{token_id}/shares")
+def revoke_token_shares(token_id: str, db: Session = Depends(get_db)):
+    if not _TOKEN_ID_RE.match(token_id):
+        raise HTTPException(status_code=404, detail="No such token")
+    matches = [
+        record for token_hash, record in list(token_store.list_tokens().items())
+        if token_hash.startswith(token_id)
+    ]
+    if len(matches) != 1:
+        raise HTTPException(status_code=404, detail="No such token")
+    vault_id = matches[0].get("vault_id")
+    if not vault_id:
+        return {"removed": 0}
+    removed = db.query(ShareToken).filter(ShareToken.vault_id == vault_id).delete(synchronize_session=False)
+    db.commit()
+    logger.info("admin revoked %d share link(s) for token %s", removed, token_id)
+    return {"removed": removed}
 
 
 @api.get("/shares")
@@ -411,7 +465,7 @@ def _client_asset(name: str) -> str | None:
     return None
 
 
-_NO_CACHE = {"Cache-Control": "no-cache"}
+_NO_CACHE = {"Cache-Control": "no-store"}
 
 _LOGO_FALLBACK_SVG = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="100 270 1052 680" fill="#f0f0f0">'

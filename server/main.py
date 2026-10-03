@@ -8,6 +8,7 @@ import threading
 import time
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 
 import anyio.to_thread
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, Form, BackgroundTasks, Request, Query
@@ -19,7 +20,7 @@ from sqlalchemy import delete as sa_delete, func
 from sqlalchemy.orm import Session
 
 from database import Base, engine, get_db, run_migrations
-from models import EncryptedFile, ShareToken
+from models import EncryptedFile, ShareToken, gen_uuid
 from schemas import (
     FileMetaResponse, UsageResponse, ShareCreateResponse, ShareFileResponse,
     VaultRotateRequest, VaultRotateResponse,
@@ -79,20 +80,6 @@ else:
         allow_headers=["Authorization", "X-Access-Token", "Content-Type"],
         allow_credentials=False,
     )
-
-@app.middleware("http")
-async def _debug_cors(request: Request, call_next):
-    if request.method == "OPTIONS" and "access-control-request-method" in request.headers:
-        origin = request.headers.get("origin")
-        verdict = "ALLOWED" if origin in _ALLOWED_ORIGINS else "REJECTED"
-        print(
-            f"[DEBUG_CORS] {verdict} origin={origin!r} "
-            f"method={request.headers.get('access-control-request-method')!r} "
-            f"headers={request.headers.get('access-control-request-headers')!r} "
-            f"path={request.url.path} allowed_origins={_ALLOWED_ORIGINS!r}",
-            flush=True,
-        )
-    return await call_next(request)
 
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", str(5 * 1024**3)))
 _READ_CHUNK = 8 * 1024 * 1024
@@ -190,9 +177,16 @@ _LOCK_STRIPES = 256
 _vault_locks = [threading.Lock() for _ in range(_LOCK_STRIPES)]
 
 
+def _stripe_for_vault(vault_id: str) -> int:
+    return int(hashlib.sha256(vault_id.encode("utf-8")).hexdigest(), 16) % _LOCK_STRIPES
+
+
 def _lock_for_vault(vault_id: str) -> threading.Lock:
-    idx = int(hashlib.sha256(vault_id.encode("utf-8")).hexdigest(), 16) % _LOCK_STRIPES
-    return _vault_locks[idx]
+    return _vault_locks[_stripe_for_vault(vault_id)]
+
+
+def _locks_for(*vault_ids: str) -> list[threading.Lock]:
+    return [_vault_locks[i] for i in sorted({_stripe_for_vault(v) for v in vault_ids})]
 
 
 _reserved_lock = threading.Lock()
@@ -228,6 +222,7 @@ def _reserve_upload_slot(
         stream_limit = min(candidate_limits)
 
         record = EncryptedFile(
+            id=gen_uuid(),
             vault_id=vault_id,
             encrypted_metadata=encrypted_metadata,
             metadata_iv=metadata_iv,
@@ -237,8 +232,6 @@ def _reserve_upload_slot(
             storage_path="",
             size=0,
         )
-        db.add(record)
-        db.flush()
 
         with _reserved_lock:
             _reserved_bytes[vault_id] = _reserved_bytes.get(vault_id, 0) + stream_limit
@@ -255,18 +248,20 @@ def _release_reservation(vault_id: str, stream_limit: int) -> None:
             _reserved_bytes[vault_id] = remaining
 
 
-def _discard_upload(db: Session, vault_id: str, stream_limit: int) -> None:
-    db.rollback()
-    _release_reservation(vault_id, stream_limit)
-
-
 def _finalize_upload(db: Session, record: EncryptedFile, path: str, size: int, vault_id: str, stream_limit: int) -> EncryptedFile:
-    record.storage_path = path
-    record.size = size
-    db.commit()
-    db.refresh(record)
-    _release_reservation(vault_id, stream_limit)
-    return record
+    try:
+        record.storage_path = path
+        record.size = size
+        db.add(record)
+        db.commit()
+        db.refresh(record)
+        return record
+    except BaseException:
+        db.rollback()
+        storage.delete_blob(path)
+        raise
+    finally:
+        _release_reservation(vault_id, stream_limit)
 
 
 @app.post("/files", response_model=FileMetaResponse, status_code=201)
@@ -308,17 +303,19 @@ async def upload_file(
             wrap_iv,
         )
 
-        path = storage.path_for(vault_id, record.id)
         try:
+            path = storage.path_for(vault_id, record.id)
             size = await storage.write_blob_streamed(path, blob, stream_limit, chunk_size=_READ_CHUNK)
-        except ValueError:
-            await asyncio.to_thread(_discard_upload, db, vault_id, stream_limit)
+        except ValueError as exc:
+            _release_reservation(vault_id, stream_limit)
+            if "stalled" in str(exc):
+                raise HTTPException(status_code=408, detail=str(exc))
             raise HTTPException(
                 status_code=413,
                 detail=f"File exceeds allowed size ({stream_limit} bytes remaining under quota/limit)",
             )
-        except Exception:
-            await asyncio.to_thread(_discard_upload, db, vault_id, stream_limit)
+        except BaseException:
+            _release_reservation(vault_id, stream_limit)
             raise
 
         return await asyncio.to_thread(_finalize_upload, db, record, path, size, vault_id, stream_limit)
@@ -389,11 +386,13 @@ async def get_file_blob(file_id: str, db: Session = Depends(get_db), vault_id: s
 
 
 def _delete_record(db: Session, record: EncryptedFile) -> bool:
-    result = db.execute(sa_delete(EncryptedFile).where(EncryptedFile.id == record.id))
+    record_id = record.id
+    storage_path = record.storage_path
+    result = db.execute(sa_delete(EncryptedFile).where(EncryptedFile.id == record_id))
     db.commit()
     if result.rowcount != 1:
         return False
-    storage.shred_blob(record.storage_path)
+    storage.delete_blob(storage_path)
     return True
 
 
@@ -419,6 +418,11 @@ def create_file_share(
     db: Session = Depends(get_db),
     vault_id: str = Depends(get_vault_id),
 ):
+    if token_store.find_by_vault_id(vault_id) is None:
+        raise HTTPException(
+            status_code=403,
+            detail="This vault's access token is no longer active, so new share links can't be created.",
+        )
     record = _get_owned_file(db, file_id, vault_id)
     try:
         raw_token, raw_delete_token, expires_at, max_downloads = share_store.create_share(
@@ -531,18 +535,18 @@ def wipe_vault(
         db.query(EncryptedFile).filter(EncryptedFile.vault_id == vault_id).delete(synchronize_session=False)
         db.commit()
 
-    background_tasks.add_task(_shred_vault_files, vault_id, file_infos)
+    background_tasks.add_task(_delete_vault_files, vault_id, file_infos)
 
     return Response(status_code=204)
 
 
-def _shred_vault_files(vault_id: str, file_infos: list[tuple[str, str]]) -> None:
+def _delete_vault_files(vault_id: str, file_infos: list[tuple[str, str]]) -> None:
     with _lock_for_vault(vault_id):
         for file_id, path in file_infos:
             try:
-                storage.shred_blob(path)
+                storage.delete_blob(path)
             except Exception:
-                logger.exception("Failed to shred blob for file %s in vault %s...", file_id, vault_id[:8])
+                logger.exception("Failed to delete blob for file %s in vault %s...", file_id, vault_id[:8])
 
 
 @app.post("/vault/rotate", response_model=VaultRotateResponse)
@@ -581,7 +585,10 @@ def rotate_vault(
         if len(item.wrapped_file_key) > _WRAPPED_KEY_MAX_LEN or len(item.wrap_iv) > _IV_MAX_LEN:
             raise HTTPException(status_code=400, detail=f"Malformed rewrap entry for {item.file_id}")
 
-    with _lock_for_vault(old_vault_id), _lock_for_vault(new_vault_id):
+    with ExitStack() as stack:
+        for lk in _locks_for(old_vault_id, new_vault_id):
+            stack.enter_context(lk)
+
         for item in body.rewraps:
             db.query(EncryptedFile).filter(
                 EncryptedFile.id == item.file_id, EncryptedFile.vault_id == old_vault_id,
