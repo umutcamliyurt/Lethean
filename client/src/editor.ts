@@ -1,3 +1,6 @@
+import { Marked } from 'marked';
+import type { Tokens } from 'marked';
+import DOMPurify from 'dompurify';
 import * as api from './api.js';
 import { newTextFileBtn } from './dom.js';
 import { getWrappingKeyRaw } from './state.js';
@@ -246,260 +249,48 @@ function handlePasteUrl(textarea: HTMLTextAreaElement, e: ClipboardEvent): void 
   dispatchInput(textarea);
 }
 
-const ALLOWED_LINK_PROTOCOLS = /^(https?:|mailto:)/i;
-const HAS_CONTROL_OR_MARKUP_CHARS = /[\x00-\x1f\x7f<>`]/;
-
-function sanitizeHref(escapedUrl: string): string | null {
-  const trimmed = escapedUrl.trim();
-  if (!ALLOWED_LINK_PROTOCOLS.test(trimmed)) return null;
-  if (HAS_CONTROL_OR_MARKUP_CHARS.test(trimmed)) return null;
-  return trimmed;
-}
-
-function renderEmphasis(text: string): string {
-  return text
-    .replace(/\*\*\*([^*\n]+)\*\*\*/g, '<strong><em>$1</em></strong>')
-    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/__([^_\n]+)__/g, '<strong>$1</strong>')
-    .replace(/~~([^~\n]+)~~/g, '<del>$1</del>')
-    .replace(/==([^=\n]+)==/g, '<mark>$1</mark>')
-    .replace(/\*([^*\n]+)\*/g, '<em>$1</em>')
-    .replace(/(^|[^\w])_([^_\n]+)_(?!\w)/g, '$1<em>$2</em>');
-}
-
-function renderInline(escapedText: string): string {
-  const stash: string[] = [];
-  const hold = (html: string): string => {
-    stash.push(html);
-    return `\u0000${stash.length - 1}\u0000`;
-  };
-  const anchor = (href: string, labelHtml: string): string =>
-    hold(`<a href="${href}" target="_blank" rel="noopener noreferrer nofollow">${labelHtml}</a>`);
-
-  let text = escapedText.replace(/`([^`\n]+)`/g, (_m, code: string) => hold(`<code>${code}</code>`));
-
-  text = text.replace(/\\([\\*_{}\[\]()#+\-.!|~=])/g, (_m, ch: string) => hold(ch));
-
-  text = text.replace(/!\[([^\]\n]*)\]\(([^)\s]+)(?:\s+&quot;[^)]*&quot;)?\)/g, (_m, alt: string, url: string) => {
-    const href = sanitizeHref(url);
-    const label = alt || 'image';
-    return href ? anchor(href, `\u{1F5BC} ${label}`) : `${label} (${url})`;
-  });
-
-  text = text.replace(/\[([^\]\n]+)\]\(([^)\s]+)(?:\s+&quot;[^)]*&quot;)?\)/g, (_m, label: string, url: string) => {
-    const href = sanitizeHref(url);
-    return href ? anchor(href, renderEmphasis(label)) : `${label} (${url})`;
-  });
-
-  text = text.replace(/&lt;((?:https?:\/\/|mailto:)[^\s]+?)&gt;/gi, (_m, url: string) => {
-    const href = sanitizeHref(url);
-    return href ? anchor(href, url) : _m;
-  });
-
-  text = text.replace(/(^|[\s(])(https?:\/\/[^\s\u0000]*[^\s\u0000.,;:!?)'])/gi, (_m, pre: string, url: string) => {
-    const href = sanitizeHref(url);
-    return href ? `${pre}${anchor(href, url)}` : _m;
-  });
-
-  text = renderEmphasis(text);
-
-  for (let pass = 0; pass < 3 && text.includes('\u0000'); pass++) {
-    text = text.replace(/\u0000(\d+)\u0000/g, (_m, idx: string) => stash[Number(idx)] ?? '');
-  }
-  return text;
-}
-
 const MARKDOWN_PREVIEW_MAX_CHARS = 2 * 1024 * 1024;
-const LIST_ITEM_RE = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
-const TABLE_DELIM_RE = /^\s*\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/;
-const FENCE_RE = /^\s{0,3}(`{3,}|~{3,})\s*([\w+#.-]*)[^`]*$/;
-const MAX_NESTING = 20;
 
-function splitTableRow(line: string): string[] {
-  let s = line.trim();
-  if (s.startsWith('|')) s = s.slice(1);
-  if (s.endsWith('|') && !s.endsWith('\\|')) s = s.slice(0, -1);
-  return s.split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, '|'));
-}
+const escapeText = (s: string): string =>
+  s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 
-function renderList(lines: string[], start: number, depth: number): { html: string; next: number } {
-  const first = LIST_ITEM_RE.exec(lines[start]!)!;
-  const baseIndent = first[1]!.length;
-  const ordered = /^\d/.test(first[2]!);
-  const items: string[] = [];
-  let hasTask = false;
-  let i = start;
+const md = new Marked({ gfm: true, breaks: true, async: false });
+md.use({
+  renderer: {
+    html: ({ text }: Tokens.HTML | Tokens.Tag): string => escapeText(text),
+    image: ({ href, text }: Tokens.Image): string => `<a href="${escapeText(href)}">\u{1F5BC} ${escapeText(text || 'image')}</a>`,
+  },
+});
 
-  while (i < lines.length) {
-    const m = LIST_ITEM_RE.exec(lines[i]!);
-    if (!m) break;
-    const indent = m[1]!.length;
-    if (indent !== baseIndent && !(indent < baseIndent + 2 && indent > baseIndent)) break;
-    if (/^\d/.test(m[2]!) !== ordered) break;
+const SANITIZE_CONFIG = {
+  ALLOWED_TAGS: [
+    'p', 'br', 'hr', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    'strong', 'em', 'del', 'code', 'pre', 'blockquote',
+    'ul', 'ol', 'li', 'input',
+    'table', 'thead', 'tbody', 'tr', 'th', 'td', 'a',
+  ],
+  ALLOWED_ATTR: ['href', 'title', 'start', 'align', 'class', 'type', 'checked', 'disabled'],
+  ALLOW_DATA_ATTR: false,
+  ALLOWED_URI_REGEXP: /^(?:https?:|mailto:)/i,
+};
 
-    let content = m[3]!;
-    let checkbox = '';
-    const task = content.match(/^\[([ xX])\]\s+(.*)$/);
-    if (task) {
-      hasTask = true;
-      checkbox = `<input type="checkbox" disabled${task[1] !== ' ' ? ' checked' : ''}> `;
-      content = task[2]!;
-    }
-    let body = renderInline(content);
-    let nested = '';
-    i++;
-
-    while (i < lines.length) {
-      const line = lines[i]!;
-      const nm = LIST_ITEM_RE.exec(line);
-      const lead = line.length - line.trimStart().length;
-      if (nm && nm[1]!.length >= baseIndent + 2 && depth < MAX_NESTING) {
-        const sub = renderList(lines, i, depth + 1);
-        nested += sub.html;
-        i = sub.next;
-        continue;
-      }
-      if (!nm && line.trim() !== '' && lead > baseIndent) {
-        body += '<br>' + renderInline(line.trim());
-        i++;
-        continue;
-      }
-      break;
-    }
-    items.push(`<li${task ? ' class="task-list-item"' : ''}>${checkbox}${body}${nested}</li>`);
+DOMPurify.addHook('afterSanitizeAttributes', (node: Element): void => {
+  if (node.tagName === 'A' && node.hasAttribute('href')) {
+    node.setAttribute('target', '_blank');
+    node.setAttribute('rel', 'noopener noreferrer nofollow');
   }
-
-  const tag = ordered ? 'ol' : 'ul';
-  const startNum = ordered ? parseInt(first[2]!, 10) : 1;
-  const attrs = (ordered && startNum !== 1 ? ` start="${startNum}"` : '') + (hasTask ? ' class="task-list"' : '');
-  return { html: `<${tag}${attrs}>${items.join('')}</${tag}>`, next: i };
-}
-
-function renderBlocks(lines: string[], depth: number): string[] {
-  const out: string[] = [];
-  let paragraph: string[] = [];
-  let rawParagraph: string[] = [];
-  let i = 0;
-
-  const flushParagraph = (): void => {
-    if (paragraph.length) {
-      out.push(`<p>${paragraph.join('<br>')}</p>`);
-      paragraph = [];
-      rawParagraph = [];
-    }
-  };
-
-  while (i < lines.length) {
-    const line = lines[i]!;
-
-    const fence = FENCE_RE.exec(line);
-    if (fence) {
-      flushParagraph();
-      const marker = fence[1]!;
-      const lang = fence[2]!.replace(/[^\w+#.-]/g, '');
-      const code: string[] = [];
-      i++;
-      while (i < lines.length) {
-        const close = lines[i]!.trim();
-        if (close.startsWith(marker[0]!.repeat(marker.length)) && /^(`+|~+)$/.test(close)) break;
-        code.push(lines[i]!);
-        i++;
-      }
-      i++;
-      const cls = lang ? ` class="language-${lang}"` : '';
-      out.push(`<pre${lang ? ` data-lang="${lang}"` : ''}><code${cls}>${code.join('\n')}</code></pre>`);
-      continue;
-    }
-
-    if (rawParagraph.length && /^\s*(=+|-+)\s*$/.test(line)) {
-      const level = line.trim().startsWith('=') ? 1 : 2;
-      const html = renderInline(rawParagraph.join(' '));
-      paragraph = [];
-      rawParagraph = [];
-      out.push(`<h${level}>${html}</h${level}>`);
-      i++;
-      continue;
-    }
-
-    if (/^\s{0,3}([-*_])(\s*\1){2,}\s*$/.test(line)) {
-      flushParagraph();
-      out.push('<hr>');
-      i++;
-      continue;
-    }
-
-    const heading = line.match(/^\s{0,3}(#{1,6})\s+(.*?)(?:\s+#+)?\s*$/);
-    if (heading) {
-      flushParagraph();
-      const level = heading[1]!.length;
-      out.push(`<h${level}>${renderInline(heading[2]!)}</h${level}>`);
-      i++;
-      continue;
-    }
-
-    if (/^\s{0,3}&gt;/.test(line)) {
-      flushParagraph();
-      const quote: string[] = [];
-      while (i < lines.length && /^\s{0,3}&gt;/.test(lines[i]!)) {
-        quote.push(lines[i]!.replace(/^\s{0,3}&gt;\s?/, ''));
-        i++;
-      }
-      const inner = depth < MAX_NESTING ? renderBlocks(quote, depth + 1).join('') : quote.map((l) => `<p>${renderInline(l)}</p>`).join('');
-      out.push(`<blockquote>${inner}</blockquote>`);
-      continue;
-    }
-
-    if (line.includes('|') && i + 1 < lines.length && lines[i + 1]!.includes('-') && TABLE_DELIM_RE.test(lines[i + 1]!)) {
-      const headers = splitTableRow(line);
-      const aligns = splitTableRow(lines[i + 1]!).map((c) => {
-        const l = c.startsWith(':');
-        const r = c.endsWith(':');
-        return l && r ? 'center' : r ? 'right' : l ? 'left' : '';
-      });
-      if (headers.length === aligns.length) {
-        flushParagraph();
-        const cell = (tag: string, text: string, idx: number): string =>
-          `<${tag}${aligns[idx] ? ` style="text-align:${aligns[idx]}"` : ''}>${renderInline(text)}</${tag}>`;
-        const rows: string[] = [];
-        i += 2;
-        while (i < lines.length && lines[i]!.trim() !== '' && lines[i]!.includes('|')) {
-          const cells = splitTableRow(lines[i]!);
-          rows.push(`<tr>${headers.map((_h, idx) => cell('td', cells[idx] ?? '', idx)).join('')}</tr>`);
-          i++;
-        }
-        out.push(
-          `<div class="editor-table-wrap"><table><thead><tr>${headers.map((h, idx) => cell('th', h, idx)).join('')}</tr></thead>` +
-          `<tbody>${rows.join('')}</tbody></table></div>`,
-        );
-        continue;
-      }
-    }
-
-    if (LIST_ITEM_RE.test(line)) {
-      flushParagraph();
-      const list = renderList(lines, i, 0);
-      out.push(list.html);
-      i = list.next;
-      continue;
-    }
-
-    if (line.trim() === '') { flushParagraph(); i++; continue; }
-
-    rawParagraph.push(line);
-    paragraph.push(renderInline(line));
-    i++;
+  if (node.tagName === 'INPUT') {
+    node.setAttribute('type', 'checkbox');
+    node.setAttribute('disabled', '');
   }
-
-  flushParagraph();
-  return out;
-}
+});
 
 export function renderMarkdownPreview(source: string): string {
   if (source.length > MARKDOWN_PREVIEW_MAX_CHARS) {
     return '<p class="editor-preview-empty">This document is too large to preview here. It will still save and open normally.</p>';
   }
-  const lines = source.replace(/\r\n?/g, '\n').replace(/^\t+/gm, (t) => '    '.repeat(t.length)).split('\n').map(escapeHtml);
-  return renderBlocks(lines, 0).join('\n') || '<p class="editor-preview-empty">Nothing to preview yet.</p>';
+  const html = DOMPurify.sanitize(md.parse(source) as string, SANITIZE_CONFIG);
+  return html.trim() || '<p class="editor-preview-empty">Nothing to preview yet.</p>';
 }
 
 const TOOLBAR_BUTTONS: Array<{ action: string; icon: string; label: string; text?: string } | 'sep'> = [

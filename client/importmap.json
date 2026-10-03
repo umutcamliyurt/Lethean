@@ -1,5 +1,7 @@
 {
   "imports": {
+    "marked": "./vendor/marked.esm.js",
+    "dompurify": "./vendor/purify.es.mjs",
     "hash-wasm": "./vendor/hash-wasm.esm.min.js",
     "pdfjs-dist": "./vendor/pdfjs/pdf.min.mjs"
   }

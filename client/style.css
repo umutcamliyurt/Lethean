@@ -1576,3 +1576,7 @@ main.vault {
 .context-menu-sep { height: 1px; background: var(--border); margin: 5px 2px; }
 
 .box-tile, .file-list-row { -webkit-touch-callout: none; }
+.editor-preview table { border-collapse: collapse; margin: 0 0 14px; display: block; overflow-x: auto; max-width: 100%; }
+.editor-preview th, .editor-preview td { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+.editor-preview th { background: var(--surface-2); font-weight: 600; }
+.editor-preview li > input[type=checkbox] { margin-right: 6px; accent-color: var(--text); }
