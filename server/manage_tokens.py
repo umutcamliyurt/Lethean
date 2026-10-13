@@ -12,32 +12,22 @@ def cmd_create(args):
     quota_bytes = int(args.quota_gb * 1024**3) if args.quota_gb is not None else None
     quota_display = f"{args.quota_gb} GB" if args.quota_gb is not None else f"{token_store.DEFAULT_QUOTA_BYTES / 1024**3:g} GB (default)"
 
-    real_token = token_store.create_token(label=args.label, quota_bytes=quota_bytes)
+    first, second = token_store.create_token_pair(label=args.label, quota_bytes=quota_bytes)
 
-    print(f"Real vault token created for {args.label or '(unlabeled)'}:")
-    print(f"  {real_token}")
-
-    if args.no_decoy:
-        print()
-        print(f"Quota: {quota_display}")
-        print("Not yet bound to a vault, it will bind automatically to whichever")
-        print("vault first uploads with it. Give this token to the person who")
-        print("should use it; they enter it in the app alongside their password.")
-        return
-
-    decoy_label = f"{args.label} (decoy)" if args.label else "(decoy)"
-    decoy_token = token_store.create_token(label=decoy_label, quota_bytes=quota_bytes)
-
-    print()
-    print("Decoy vault token (for the Duress Code panel's 'Decoy files' section):")
-    print(f"  {decoy_token}")
+    print(f"Access tokens created for {args.label or '(unlabeled)'}:")
+    print(f"  {first}")
+    print(f"  {second}")
     print()
     print(f"Quota: {quota_display} each")
-    print("Neither is bound to a vault yet, each binds automatically to")
-    print("whichever vault first uploads with it. Give both to the person who")
-    print("should use them: the real token goes in the app's main Access token")
-    print("field alongside their password; the decoy token goes in the")
-    print("Duress Code panel, under 'Decoy files'.")
+    print("Give both to the person. They pick one as their main token (entered in the app")
+    print("alongside their password) and keep the other for the decoy vault (Duress Code")
+    print("panel, under 'Decoy files'). The two are identical, so nobody, including this")
+    print("server, can tell which one they chose. Each binds to whichever vault first uses it.")
+
+
+def cmd_strip_decoy_labels(args):
+    changed = token_store.strip_decoy_labels()
+    print(f"Removed the '(decoy)' marker from {changed} token label(s)." if changed else "No '(decoy)' labels found.")
 
 
 def cmd_list(args):
@@ -126,11 +116,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_create = sub.add_parser("create", help="Create a new, unbound access token (plus a matching decoy-vault token)")
+    p_create = sub.add_parser("create", help="Create a pair of identical, unbound access tokens for one person (one main, one for their decoy vault)")
     p_create.add_argument("--label", help="A human-readable note (e.g. a name) — not sent to clients")
     p_create.add_argument("--quota-gb", type=float, help=f"Storage quota in GB (default: {token_store.DEFAULT_QUOTA_BYTES / 1024**3:g})")
-    p_create.add_argument("--no-decoy", action="store_true", help="Only create the real-vault token, skip the paired decoy-vault token")
     p_create.set_defaults(func=cmd_create)
+
+    p_strip = sub.add_parser("strip-decoy-labels", help="Remove the '(decoy)' marker older versions added to decoy tokens' labels")
+    p_strip.set_defaults(func=cmd_strip_decoy_labels)
 
     p_list = sub.add_parser("list", help="List all tokens and their status")
     p_list.set_defaults(func=cmd_list)

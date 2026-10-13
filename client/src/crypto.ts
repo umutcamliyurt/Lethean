@@ -16,7 +16,11 @@ import {
 export {
   encryptFile,
   encryptFolder,
+  prepareChunkedFile,
+  CHUNK_SIZE,
   decryptContent,
+  decryptToStream,
+  streamToBlob,
   decryptMetadata,
   encryptMetadata,
   unwrapFileKey,
@@ -134,15 +138,26 @@ async function deriveDuressKey(
   return new Uint8Array(hash);
 }
 
-export async function setupDuress(duressCode: string, realVaultId: string): Promise<DuressConfig> {
+const DURESS_V2_MAGIC = utf8('DRS2');
+const DURESS_PAYLOAD_BYTES = 64;
+export const SHRED_SECRET_BYTES = 32;
+
+export type DuressMatch =
+  | { kind: 'secret'; secret: Uint8Array }
+  | { kind: 'legacy-vault'; vaultId: string };
+
+export interface DuressSetup {
+  config: DuressConfig;
+  shredSecret: Uint8Array;
+}
+
+async function sealDuressPayload(duressCode: string, payload: Uint8Array): Promise<DuressConfig> {
   const salt = randomBytes(16);
   const kdfVersion = CURRENT_KDF_VERSION;
   const verifierBytes = await deriveDuressKey(duressCode, salt, 'e2ee-vault|duress-verifier|v1', kdfVersion);
-
   const wrapKeyBytes = await deriveDuressKey(duressCode, salt, 'e2ee-vault|duress-wrap|v1', kdfVersion);
   const wrapKey = await importAesKey(wrapKeyBytes, ['encrypt']);
-  const { iv, ciphertext } = await aesGcmEncrypt(wrapKey, utf8(realVaultId));
-
+  const { iv, ciphertext } = await aesGcmEncrypt(wrapKey, payload);
   return {
     salt: toBase64(salt),
     verifier: toHex(verifierBytes),
@@ -150,6 +165,22 @@ export async function setupDuress(duressCode: string, realVaultId: string): Prom
     iv: toBase64(iv),
     kdfVersion,
   };
+}
+
+export async function setupDuress(duressCode: string): Promise<DuressSetup> {
+  const shredSecret = randomBytes(SHRED_SECRET_BYTES);
+  const payload = randomBytes(DURESS_PAYLOAD_BYTES);
+  payload.set(DURESS_V2_MAGIC, 0);
+  payload.set(shredSecret, DURESS_V2_MAGIC.length);
+  return { config: await sealDuressPayload(duressCode, payload), shredSecret };
+}
+
+export async function setupLegacyDuress(duressCode: string, realVaultId: string): Promise<DuressConfig> {
+  return sealDuressPayload(duressCode, utf8(realVaultId));
+}
+
+export async function sha256Hex(bytes: Uint8Array): Promise<string> {
+  return toHex(await sha256(bytes));
 }
 
 export function randomVaultIdShaped(): string {
@@ -167,7 +198,7 @@ export function generateDecoyDuressConfig(): DuressConfig {
   };
 }
 
-export async function checkDuress(input: string, duressConfig: DuressConfig): Promise<string | null> {
+export async function checkDuress(input: string, duressConfig: DuressConfig): Promise<DuressMatch | null> {
   try {
     const kdfVersion = duressConfig.kdfVersion ?? DEFAULT_LEGACY_KDF_VERSION;
     const saltBytes = fromBase64(duressConfig.salt);
@@ -176,15 +207,20 @@ export async function checkDuress(input: string, duressConfig: DuressConfig): Pr
 
     const wrapKeyBytes = await deriveDuressKey(input, saltBytes, 'e2ee-vault|duress-wrap|v1', kdfVersion);
     const wrapKey = await importAesKey(wrapKeyBytes, ['decrypt']);
-    let vaultId: string | null = null;
+    let payload: Uint8Array | null = null;
     try {
-      const vaultIdBytes = await aesGcmDecrypt(wrapKey, fromBase64(duressConfig.iv), fromBase64(duressConfig.encVaultId));
-      vaultId = new TextDecoder().decode(vaultIdBytes);
+      payload = await aesGcmDecrypt(wrapKey, fromBase64(duressConfig.iv), fromBase64(duressConfig.encVaultId));
     } catch {
-      vaultId = null;
+      payload = null;
     }
+    if (!matches || !payload) return null;
 
-    return matches ? vaultId : null;
+    const isV2 = payload.length === DURESS_PAYLOAD_BYTES
+      && DURESS_V2_MAGIC.every((b, i) => payload![i] === b);
+    if (isV2) {
+      return { kind: 'secret', secret: payload.slice(DURESS_V2_MAGIC.length, DURESS_V2_MAGIC.length + SHRED_SECRET_BYTES) };
+    }
+    return { kind: 'legacy-vault', vaultId: new TextDecoder().decode(payload) };
   } catch {
     return null;
   }

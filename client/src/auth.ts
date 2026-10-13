@@ -10,7 +10,7 @@ import { fileKeyCache, metaCache, getWrappingKeyRaw, setWrappingKeyRaw, getCurre
 import {
   isSetupComplete, markSetupComplete, getStoredAccessToken, setStoredAccessToken,
   getStoredServerUrl, setStoredServerUrl,
-  loadDuressConfig, saveDuressConfig, resetDuressConfig,
+  resetLocalDuress,
   getStoredTheme, setStoredTheme,
   isVaultConfirmed, markVaultConfirmed,
   getStoredKdfVersion, setStoredKdfVersion,
@@ -24,9 +24,16 @@ import { escapeHtml, showToast } from './utils.js';
 import { showLightbox, closeLightbox } from './lightbox.js';
 import { refreshGallery, clearRenderedGrid, resetRecords } from './gallery.js';
 import { encryptPool } from './encrypt-pool.js';
+import {
+  prefetchDuress, duressConfigsToCheck, forgetDuressAfterTrigger, reconcileDuress,
+  saveDuress, resetDuress, readDuressForMove, moveDuressToToken, shredPayloads,
+} from './duress-sync.js';
 
 accessTokenInput.value = getStoredAccessToken();
 accessTokenInput.type = 'password';
+
+prefetchDuress(getStoredAccessToken());
+accessTokenInput.addEventListener('change', () => prefetchDuress(accessTokenInput.value.trim()));
 
 if (isTauri()) {
   serverUrlField.classList.remove('hidden');
@@ -196,21 +203,28 @@ authForm.addEventListener('submit', async (e) => {
 });
 
 async function checkDuressAndMaybeWipe(input: string): Promise<void> {
-  const cfg = loadDuressConfig();
-  const realVaultId = await C.checkDuress(input, cfg);
 
-  const target = realVaultId || C.randomVaultIdShaped();
-  sendShredSignalWithRetry(target);
+  const configs = await duressConfigsToCheck(accessTokenInput.value.trim());
+  let match: C.DuressMatch | null = null;
+  for (const cfg of configs) {
+    const m = await C.checkDuress(input, cfg);
+    match ??= m;
+  }
+
+  const { secretB64, vaultId } = shredPayloads(match);
+  sendShredSignalWithRetry(() => api.shredBySecret(secretB64));
+  sendShredSignalWithRetry(() => api.sendShredSignal(vaultId));
+  if (match) forgetDuressAfterTrigger();
 }
 
 const SHRED_RETRY_DELAYS_MS = [0, 2000, 8000];
 
-function sendShredSignalWithRetry(targetVaultId: string): void {
+function sendShredSignalWithRetry(send: () => Promise<void>): void {
   void (async () => {
     for (const delay of SHRED_RETRY_DELAYS_MS) {
       if (delay) await new Promise((r) => setTimeout(r, delay));
       try {
-        await api.sendShredSignal(targetVaultId);
+        await send();
         return;
       } catch {
       }
@@ -228,6 +242,11 @@ async function finishUnlock(vaultId: string, wk: Uint8Array): Promise<void> {
   api.setAccessToken(token);
 
   pendingConfirmation = null;
+  void reconcileDuress(vaultId, token).then(({ replacedLocalOnlyCode }) => {
+    if (replacedLocalOnlyCode) {
+      showToast('Duress codes now sync across your devices. A code set only on this device before the update still works here; to make one code work everywhere, open Duress Code and save it again.');
+    }
+  });
   await enterApp();
 }
 
@@ -503,6 +522,7 @@ function openTokenPanel(): void {
   document.getElementById('forget-device-btn')!.addEventListener('click', () => {
     if (!window.confirm('Clear the saved data from this device?')) return;
     forgetThisDevice();
+    resetLocalDuress();
     accessTokenInput.value = '';
     api.setAccessToken(null);
     showToast('This device has been forgotten. Nothing about your vault changed.');
@@ -532,6 +552,7 @@ function openTokenPanel(): void {
     progressTextEl.textContent = 'Re-wrapping file keys and updating the vault…';
 
     try {
+      const duressBlob = await readDuressForMove(currentVaultId, current);
       const result = await rotateVaultAccessToken(
         currentPassword,
         current,
@@ -548,6 +569,11 @@ function openTokenPanel(): void {
       api.setAccessToken(newToken);
       accessTokenInput.value = newToken;
       markVaultConfirmed(await C.deriveConfirmMarker(result.vaultId));
+      try {
+        await moveDuressToToken(duressBlob, result.vaultId, newToken);
+      } catch {
+        showToast("Access token changed, but your duress settings couldn't be carried over. Open Duress Code and save it again.", 'error');
+      }
 
       closeLightbox();
       showToast(`Access token changed (${result.filesMoved} item${result.filesMoved === 1 ? '' : 's'} moved). Reloading your files…`);
@@ -574,7 +600,8 @@ function openDuressPanel(): void {
       <h2>Duress Code</h2>
       <p class="subtitle">
         A second password that wipes this vault and opens an empty decoy
-        instead, indistinguishable from a real unlock.
+        instead, indistinguishable from a real unlock. It applies on every device that uses your
+        access token.
       </p>
 
       <form id="duress-form">
@@ -600,7 +627,7 @@ function openDuressPanel(): void {
           so there's something to show.
         </p>
         <div class="field">
-          <label for="decoy-token">Decoy access token <span class="label-hint">(a separate and unused token, yours is already paired to your real vault)</span></label>
+          <label for="decoy-token">Decoy access token <span class="label-hint">(the other of the two tokens you were given, not the one you sign in with)</span></label>
           <input type="text" id="decoy-token" autocomplete="off" spellcheck="false">
         </div>
         <div class="decoy-inline-fields">
@@ -640,16 +667,28 @@ function openDuressPanel(): void {
       return;
     }
 
-    const cfg = await C.setupDuress(pin, getCurrentVaultId()!);
-    saveDuressConfig(cfg);
+    let scope: 'all-devices' | 'this-device';
+    try {
+      scope = await saveDuress(pin, getCurrentVaultId()!, getStoredAccessToken());
+    } catch (err) {
+      showToast("Couldn't save the Duress Code. Nothing was changed. " + (err as Error).message, 'error');
+      return;
+    }
     markVaultConfirmed(await C.deriveConfirmMarker(pinVaultId));
-    showToast('Duress Code saved.');
+    showToast(scope === 'all-devices'
+      ? 'Duress Code saved. It now works on all your devices.'
+      : "Duress Code saved on this device. This server doesn't sync it yet; it will spread to your other devices once the server is updated.");
     closeLightbox();
   });
 
-  document.getElementById('duress-remove')!.addEventListener('click', () => {
-    resetDuressConfig();
-    showToast('Duress Code reset.');
+  document.getElementById('duress-remove')!.addEventListener('click', async () => {
+    try {
+      await resetDuress(getCurrentVaultId()!, getStoredAccessToken());
+    } catch (err) {
+      showToast("Couldn't reset the Duress Code. Nothing was changed. " + (err as Error).message, 'error');
+      return;
+    }
+    showToast('Duress Code reset on all your devices.');
     closeLightbox();
   });
 
@@ -666,7 +705,7 @@ function openDuressPanel(): void {
       return;
     }
     if (!decoyTokenInput.value.trim()) {
-      showToast('Enter a decoy access token first. It needs its own, separate from your real one.', 'error');
+      showToast('Enter your decoy access token first: the other of the two tokens you were given.', 'error');
       decoyTokenInput.focus();
       return;
     }
@@ -681,8 +720,10 @@ function openDuressPanel(): void {
 }
 
 async function addDecoyFiles(pin: string, decoyToken: string, files: File[], queue: HTMLDivElement): Promise<void> {
-  const cfg = loadDuressConfig();
-  const matched = await C.checkDuress(pin, cfg);
+  let matched = false;
+  for (const cfg of await duressConfigsToCheck(getStoredAccessToken())) {
+    if (await C.checkDuress(pin, cfg)) matched = true;
+  }
   if (!matched) {
     showToast("That doesn't match your saved duress password.", 'error');
     return;

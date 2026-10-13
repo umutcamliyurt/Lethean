@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import Column, String, Integer, DateTime, ForeignKey, Index
+from sqlalchemy import Boolean, BigInteger, Column, String, Integer, DateTime, ForeignKey, Index
 from database import Base
 
 
@@ -50,3 +50,40 @@ class ShareToken(Base):
 
 
 Index("ix_share_tokens_file", ShareToken.file_id)
+
+class UploadSession(Base):
+
+    __tablename__ = "upload_sessions"
+
+    id = Column(String, primary_key=True)
+    vault_id = Column(String, nullable=False, index=True)
+
+    encrypted_metadata = Column(String, nullable=False)
+    metadata_iv = Column(String, nullable=False)
+    content_iv = Column(String, nullable=False)
+    wrapped_file_key = Column(String, nullable=False)
+    wrap_iv = Column(String, nullable=False)
+
+    part_count = Column(Integer, nullable=False)
+    part_size = Column(Integer, nullable=False)
+    total_size = Column(BigInteger, nullable=False)
+
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class DuressSlot(Base):
+
+    __tablename__ = "duress_slots"
+
+    token_hash = Column(String, primary_key=True)
+    blob = Column(String, nullable=False)
+    written = Column(Boolean, nullable=False, default=False)
+    updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+
+class ShredHash(Base):
+
+    __tablename__ = "shred_hashes"
+
+    vault_id = Column(String, primary_key=True)
+    shred_hash = Column(String, nullable=False, unique=True, index=True)

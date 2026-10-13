@@ -8,6 +8,7 @@ use zeroize::Zeroizing;
 
 use crate::api::{ApiClient, RewrapEntry};
 use crate::crypto::aead;
+use crate::crypto::chunked::{self, ChunkedEncryptReader, CHUNK_SIZE};
 use crate::crypto::gcm_stream::{GcmDecryptReader, GcmEncryptReader, AUTH_FAILED, STREAM_THRESHOLD};
 use crate::scratch::{self, Scratch, ScratchPool, ScratchWriter, DEFAULT_POOL_BYTES};
 use crate::types::{EncryptedHeader, FileMeta, FileRecord};
@@ -371,6 +372,7 @@ impl Vault {
                     unpadded_size: None,
                     is_folder: false,
                     parent_id: None,
+                    chunk_size: None,
                 },
                 Zeroizing::new(Vec::new()),
             ),
@@ -510,6 +512,27 @@ impl Vault {
             return self.get(&id).context("upload succeeded but the new entry vanished (likely deleted concurrently)");
         }
 
+        if size > CHUNK_SIZE {
+            let plan = chunked::plan_chunked_upload(&wrapping_key, name, mime, size, parent_id)?;
+            let record = self
+                .api
+                .upload_in_parts(
+                    &plan.header,
+                    plan.body_len(),
+                    || {
+                        let src = factory()?;
+                        let body: Box<dyn Read + 'a> = Box::new(ChunkedEncryptReader::new(src, &plan.file_key, &plan.prefix, size));
+                        Ok(body)
+                    },
+                    None,
+                    None,
+                )
+                .context("upload failed")?;
+            let id = record.id.clone();
+            self.ingest_record(record);
+            return self.get(&id).context("upload succeeded but the new entry vanished (likely deleted concurrently)");
+        }
+
         let plan = aead::plan_stream_upload(&wrapping_key, name, mime, size, parent_id)?;
         let record = self
             .api
@@ -556,7 +579,7 @@ impl Vault {
 
 
     fn is_large(entry: &Entry) -> bool {
-        entry.size().max(entry.record.size.unwrap_or(0)) > IN_MEMORY_READ_MAX
+        entry.meta.chunk_size.is_some() || entry.size().max(entry.record.size.unwrap_or(0)) > IN_MEMORY_READ_MAX
     }
 
     fn stream_decrypted(&self, entry: &Entry, w: &mut dyn Write) -> Result<u64> {
@@ -564,6 +587,11 @@ impl Vault {
             bail!("\"{}\" could not be decrypted (wrong vault password, or a corrupted item)", entry.name());
         }
         let iv = aead::from_base64(&entry.record.content_iv)?;
+        if let Some(chunk_size) = entry.meta.chunk_size {
+            let true_size = entry.meta.unpadded_size.context("chunked file without a size in its metadata")?;
+            let (body, _len) = self.api.open_blob(&entry.record.id)?;
+            return Ok(chunked::decrypt_chunked(body, &entry.file_key, &iv, chunk_size, true_size, w)?);
+        }
         let (body, _len) = self.api.open_blob(&entry.record.id)?;
         let mut dec = GcmDecryptReader::new(body, &entry.file_key, &iv)?;
         let limit = entry.meta.unpadded_size.unwrap_or(u64::MAX);
@@ -776,7 +804,7 @@ impl Vault {
             match len {
                 Some(total) => {
                     let mut first = Some(first);
-                    self.api.upload_stream(
+                    self.api.upload_in_parts(
                         &header,
                         total,
                         || {
@@ -796,7 +824,7 @@ impl Vault {
                 None => {
                     drop(first);
                     let ciphertext = self.api.download_content(old_id)?;
-                    self.api.upload_stream(
+                    self.api.upload_in_parts(
                         &header,
                         ciphertext.len() as u64,
                         || {

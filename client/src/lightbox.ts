@@ -1,4 +1,3 @@
-import * as C from './crypto.js';
 import * as api from './api.js';
 import { lightbox, boxGrid } from './dom.js';
 import { fileKeyCache, metaCache, objectUrlCache } from './state.js';
@@ -11,7 +10,8 @@ import { editTextFile, isMarkdownFile, renderMarkdownPreview } from './editor.js
 import { openPdfPreview } from './pdf-preview.js';
 import type { PdfPreviewHandle } from './pdf-preview.js';
 import type { FileMeta, FileRecord } from './types.js';
-import { isTauri, saveBytes } from './platform.js';
+import { isTauri } from './platform.js';
+import { downloadDecrypted } from './save-stream.js';
 
 let lightboxMediaList: FileRecord[] = [];
 let lightboxIndex = -1;
@@ -204,14 +204,8 @@ document.addEventListener('MSFullscreenChange', () => {
   updateFullscreenButton();
 });
 
-function isThumbnailedKind(meta: FileMeta | undefined | null): boolean {
-  return fileKind(meta?.mime) === 'image';
-}
-
 function releaseEphemeralPreview(id: string | null): void {
   if (!id) return;
-  const meta = metaCache.get(id);
-  if (isThumbnailedKind(meta)) return;
   const url = objectUrlCache.get(id);
   if (url) {
     URL.revokeObjectURL(url);
@@ -640,27 +634,20 @@ lightbox.addEventListener('touchend', (e) => {
 
 export async function downloadAndSave(record: FileRecord, meta: FileMeta, existingUrl?: string): Promise<void> {
   try {
-    if (isTauri()) {
-      const fileKeyRaw = fileKeyCache.get(record.id)!;
-      const ciphertext = await api.downloadContent(record.id);
-      const bytes = await C.decryptContent(fileKeyRaw, record.content_iv, ciphertext, meta.compressed, meta.unpaddedSize ?? null);
-      await saveBytes(meta.name, meta.mime, bytes);
+    if (existingUrl && !isTauri()) {
+      const a = document.createElement('a');
+      a.href = existingUrl;
+      a.download = meta.name;
+      a.click();
       return;
     }
 
-    let url = existingUrl;
-    if (!url) {
-      const fileKeyRaw = fileKeyCache.get(record.id)!;
-      const ciphertext = await api.downloadContent(record.id);
-      const bytes = await C.decryptContent(fileKeyRaw, record.content_iv, ciphertext, meta.compressed, meta.unpaddedSize ?? null);
-      const blob = new Blob([bytes as BlobPart], { type: meta.mime });
-      url = URL.createObjectURL(blob);
-    }
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = meta.name;
-    a.click();
-    if (!existingUrl) URL.revokeObjectURL(url);
+    await downloadDecrypted({
+      request: api.fileBlobRequest(record.id),
+      fileKeyRaw: fileKeyCache.get(record.id)!,
+      contentIv: record.content_iv,
+      meta,
+    });
   } catch (err) {
     showToast('Download failed. ' + (err as Error).message, 'error');
   }

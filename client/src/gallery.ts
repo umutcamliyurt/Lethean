@@ -7,6 +7,7 @@ import {
   selectionDownloadBtn, selectionMoveBtn, selectionDeleteBtn, selectionCancelBtn,
 } from './dom.js';
 import { fileKeyCache, metaCache, objectUrlCache, getWrappingKeyRaw } from './state.js';
+import { acquireThumbnail, releaseThumbnail, dropThumbnail, clearThumbnails } from './thumbnails.js';
 import { getStoredViewMode, setStoredViewMode } from './storage.js';
 import { fileKind, fileTypeLabel, formatBytes, decryptedSize, icon, showToast, isCoarsePointerDevice } from './utils.js';
 import { openTile, downloadAndSave } from './lightbox.js';
@@ -176,6 +177,7 @@ async function deleteIds(ids: string[]): Promise<void> {
     try {
       await api.deleteFile(id);
       if (objectUrlCache.has(id)) { URL.revokeObjectURL(objectUrlCache.get(id)!); objectUrlCache.delete(id); }
+      dropThumbnail(id);
       fileKeyCache.delete(id);
       metaCache.delete(id);
     } catch {
@@ -219,22 +221,28 @@ async function moveOneRecord(oldId: string, newParentId: string | null): Promise
     throw new Error(`"${meta?.name ?? oldId}" isn't fully loaded yet — wait for the gallery to finish loading and try again.`);
   }
 
-  const rawCiphertext = await api.downloadContent(oldId);
+  const { stream } = await api.openDownloadStream(oldId);
+  const ciphertextBlob = await C.streamToBlob(stream);
   const updatedMeta: FileMeta = { ...meta, parentId: newParentId };
   const { encryptedMetadata, metadataIv } = await C.encryptMetadata(fileKeyRaw, updatedMeta);
 
-  const newRecord = await api.uploadFile({
-    ciphertext: rawCiphertext,
+  const fields = {
     contentIv: record.content_iv,
     encryptedMetadata,
     metadataIv,
     wrappedFileKey: record.wrapped_file_key,
     wrapIv: record.wrap_iv,
-  });
+  };
+  const newRecord = await api.uploadFile(
+    ciphertextBlob.size <= api.SINGLE_UPLOAD_MAX_BYTES
+      ? { ...fields, ciphertext: new Uint8Array(await ciphertextBlob.arrayBuffer()) }
+      : api.ciphertextBlobAsParts(fields, ciphertextBlob)
+  );
 
   await api.deleteFile(oldId);
 
   if (objectUrlCache.has(oldId)) { URL.revokeObjectURL(objectUrlCache.get(oldId)!); objectUrlCache.delete(oldId); }
+  dropThumbnail(oldId);
   fileKeyCache.delete(oldId);
   metaCache.delete(oldId);
   fileKeyCache.set(newRecord.id, fileKeyRaw);
@@ -326,6 +334,8 @@ export function resetRecords(): void {
 }
 
 export function clearRenderedGrid(): void {
+  unmountAllThumbs();
+  clearThumbnails();
   for (const url of objectUrlCache.values()) URL.revokeObjectURL(url);
   objectUrlCache.clear();
   boxGrid.innerHTML = '';
@@ -510,6 +520,7 @@ function renderBreadcrumb(): void {
 }
 
 function renderCurrentView(): void {
+  unmountAllThumbs();
   boxGrid.innerHTML = '';
   fileListBody.innerHTML = '';
   const shown = visibleRecords();
@@ -560,6 +571,52 @@ searchClearBtn?.addEventListener('click', () => {
   renderCurrentView();
   searchInput.focus();
 });
+
+const thumbTiles = new WeakMap<Element, FileRecord>();
+const thumbObserver = new IntersectionObserver((entries) => {
+  for (const entry of entries) {
+    const tile = entry.target as HTMLElement;
+    const record = thumbTiles.get(tile);
+    if (!record) continue;
+    if (entry.isIntersecting) mountThumb(tile, record);
+    else unmountThumb(tile, record.id);
+  }
+}, { rootMargin: '600px 0px' });
+
+function mountThumb(tile: HTMLElement, record: FileRecord): void {
+  if (tile.dataset.thumb) return;
+  const meta = metaCache.get(record.id);
+  if (!meta) return;
+  tile.dataset.thumb = 'pending';
+  const wanted = () => tile.isConnected && tile.dataset.thumb === 'pending';
+  acquireThumbnail(record, meta, wanted).then((url) => {
+    if (!url) { if (wanted()) delete tile.dataset.thumb; return; }
+    if (!wanted()) { releaseThumbnail(record.id); return; }
+    const img = document.createElement('img');
+    img.decoding = 'async';
+    img.alt = meta.name;
+    img.src = url;
+    tile.querySelector('.box-body')!.prepend(img);
+    tile.dataset.thumb = 'on';
+  });
+}
+
+function unmountThumb(tile: HTMLElement, id: string): void {
+  const state = tile.dataset.thumb;
+  delete tile.dataset.thumb;
+  if (state !== 'on') return;
+  const img = tile.querySelector('.box-body > img') as HTMLImageElement | null;
+  if (img) { img.removeAttribute('src'); img.remove(); }
+  releaseThumbnail(id);
+}
+
+function unmountAllThumbs(): void {
+  boxGrid.querySelectorAll<HTMLElement>('.box-tile[data-thumb]').forEach((tile) => {
+    const record = thumbTiles.get(tile);
+    if (record) unmountThumb(tile, record.id);
+  });
+  thumbObserver.disconnect();
+}
 
 function renderTile(record: FileRecord): HTMLDivElement {
   const meta: FileMeta = metaCache.get(record.id) || { name: '\u2026', mime: '' };
@@ -629,20 +686,8 @@ function renderTile(record: FileRecord): HTMLDivElement {
   });
 
   if (!isFolder && kind === 'image') {
-    const observer = new IntersectionObserver(async (entries) => {
-      if (entries[0]?.isIntersecting) {
-        observer.disconnect();
-        try {
-          const url = await getDecryptedUrl(record);
-          const img = document.createElement('img');
-          img.src = url;
-          img.alt = meta.name;
-          tile.querySelector('.box-body')!.prepend(img);
-        } catch {
-        }
-      }
-    }, { rootMargin: '200px' });
-    observer.observe(tile);
+    thumbTiles.set(tile, record);
+    thumbObserver.observe(tile);
   }
 
   return tile;
@@ -834,15 +879,19 @@ export async function getDecryptedBytes(record: FileRecord): Promise<Uint8Array>
   const fileKeyRaw = fileKeyCache.get(record.id)!;
   const ciphertext = await api.downloadContent(record.id);
   const meta = metaCache.get(record.id)!;
-  return C.decryptContent(fileKeyRaw, record.content_iv, ciphertext, meta.compressed, meta.unpaddedSize);
+  return C.decryptContent(fileKeyRaw, record.content_iv, ciphertext, meta.compressed, meta.unpaddedSize ?? null, meta.chunkSize ?? null);
+}
+
+export async function getDecryptedBlob(record: FileRecord): Promise<Blob> {
+  const fileKeyRaw = fileKeyCache.get(record.id)!;
+  const meta = metaCache.get(record.id)!;
+  const { stream } = await api.openDownloadStream(record.id);
+  return C.streamToBlob(C.decryptToStream(fileKeyRaw, record.content_iv, stream, meta), meta.mime);
 }
 
 export async function getDecryptedUrl(record: FileRecord): Promise<string> {
   if (objectUrlCache.has(record.id)) return objectUrlCache.get(record.id)!;
-  const meta = metaCache.get(record.id)!;
-  let bytes: Uint8Array | null = await getDecryptedBytes(record);
-  const blob = new Blob([bytes as BlobPart], { type: meta.mime });
-  bytes = null;
+  const blob = await getDecryptedBlob(record);
   const url = URL.createObjectURL(blob);
   objectUrlCache.set(record.id, url);
   return url;
@@ -882,6 +931,7 @@ export async function createFolder(name: string): Promise<void> {
 
 export function removeRecordLocally(fileId: string): void {
   if (objectUrlCache.has(fileId)) { URL.revokeObjectURL(objectUrlCache.get(fileId)!); objectUrlCache.delete(fileId); }
+  dropThumbnail(fileId);
   fileKeyCache.delete(fileId);
   metaCache.delete(fileId);
   records = records.filter((r) => r.id !== fileId);
@@ -905,6 +955,7 @@ export async function handleDelete(fileId: string): Promise<boolean> {
     for (const id of idsToDelete) {
       await api.deleteFile(id);
       if (objectUrlCache.has(id)) { URL.revokeObjectURL(objectUrlCache.get(id)!); objectUrlCache.delete(id); }
+      dropThumbnail(id);
       fileKeyCache.delete(id);
       metaCache.delete(id);
     }

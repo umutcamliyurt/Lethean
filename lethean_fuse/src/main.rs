@@ -8,13 +8,14 @@ use clap::{Parser, Subcommand};
 use zeroize::Zeroize;
 
 use lethean_fuse_lib::api::{self, ApiClient};
-use lethean_fuse_lib::config::Config;
+use lethean_fuse_lib::config::{Config, ConfigDuressCache};
 use lethean_fuse_lib::crypto::kdf;
+use lethean_fuse_lib::duress;
 use lethean_fuse_lib::fuse_fs;
 use lethean_fuse_lib::vault::Vault;
 
 #[derive(Parser)]
-#[command(name = "lethean-cli", version, about = "Mount an e2ee-vault as a local filesystem, or drive it headlessly")]
+#[command(name = "lethean-fuse", version, about = "Mount an e2ee-vault as a local filesystem, or drive it headlessly")]
 struct Cli {
     #[arg(long, global = true)]
     server: Option<String>,
@@ -57,6 +58,19 @@ enum Command {
         allow_delete: bool,
     },
     Unshare { file_id: String },
+    Duress {
+        #[command(subcommand)]
+        action: DuressAction,
+    },
+}
+
+#[derive(Subcommand, Clone)]
+enum DuressAction {
+    Set,
+    Reset,
+    AddDecoyFiles {
+        files: Vec<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -123,7 +137,7 @@ fn prompt_hidden(label: &str) -> Result<String> {
 }
 
 fn resolve_server(cli: &Cli, config: &Config) -> Result<String> {
-    cli.server.clone().or_else(|| config.server_url.clone()).context("no server URL configured, pass --server or run `lethean-cli config set-server <url>`")
+    cli.server.clone().or_else(|| config.server_url.clone()).context("no server URL configured, pass --server or run `lethean-fuse config set-server <url>`")
 }
 
 fn resolve_access_token(cli: &Cli, config: &Config) -> Option<String> {
@@ -139,17 +153,23 @@ fn unlock_session(cli: &Cli, config: &Config) -> Result<Vault> {
         bail!("password cannot be empty");
     }
 
+    let api = ApiClient::new(server)?;
+    let _ = duress::check_and_signal(&api, access_token.as_deref(), &password, &ConfigDuressCache);
+
     let unlocked = kdf::unlock_vault(&password, access_token.as_deref(), cli.kdf_version)?;
     password.zeroize();
 
-    let api = ApiClient::new(server)?;
+    let vault_id = unlocked.vault_id.clone();
     api.set_vault_id(Some(unlocked.vault_id));
-    api.set_access_token(access_token);
+    api.set_access_token(access_token.clone());
 
     let vault = Vault::new(api, unlocked.wrapping_key_raw);
     eprintln!("Fetching file index…");
     vault.refresh_all().context("could not list vault files (wrong password/access token, or server unreachable?)")?;
     eprintln!("Loaded {} item(s).", vault.all_entries().len());
+    if duress::reconcile(&vault.api, &vault_id, access_token.as_deref(), &ConfigDuressCache) {
+        eprintln!("Note: duress codes now sync across your devices. A code set only on this device before the update still works here; run `lethean-fuse duress set` to make one code work everywhere.");
+    }
     Ok(vault)
 }
 
@@ -335,6 +355,93 @@ fn cmd_unshare(cli: &Cli, config: &Config, file_id: String) -> Result<()> {
     Ok(())
 }
 
+fn cmd_duress(cli: &Cli, config: &Config, action: DuressAction) -> Result<()> {
+    let access_token = resolve_access_token(cli, config).context("the duress code is tied to your access token; set one with `lethean-fuse config set-token` or --access-token")?;
+    match action {
+        DuressAction::Set | DuressAction::Reset => {
+            let vault = unlock_session(cli, config)?;
+            let vault_id = vault.api.vault_id().context("no vault is unlocked")?;
+            let scope = if matches!(action, DuressAction::Set) {
+                let mut code = prompt_hidden("New duress password: ")?;
+                let mut confirm = prompt_hidden("Confirm duress password: ")?;
+                let same = code == confirm;
+                confirm.zeroize();
+                if !same {
+                    code.zeroize();
+                    vault.close();
+                    bail!("passwords did not match");
+                }
+                let strength = kdf::validate_password_strength(&code);
+                if !strength.valid {
+                    for e in &strength.errors {
+                        eprintln!("- {e}");
+                    }
+                    code.zeroize();
+                    vault.close();
+                    bail!("duress password is too weak");
+                }
+                let decoy = kdf::unlock_vault(&code, Some(&access_token), cli.kdf_version)?;
+                if decoy.vault_id == vault_id {
+                    code.zeroize();
+                    vault.close();
+                    bail!("the duress password must be different from your real password");
+                }
+                let r = duress::save_code(&vault.api, &code, &vault_id, &access_token, &ConfigDuressCache);
+                code.zeroize();
+                r?
+            } else {
+                duress::reset_code(&vault.api, &vault_id, &access_token, &ConfigDuressCache)?
+            };
+            vault.close();
+            match (matches!(action, DuressAction::Set), scope) {
+                (true, duress::SaveScope::AllDevices) => println!("Duress password saved. It now works on all your devices."),
+                (true, duress::SaveScope::ThisDeviceOnly) => println!("Duress password saved on this device. This server doesn't sync it yet; it will spread to your other devices once the server is updated."),
+                (false, duress::SaveScope::AllDevices) => println!("Duress password removed on all your devices."),
+                (false, duress::SaveScope::ThisDeviceOnly) => println!("Duress password removed on this device."),
+            }
+            Ok(())
+        }
+        DuressAction::AddDecoyFiles { files } => {
+            if files.is_empty() {
+                bail!("name at least one file to add");
+            }
+            let server = resolve_server(cli, config)?;
+            let api = ApiClient::new(server.clone())?;
+            let mut code = prompt_hidden("Duress password: ")?;
+            if !duress::is_duress_code(&api, Some(&access_token), &code, &ConfigDuressCache) {
+                code.zeroize();
+                bail!("that doesn't match your saved duress password");
+            }
+            let mut decoy_token = prompt_hidden("Decoy access token (the other of your two tokens, not the one you sign in with): ")?;
+            let decoy_token_trimmed = decoy_token.trim().to_string();
+            decoy_token.zeroize();
+            if decoy_token_trimmed.is_empty() || decoy_token_trimmed == access_token {
+                code.zeroize();
+                bail!("enter your decoy token: the other of the two tokens you were given");
+            }
+            let decoy = kdf::unlock_vault(&code, Some(&access_token), cli.kdf_version)?;
+            code.zeroize();
+            let decoy_api = ApiClient::new(server)?;
+            decoy_api.set_vault_id(Some(decoy.vault_id));
+            decoy_api.set_access_token(Some(decoy_token_trimmed));
+            let decoy_vault = Vault::new(decoy_api, decoy.wrapping_key_raw);
+            for path in &files {
+                let name = path.file_name().and_then(|n| n.to_str()).context("file name must be valid UTF-8")?.to_string();
+                let size = std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?.len();
+                decoy_vault
+                    .create_file_streaming(&name, "application/octet-stream", size, None, || {
+                        let f: Box<dyn Read> = Box::new(std::fs::File::open(path)?);
+                        Ok(f)
+                    })
+                    .with_context(|| format!("adding {}", path.display()))?;
+                println!("Added {name} to the decoy vault.");
+            }
+            decoy_vault.close();
+            Ok(())
+        }
+    }
+}
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let cli = Cli::parse();
@@ -351,5 +458,6 @@ fn main() -> Result<()> {
         Command::RotatePassword => cmd_rotate_password(&cli, &config),
         Command::Share { ref file_id, max_downloads, expires_in_seconds, allow_delete } => cmd_share(&cli, &config, file_id.clone(), max_downloads, expires_in_seconds, allow_delete),
         Command::Unshare { ref file_id } => cmd_unshare(&cli, &config, file_id.clone()),
+        Command::Duress { ref action } => cmd_duress(&cli, &config, action.clone()),
     }
 }

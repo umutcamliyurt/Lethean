@@ -22,17 +22,24 @@ In scope:
 - Flaws in the cryptographic design or implementation described in [`CRYPTOGRAPHY.md`](CRYPTOGRAPHY.md)
 - Any way for the server, or an attacker with its stored data, to learn plaintext, passwords, keys, file names, directory structure, or exact file sizes
 - Authentication or authorization bypass, including access token and quota handling
-- Duress code or decoy vault behavior that is distinguishable from the normal unlock path
+- Duress code or decoy vault behavior that is distinguishable from the normal unlock path, including through the synced duress settings, their write pattern, or the wipe request
+- Any way to learn whether a vault has a duress code, or which token of a pair is the decoy, from stored data alone, or to recover a vault ID or file keys from the duress settings
+- Any way to wipe a vault without its duress secret, or to change another vault's duress settings
+- Attacks on chunked files: reordering, dropping, truncating or splicing chunks without detection
+- Quota or authorization bypass through multi-part uploads, and access to another vault's upload sessions
+- Issues in the download service worker or thumbnail workers, such as serving one file's plaintext to another origin, or keys or credentials outliving the download they were given for
 - Admin panel and share link vulnerabilities
 - Injection, path traversal, or remote code execution in the server
 - Vulnerabilities in the web, desktop, mobile, or FUSE clients
+- Any way for a malicious or compromised server to learn passwords, keys or plaintext from desktop or mobile app users, or to get tampered data accepted by any client
 
 Out of scope, as documented in the [threat model](README.md#threat-model):
 
-- Active server compromise, including a malicious operator serving modified JavaScript to the web client
+- A malicious server serving modified JavaScript to the web client or the share-link page, and a server denying service (withholding, deleting or restoring files, ignoring wipe requests)
 - A compromised client device, browser, or extension
 - Weak or reused passwords
-- Metadata visible by design: padded size buckets, record counts, and access patterns
+- Metadata visible by design: padded size buckets (including the 32 MiB steps of large files), record counts, access patterns, when duress settings are written, and whether the second token of a pair is in use
+- Offline guessing of a weak duress password by someone who holds your access token (the duress settings are readable with the token by design, so devices can fetch them before unlocking)
 - A compromised admin password
 - Anyone holding a complete share link, which is the decryption key for that file
 - Volumetric denial of service, and third-party dependency issues with no exploitable path (report those upstream)

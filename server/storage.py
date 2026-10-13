@@ -141,3 +141,95 @@ def delete_blob(path: str) -> None:
         os.remove(path)
     except FileNotFoundError:
         pass
+
+import shutil
+
+_SESSION_ID_RE = re.compile(r"^[A-Za-z0-9_-]{16,64}$")
+_UPLOADS_DIR = "_uploads"
+
+
+def _session_dir(session_id: str) -> str:
+    if not _SESSION_ID_RE.match(session_id):
+        raise ValueError("invalid upload session id")
+    return os.path.join(STORAGE_ROOT, _UPLOADS_DIR, session_id)
+
+
+def create_session_file(session_id: str, total_size: int) -> None:
+    d = _session_dir(session_id)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    fd = os.open(os.path.join(d, "data.bin"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        os.ftruncate(fd, total_size)
+    finally:
+        os.close(fd)
+
+
+def _pwrite_all(fd: int, data: bytes, offset: int) -> None:
+    view = memoryview(data)
+    while view:
+        n = os.pwrite(fd, view, offset)
+        view = view[n:]
+        offset += n
+
+
+async def write_part_streamed(
+    session_id: str,
+    index: int,
+    offset: int,
+    expected_len: int,
+    chunks,
+    read_timeout: float = _READ_STALL_TIMEOUT_SECONDS,
+) -> None:
+    d = _session_dir(session_id)
+    marker = os.path.join(d, f"{index}.done")
+    try:
+        os.remove(marker)
+    except FileNotFoundError:
+        pass
+
+    fd = os.open(os.path.join(d, "data.bin"), os.O_WRONLY)
+    try:
+        written = 0
+        iterator = chunks.__aiter__()
+        while True:
+            try:
+                chunk = await asyncio.wait_for(iterator.__anext__(), timeout=read_timeout)
+            except StopAsyncIteration:
+                break
+            except asyncio.TimeoutError:
+                raise ValueError(f"upload stalled: no data received within {read_timeout:.0f}s")
+            if not chunk:
+                continue
+            if written + len(chunk) > expected_len:
+                raise ValueError(f"part {index} is larger than {expected_len} bytes")
+            await asyncio.to_thread(_pwrite_all, fd, chunk, offset + written)
+            written += len(chunk)
+        if written != expected_len:
+            raise ValueError(f"part {index} must be exactly {expected_len} bytes, got {written}")
+        await asyncio.to_thread(os.fsync, fd)
+    finally:
+        os.close(fd)
+
+    with open(marker, "wb"):
+        pass
+
+
+def received_parts(session_id: str) -> list[int]:
+    try:
+        names = os.listdir(_session_dir(session_id))
+    except FileNotFoundError:
+        return []
+    return sorted(int(n[:-5]) for n in names if n.endswith(".done") and n[:-5].isdigit())
+
+
+def finalize_session(session_id: str, final_path: str) -> None:
+    d = _session_dir(session_id)
+    os.replace(os.path.join(d, "data.bin"), final_path)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def remove_session(session_id: str) -> None:
+    try:
+        shutil.rmtree(_session_dir(session_id), ignore_errors=True)
+    except ValueError:
+        pass

@@ -1,8 +1,10 @@
 import * as api from './api.js';
 import { encryptPool } from './encrypt-pool.js';
 import { depositSlot, chooseFilesBtn, newFolderBtn, fileInput, uploadQueue } from './dom.js';
+import { prepareChunkedFile, CHUNK_SIZE } from './crypto-encrypt-core.js';
 import { getWrappingKeyRaw } from './state.js';
 import { icon, showToast } from './utils.js';
+import type { ChunkedFilePayload, EncryptedFilePayload } from './types.js';
 import { addUploadedRecord, getCurrentFolderId, createFolder } from './gallery.js';
 
 chooseFilesBtn.addEventListener('click', () => fileInput.click());
@@ -159,6 +161,7 @@ async function uploadOne(file: File, rowItem: UploadRowItem): Promise<void> {
   const barEl = row.querySelector('.bar-fill') as HTMLElement;
   const cancelBtn = row.querySelector('.upload-cancel') as HTMLElement;
 
+  let encrypted: EncryptedFilePayload | ChunkedFilePayload | undefined;
   const controller = new AbortController();
   let cancelled = false;
   const cancelUpload = () => { cancelled = true; controller.abort(); };
@@ -172,6 +175,7 @@ async function uploadOne(file: File, rowItem: UploadRowItem): Promise<void> {
   };
 
   const finishCancelled = () => {
+    if (encrypted && 'uploadId' in encrypted && encrypted.uploadId) void api.abortUpload(encrypted.uploadId);
     row.classList.add('error');
     statusEl.textContent = 'Cancelled';
     statusEl.removeAttribute('title');
@@ -180,9 +184,10 @@ async function uploadOne(file: File, rowItem: UploadRowItem): Promise<void> {
   };
 
   statusEl.textContent = 'Encrypting\u2026';
-  let encrypted;
   try {
-    encrypted = await encryptPool.encryptFile(getWrappingKeyRaw()!, file, getCurrentFolderId());
+    encrypted = file.size > CHUNK_SIZE
+      ? await prepareChunkedFile(getWrappingKeyRaw()!, file, getCurrentFolderId())
+      : await encryptPool.encryptFile(getWrappingKeyRaw()!, file, getCurrentFolderId());
   } catch (err) {
     row.classList.add('error');
     statusEl.textContent = 'Failed';
@@ -199,7 +204,7 @@ async function uploadOne(file: File, rowItem: UploadRowItem): Promise<void> {
       statusEl.textContent = attempt === 0 ? 'Uploading\u2026' : `Retrying\u2026 (attempt ${attempt + 1})`;
       statusEl.removeAttribute('title');
       setBarProgress(barEl, 0, { instant: true });
-      const created = await api.uploadFile(encrypted, (fraction) => {
+      const created = await api.uploadFile(encrypted!, (fraction) => {
         scheduleBarProgress(barEl, fraction);
       }, controller.signal);
 

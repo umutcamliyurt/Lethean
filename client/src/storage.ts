@@ -45,21 +45,30 @@ export function setStoredServerUrl(url: string): void {
   else localStorage.removeItem(LS_SERVER_URL_KEY);
 }
 
-export function loadDuressConfig(): DuressConfig {
+const LS_DURESS_SYNCED_KEY = 'vault.duressSynced';
+
+export interface LocalDuress {
+  config: DuressConfig;
+  synced: boolean;
+}
+
+export function loadLocalDuress(): LocalDuress {
   try {
     const raw = localStorage.getItem(LS_DURESS_KEY);
-    if (raw) return JSON.parse(raw) as DuressConfig;
+    if (raw) return { config: JSON.parse(raw) as DuressConfig, synced: localStorage.getItem(LS_DURESS_SYNCED_KEY) === '1' };
   } catch {
   }
   const decoy = C.generateDecoyDuressConfig();
-  localStorage.setItem(LS_DURESS_KEY, JSON.stringify(decoy));
-  return decoy;
+  saveLocalDuress(decoy, true);
+  return { config: decoy, synced: true };
 }
-export function saveDuressConfig(cfg: DuressConfig): void {
+export function saveLocalDuress(cfg: DuressConfig, synced: boolean): void {
   localStorage.setItem(LS_DURESS_KEY, JSON.stringify(cfg));
+  if (synced) localStorage.setItem(LS_DURESS_SYNCED_KEY, '1');
+  else localStorage.removeItem(LS_DURESS_SYNCED_KEY);
 }
-export function resetDuressConfig(): void {
-  saveDuressConfig(C.generateDecoyDuressConfig());
+export function resetLocalDuress(): void {
+  saveLocalDuress(C.generateDecoyDuressConfig(), true);
 }
 
 export function getStoredViewMode(): ViewMode {

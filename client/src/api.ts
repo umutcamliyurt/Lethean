@@ -1,5 +1,5 @@
 import type {
-  EncryptedFilePayload, FileRecord, ProgressCallback, UsageResponse, ShareCreateResponse, ShareRecord,
+  ChunkedFilePayload, DuressConfig, EncryptedFilePayload, FileRecord, ProgressCallback, UsageResponse, ShareCreateResponse, ShareRecord,
 } from './types.js';
 import { isTauri, resolveBaseUrl } from './platform.js';
 
@@ -54,35 +54,40 @@ async function checkOk(res: Response, label: string): Promise<Response> {
       detail = body.detail ?? detail;
     } catch {
     }
-    throw new Error(`${label}: ${detail}`);
+    const err = new Error(`${label}: ${detail}`) as Error & { status?: number };
+    err.status = res.status;
+    throw err;
   }
   return res;
+}
+
+export function isMissingEndpoint(err: unknown): boolean {
+  const status = (err as { status?: number } | null)?.status;
+  return status === 404 || status === 405;
 }
 
 const STALL_TIMEOUT_MS = 20000;
 const RESPONSE_WAIT_TIMEOUT_MS = 120000;
 
-export async function uploadFile(
-  encrypted: EncryptedFilePayload,
-  onProgress?: ProgressCallback,
-  signal?: AbortSignal,
-  vaultIdOverride?: string,
-  accessTokenOverride?: string
-): Promise<FileRecord> {
-  const form = new FormData();
-  form.append('content_iv', encrypted.contentIv);
-  form.append('encrypted_metadata', encrypted.encryptedMetadata);
-  form.append('metadata_iv', encrypted.metadataIv);
-  form.append('wrapped_file_key', encrypted.wrappedFileKey);
-  form.append('wrap_iv', encrypted.wrapIv);
-  form.append('blob', new Blob([encrypted.ciphertext as BlobPart]));
+interface XhrOptions {
+  method: string;
+  url: string;
+  body?: XMLHttpRequestBodyInit | null;
+  headers?: Record<string, string>;
+  onProgress?: ProgressCallback;
+  signal?: AbortSignal;
+  vaultIdOverride?: string;
+  accessTokenOverride?: string;
+}
 
+function sendXhr(o: XhrOptions): Promise<XMLHttpRequest> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', `${BASE_URL}/files`);
-    for (const [k, v] of Object.entries(authHeaders(vaultIdOverride))) xhr.setRequestHeader(k, v);
-    const tokenToSend = accessTokenOverride !== undefined ? accessTokenOverride : accessToken;
+    xhr.open(o.method, o.url);
+    for (const [k, v] of Object.entries(authHeaders(o.vaultIdOverride))) xhr.setRequestHeader(k, v);
+    const tokenToSend = o.accessTokenOverride !== undefined ? o.accessTokenOverride : accessToken;
     if (tokenToSend) xhr.setRequestHeader('X-Access-Token', tokenToSend);
+    for (const [k, v] of Object.entries(o.headers ?? {})) xhr.setRequestHeader(k, v);
 
     let stalled = false;
     let watchdog: ReturnType<typeof setTimeout>;
@@ -99,7 +104,7 @@ export async function uploadFile(
     armWatchdog(STALL_TIMEOUT_MS);
 
     xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total);
+      if (e.lengthComputable && o.onProgress) o.onProgress(e.loaded / e.total);
       if (e.lengthComputable && e.loaded >= e.total) {
         armWatchdog(RESPONSE_WAIT_TIMEOUT_MS);
       } else {
@@ -109,30 +114,31 @@ export async function uploadFile(
 
     xhr.onload = () => {
       clearWatchdog();
-      if (xhr.status >= 200 && xhr.status < 300) resolve(JSON.parse(xhr.responseText) as FileRecord);
-      else {
-        let detail: string = xhr.statusText;
-        try {
-          const body = JSON.parse(xhr.responseText) as ErrorDetailBody;
-          detail = body.detail ?? detail;
-        } catch {
-        }
-        reject(new Error(detail));
+      if (xhr.status >= 200 && xhr.status < 300) { resolve(xhr); return; }
+      let detail: string = xhr.statusText;
+      try {
+        const body = JSON.parse(xhr.responseText) as ErrorDetailBody;
+        detail = body.detail ?? detail;
+      } catch {
       }
+      if (xhr.status === 413) detail = 'Rejected by the server as too large (413). ' + detail;
+      const err = new Error(detail) as Error & { status?: number };
+      err.status = xhr.status;
+      reject(err);
     };
 
     xhr.onabort = () => {
       clearWatchdog();
       if (stalled) {
-        reject(new Error('Upload stalled (no progress) — will retry'));
+        reject(new Error('Upload stalled (no progress) \u2014 will retry'));
       } else {
         reject(new DOMException('Upload cancelled', 'AbortError'));
       }
     };
 
-    if (signal) {
-      if (signal.aborted) { xhr.abort(); return; }
-      signal.addEventListener('abort', () => xhr.abort());
+    if (o.signal) {
+      if (o.signal.aborted) { clearWatchdog(); reject(new DOMException('Upload cancelled', 'AbortError')); return; }
+      o.signal.addEventListener('abort', () => xhr.abort());
     }
 
     xhr.onerror = () => {
@@ -140,8 +146,150 @@ export async function uploadFile(
       reject(new Error('network error'));
     };
 
-    xhr.send(form);
+    xhr.send(o.body ?? null);
   });
+}
+
+const SINGLE_REQUEST_MAX_BYTES = 32 * 1024 * 1024 + 1024;
+const MULTIPART_PART_BYTES = 32 * 1024 * 1024 + 16;
+
+export async function uploadFile(
+  encrypted: EncryptedFilePayload | ChunkedFilePayload,
+  onProgress?: ProgressCallback,
+  signal?: AbortSignal,
+  vaultIdOverride?: string,
+  accessTokenOverride?: string
+): Promise<FileRecord> {
+  const common = { signal, vaultIdOverride, accessTokenOverride };
+
+  if ('ciphertext' in encrypted && encrypted.ciphertext.length <= SINGLE_REQUEST_MAX_BYTES) {
+    const form = new FormData();
+    form.append('content_iv', encrypted.contentIv);
+    form.append('encrypted_metadata', encrypted.encryptedMetadata);
+    form.append('metadata_iv', encrypted.metadataIv);
+    form.append('wrapped_file_key', encrypted.wrappedFileKey);
+    form.append('wrap_iv', encrypted.wrapIv);
+    form.append('blob', new Blob([encrypted.ciphertext as BlobPart]));
+    const xhr = await sendXhr({ method: 'POST', url: `${BASE_URL}/files`, body: form, onProgress, ...common });
+    return JSON.parse(xhr.responseText) as FileRecord;
+  }
+
+  const payload: ChunkedFilePayload = 'readPart' in encrypted ? encrypted : wrapCiphertextAsParts(encrypted);
+  const totalBytes = payload.totalSize;
+
+  let received = new Set<number>();
+  if (payload.uploadId) {
+    try {
+      const st = await sendXhr({ method: 'GET', url: `${BASE_URL}/files/uploads/${payload.uploadId}`, ...common });
+      received = new Set((JSON.parse(st.responseText) as { received: number[] }).received);
+    } catch (err) {
+      if ((err as { status?: number }).status === 404) { payload.uploadId = undefined; } else throw err;
+    }
+  }
+  if (!payload.uploadId) {
+    received.clear();
+    let init: XMLHttpRequest;
+    try {
+      init = await sendXhr({
+      method: 'POST',
+      url: `${BASE_URL}/files/uploads`,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        content_iv: payload.contentIv,
+        encrypted_metadata: payload.encryptedMetadata,
+        metadata_iv: payload.metadataIv,
+        wrapped_file_key: payload.wrappedFileKey,
+        wrap_iv: payload.wrapIv,
+        part_count: payload.partCount,
+        part_size: payload.partSize,
+        total_size: totalBytes,
+      }),
+      ...common,
+      });
+    } catch (err) {
+      if (!isMissingEndpoint(err)) throw err;
+
+      return uploadSingleRequest(payload, onProgress, common);
+    }
+    payload.uploadId = (JSON.parse(init.responseText) as { upload_id: string }).upload_id;
+  }
+
+  let doneBytes = 0;
+  for (let i = 0; i < payload.partCount; i++) {
+    const partLen = i === payload.partCount - 1 ? totalBytes - i * payload.partSize : payload.partSize;
+    if (received.has(i)) { doneBytes += partLen; continue; }
+    const part = await payload.readPart(i);
+    await sendXhr({
+      method: 'PUT',
+      url: `${BASE_URL}/files/uploads/${payload.uploadId}/parts/${i}`,
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: part as unknown as XMLHttpRequestBodyInit,
+      onProgress: onProgress ? (f) => onProgress((doneBytes + f * part.length) / totalBytes) : undefined,
+      ...common,
+    });
+    doneBytes += part.length;
+    onProgress?.(doneBytes / totalBytes);
+  }
+
+  const done = await sendXhr({ method: 'POST', url: `${BASE_URL}/files/uploads/${payload.uploadId}/complete`, ...common });
+  return JSON.parse(done.responseText) as FileRecord;
+}
+
+async function uploadSingleRequest(
+  payload: ChunkedFilePayload,
+  onProgress: ProgressCallback | undefined,
+  common: { signal?: AbortSignal; vaultIdOverride?: string; accessTokenOverride?: string }
+): Promise<FileRecord> {
+  const parts: Blob[] = [];
+  for (let i = 0; i < payload.partCount; i++) parts.push(new Blob([(await payload.readPart(i)) as BlobPart]));
+  const form = new FormData();
+  form.append('content_iv', payload.contentIv);
+  form.append('encrypted_metadata', payload.encryptedMetadata);
+  form.append('metadata_iv', payload.metadataIv);
+  form.append('wrapped_file_key', payload.wrappedFileKey);
+  form.append('wrap_iv', payload.wrapIv);
+  form.append('blob', new Blob(parts));
+  const xhr = await sendXhr({ method: 'POST', url: `${BASE_URL}/files`, body: form, onProgress, ...common });
+  return JSON.parse(xhr.responseText) as FileRecord;
+}
+
+function wrapCiphertextAsParts(e: EncryptedFilePayload): ChunkedFilePayload {
+  const partCount = Math.max(1, Math.ceil(e.ciphertext.length / MULTIPART_PART_BYTES));
+  return {
+    contentIv: e.contentIv,
+    encryptedMetadata: e.encryptedMetadata,
+    metadataIv: e.metadataIv,
+    wrappedFileKey: e.wrappedFileKey,
+    wrapIv: e.wrapIv,
+    partCount,
+    partSize: MULTIPART_PART_BYTES,
+    totalSize: e.ciphertext.length,
+    readPart: async (i) => e.ciphertext.subarray(i * MULTIPART_PART_BYTES, (i + 1) * MULTIPART_PART_BYTES),
+  };
+}
+
+export function ciphertextBlobAsParts(
+  fields: Omit<EncryptedFilePayload, 'ciphertext'>,
+  blob: Blob
+): ChunkedFilePayload {
+  const partCount = Math.max(1, Math.ceil(blob.size / MULTIPART_PART_BYTES));
+  return {
+    ...fields,
+    partCount,
+    partSize: MULTIPART_PART_BYTES,
+    totalSize: blob.size,
+    readPart: async (i) => new Uint8Array(await blob.slice(i * MULTIPART_PART_BYTES, (i + 1) * MULTIPART_PART_BYTES).arrayBuffer()),
+  };
+}
+
+export const SINGLE_UPLOAD_MAX_BYTES = SINGLE_REQUEST_MAX_BYTES;
+
+export async function abortUpload(uploadId: string): Promise<void> {
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(uploadId)) return;
+  try {
+    await privateFetch(`${BASE_URL}/files/uploads/${uploadId}`, { method: 'DELETE', headers: authHeaders(), credentials: 'omit' });
+  } catch {
+  }
 }
 
 export interface ListFilesOptions {
@@ -188,6 +336,44 @@ async function readBodyWithProgress(res: Response, onProgress?: ProgressCallback
     onProgress(received / total);
   }
   return received === total ? out : out.subarray(0, received);
+}
+
+export function fileBlobRequest(fileId: string): { url: string; headers: Record<string, string> } {
+  assertSafeId(fileId);
+  return { url: new URL(`${BASE_URL}/files/${fileId}/blob`, window.location.href).href, headers: authHeaders() };
+}
+
+export function shareBlobRequest(shareToken: string): { url: string; headers: Record<string, string> } {
+  assertSafeShareToken(shareToken);
+  return { url: new URL(`${BASE_URL}/share/${shareToken}/blob`, window.location.href).href, headers: {} };
+}
+
+export interface DownloadStream {
+  stream: ReadableStream<Uint8Array>;
+
+  total: number;
+}
+
+function bodyAsStream(res: Response, onProgress?: ProgressCallback): DownloadStream {
+  if (!res.body) throw new Error('Download failed: empty response');
+  const declared = Number(res.headers.get('Content-Length')) || 0;
+  if (!onProgress || !declared) return { stream: res.body, total: declared };
+  let received = 0;
+  const counted = res.body.pipeThrough(new TransformStream<Uint8Array, Uint8Array>({
+    transform(chunk, controller) {
+      received += chunk.length;
+      onProgress(Math.min(1, received / declared));
+      controller.enqueue(chunk);
+    },
+  }));
+  return { stream: counted, total: declared };
+}
+
+export async function openDownloadStream(fileId: string, onProgress?: ProgressCallback, signal?: AbortSignal): Promise<DownloadStream> {
+  assertSafeId(fileId);
+  const res = await privateFetch(`${BASE_URL}/files/${fileId}/blob`, { headers: authHeaders(), credentials: 'omit', signal });
+  await checkOk(res, 'Download failed');
+  return bodyAsStream(res, onProgress);
 }
 
 export async function downloadContent(fileId: string, onProgress?: ProgressCallback): Promise<Uint8Array> {
@@ -241,6 +427,41 @@ export async function wipeVault(vaultIdToWipe: string): Promise<void> {
   clearCredentials();
 }
 
+export interface RemoteDuress {
+  config: DuressConfig;
+
+  written?: boolean;
+}
+
+export async function getDuressBlob(token: string, opts: { vaultId?: string; signal?: AbortSignal } = {}): Promise<RemoteDuress> {
+  const headers: Record<string, string> = { 'X-Access-Token': token };
+  if (opts.vaultId) headers.Authorization = `Bearer ${opts.vaultId}`;
+  const res = await privateFetch(`${BASE_URL}/duress`, { headers, credentials: 'omit', signal: opts.signal });
+  await checkOk(res, 'Could not load duress settings');
+  const body = (await res.json()) as { blob: string; written?: boolean };
+  return { config: JSON.parse(body.blob) as DuressConfig, written: body.written };
+}
+
+export async function putDuressBlob(config: DuressConfig, shredHash: string | undefined, auth: { vaultId: string; token: string }): Promise<void> {
+  const res = await privateFetch(`${BASE_URL}/duress`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${auth.vaultId}`, 'X-Access-Token': auth.token },
+    credentials: 'omit',
+    body: JSON.stringify({ blob: JSON.stringify(config), shred_hash: shredHash ?? null }),
+  });
+  await checkOk(res, 'Could not save duress settings');
+}
+
+export async function shredBySecret(secretB64: string): Promise<void> {
+  const res = await privateFetch(`${BASE_URL}/vault/shred`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'omit',
+    body: JSON.stringify({ secret: secretB64 }),
+  });
+  await checkOk(res, 'Shred signal failed');
+}
+
 export async function sendShredSignal(targetVaultId: string): Promise<void> {
   const res = await privateFetch(`${BASE_URL}/vault`, {
     method: 'DELETE',
@@ -249,7 +470,6 @@ export async function sendShredSignal(targetVaultId: string): Promise<void> {
   });
   await checkOk(res, 'Shred signal failed');
 }
-
 
 function assertSafeShareToken(token: string): string {
   if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{8,256}$/.test(token)) {

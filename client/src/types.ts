@@ -6,6 +6,7 @@ export interface FileMeta {
   mime: string;
   compressed?: boolean;
   unpaddedSize?: number;
+  chunkSize?: number;
   isFolder?: boolean;
   parentId?: string | null;
 }
@@ -28,6 +29,19 @@ export interface EncryptedFilePayload {
   metadataIv: string;
   wrappedFileKey: string;
   wrapIv: string;
+}
+
+export interface ChunkedFilePayload {
+  contentIv: string;
+  encryptedMetadata: string;
+  metadataIv: string;
+  wrappedFileKey: string;
+  wrapIv: string;
+  partCount: number;
+  partSize: number;
+  totalSize: number;
+  readPart: (index: number) => Promise<Uint8Array>;
+  uploadId?: string;
 }
 
 export interface UsageResponse {

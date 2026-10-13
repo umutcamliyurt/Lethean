@@ -11,6 +11,12 @@ pub struct Config {
     pub server_url: Option<String>,
     #[serde(default)]
     pub access_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duress_blob: Option<String>,
+    #[serde(default)]
+    pub duress_synced: bool,
+    #[serde(default)]
+    pub duress_conflict_noticed: bool,
 }
 
 impl Drop for Config {
@@ -49,5 +55,34 @@ impl Config {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         }
         Ok(())
+    }
+}
+
+pub struct ConfigDuressCache;
+
+impl crate::duress::DuressCache for ConfigDuressCache {
+    fn load(&self) -> crate::duress::LocalDuress {
+        let c = Config::load().unwrap_or_default();
+        crate::duress::LocalDuress { config: c.duress_blob.as_deref().and_then(crate::crypto::duress::DuressConfig::from_json), synced: c.duress_synced }
+    }
+
+    fn save(&self, config: &crate::crypto::duress::DuressConfig, synced: bool) {
+        let mut c = Config::load().unwrap_or_default();
+        c.duress_blob = Some(config.to_json());
+        c.duress_synced = synced;
+        if synced {
+            c.duress_conflict_noticed = false;
+        }
+        let _ = c.save();
+    }
+
+    fn conflict_noticed(&self) -> bool {
+        Config::load().map(|c| c.duress_conflict_noticed).unwrap_or(false)
+    }
+
+    fn set_conflict_noticed(&self) {
+        let mut c = Config::load().unwrap_or_default();
+        c.duress_conflict_noticed = true;
+        let _ = c.save();
     }
 }

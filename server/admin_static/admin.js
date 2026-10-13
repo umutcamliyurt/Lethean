@@ -283,23 +283,12 @@
     const defaultGb = state.overview ? +(state.overview.default_quota_bytes / 1024 ** 3).toFixed(2) : 10;
     const label = textInput('new-label', { placeholder: 'e.g. Alex' });
     const quota = textInput('new-quota', { placeholder: `${defaultGb} (default)`, mode: 'decimal' });
-    const decoy = el('input', { attrs: { type: 'checkbox', id: 'new-decoy', checked: '' } });
-    decoy.checked = true;
     const err = el('p', { class: 'field-hint error' });
-
-    const decoyRow = el('label', { class: 'share-checkbox-row neutral' }, [
-      decoy,
-      el('span', { class: 'share-checkbox-text' }, [
-        el('strong', { text: 'Also create a decoy-vault token' }),
-        el('small', { text: 'For the Duress Code panel\'s "Decoy files" section. Same quota as the real token.' }),
-      ]),
-    ]);
 
     const submit = el('button', { class: 'btn-primary', text: 'Create', attrs: { type: 'submit' } });
     const form = el('form', {}, [
       field('Label', label, 'A note for you (e.g. a name). Never sent to clients.'),
-      field('Quota (GB)', quota, 'Leave blank to use the server default.'),
-      decoyRow,
+      field('Quota (GB)', quota, 'Leave blank to use the server default. Applies to each of the two tokens.'),
       err,
       el('div', { class: 'panel-actions' }, [
         el('button', { text: 'Cancel', attrs: { type: 'button' }, on: { click: closeModal } }),
@@ -313,7 +302,7 @@
       err.textContent = '';
       submit.disabled = true;
       try {
-        const res = await api('POST', '/tokens', { label: label.value, quota_gb: q.value, decoy: decoy.checked });
+        const res = await api('POST', '/tokens', { label: label.value, quota_gb: q.value });
         showCreated(res);
         refresh();
       } catch (ex) {
@@ -323,7 +312,7 @@
     });
     openModal(el('div', { class: 'settings-panel' }, [
       el('h2', { text: 'Create access token' }),
-      el('p', { class: 'subtitle', text: 'Tokens bind to the first vault that uploads with them.' }),
+      el('p', { class: 'subtitle', text: 'Creates two identical tokens for one person: one for their vault, one for their decoy vault. They choose which is which, so nobody else can tell.' }),
       form,
     ]));
   }
@@ -341,11 +330,11 @@
   }
 
   function showCreated(res) {
-    const blocks = [tokenBlock('Access token', res.token)];
-    if (res.decoy_token) blocks.push(tokenBlock('Decoy vault token', res.decoy_token));
+    const blocks = res.tokens.map((t, i) => tokenBlock(`Access token ${i + 1}`, t));
     openModal(panel(
-      'Token created',
-      'Copy these now. Tokens are hashed at rest, so they can never be shown again.',
+      'Tokens created',
+      'Give both to the person. They use one to sign in and keep the other for their decoy vault (Duress Code, under "Decoy files"). ' +
+        'Copy them now: tokens are hashed at rest, so they can never be shown again.',
       blocks,
       [el('button', { class: 'btn-primary', text: 'Done', attrs: { type: 'button' }, on: { click: closeModal } })],
     ));

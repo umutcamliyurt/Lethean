@@ -16,6 +16,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
+import duress_store
 import share_store
 import storage
 import token_store
@@ -282,7 +283,6 @@ def list_tokens(db: Session = Depends(get_db)):
 class CreateTokenBody(BaseModel):
     label: str | None = Field(default=None, max_length=120)
     quota_gb: float | None = Field(default=None, gt=0, le=1_000_000)
-    decoy: bool = True
 
 
 def _clean_label(label: str | None) -> str | None:
@@ -297,14 +297,9 @@ def create_token(body: CreateTokenBody):
     label = _clean_label(body.label)
     quota_bytes = int(body.quota_gb * GB) if body.quota_gb is not None else None
 
-    real = token_store.create_token(label=label, quota_bytes=quota_bytes)
-    decoy = None
-    if body.decoy:
-        decoy_label = f"{label} (decoy)" if label else "(decoy)"
-        decoy = token_store.create_token(label=decoy_label, quota_bytes=quota_bytes)
-
-    logger.info("admin created token label=%r decoy=%s", label, body.decoy)
-    return {"token": real, "decoy_token": decoy}
+    tokens = token_store.create_token_pair(label=label, quota_bytes=quota_bytes)
+    logger.info("admin created a token pair label=%r", label)
+    return {"tokens": tokens}
 
 
 class UpdateTokenBody(BaseModel):
@@ -354,15 +349,17 @@ def revoke_token(
     if not _TOKEN_ID_RE.match(token_id):
         raise HTTPException(status_code=404, detail="No such token")
     matches = [
-        record for token_hash, record in list(token_store.list_tokens().items())
+        (token_hash, record) for token_hash, record in list(token_store.list_tokens().items())
         if token_hash.startswith(token_id)
     ]
     if len(matches) != 1:
         raise HTTPException(status_code=404, detail="No such token")
-    vault_id = matches[0].get("vault_id")
+    token_hash, record = matches[0]
+    vault_id = record.get("vault_id")
 
     if not token_store.revoke_by_id(token_id):
         raise HTTPException(status_code=404, detail="No such token")
+    duress_store.on_token_revoked(db, token_hash)
     logger.info("admin revoked token %s", token_id)
 
     if delete_contents and vault_id:
@@ -374,6 +371,7 @@ def revoke_token(
         file_infos = [(r.id, r.storage_path) for r in rows]
         db.query(ShareToken).filter(ShareToken.vault_id == vault_id).delete(synchronize_session=False)
         db.query(EncryptedFile).filter(EncryptedFile.vault_id == vault_id).delete(synchronize_session=False)
+        duress_store.on_vault_wiped(db, vault_id)
         db.commit()
         background_tasks.add_task(_delete_files, file_infos)
         logger.info("admin deleted %d file(s) of token %s", len(file_infos), token_id)

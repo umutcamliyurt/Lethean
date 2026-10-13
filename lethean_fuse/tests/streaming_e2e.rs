@@ -263,3 +263,38 @@ fn downloading_a_huge_file_stays_within_the_scratch_budget() {
     drop(vault);
     let _ = std::fs::remove_dir_all(&scratch_dir);
 }
+
+#[test]
+fn files_over_32_mib_use_the_web_clients_chunked_format_and_round_trip() {
+    use lethean_fuse_lib::crypto::chunked::{sealed_len, CHUNK_SIZE};
+    let server = start_server(ServerOpts { support_range: true, fail_first_upload: false, discard_blobs: false });
+    let key = aead::generate_aes_key_raw();
+    let vault = new_vault(server.addr, &key);
+    let size = CHUNK_SIZE + 5 * MIB + 17;
+    let started = Arc::new(AtomicUsize::new(0));
+    let id = upload(&vault, "chunked.bin", "application/octet-stream", size, &started);
+
+    let (fields, blob_len) = {
+        let files = server.files.lock().unwrap();
+        (files[0].1.fields.clone(), files[0].1.blob.len() as u64)
+    };
+    assert_eq!(blob_len, sealed_len(size, CHUNK_SIZE), "two sealed 32 MiB chunks");
+    let file_key = aead::unwrap_file_key(&key, &fields["wrapped_file_key"], &fields["wrap_iv"]).unwrap();
+    let meta = aead::decrypt_metadata(&file_key, &fields["encrypted_metadata"], &fields["metadata_iv"]).unwrap();
+    assert_eq!(meta.chunk_size, Some(CHUNK_SIZE));
+    assert_eq!(meta.unpadded_size, Some(size));
+    assert_eq!(aead::from_base64(&fields["content_iv"]).unwrap().len(), 8, "nonce prefix, as the web client stores it");
+
+    let reader = new_vault(server.addr, &key);
+    reader.refresh_all().unwrap();
+    assert_eq!(reader.read_range(&id, CHUNK_SIZE - 10, 20).unwrap(), expected(CHUNK_SIZE - 10, 20), "across the chunk boundary");
+    assert_eq!(reader.read_range(&id, size - 100, 100).unwrap(), expected(size - 100, 100));
+
+    {
+        let mut files = server.files.lock().unwrap();
+        files[0].1.blob[CHUNK_SIZE as usize + 100] ^= 1;
+    }
+    let tampered = new_vault(server.addr, &key);
+    tampered.refresh_all().unwrap();
+    assert!(tampered.read_range(&id, 0, 16).is_err(), "a tampered chunk must fail the whole read");
+}

@@ -1,6 +1,7 @@
 import './theme.js';
-import { getShareRecord, downloadShareContent, deleteSharedFile } from './api.js';
-import { fromBase64, decryptMetadata, decryptContent } from './crypto-encrypt-core.js';
+import { getShareRecord, shareBlobRequest, deleteSharedFile } from './api.js';
+import { fromBase64, decryptMetadata } from './crypto-encrypt-core.js';
+import { downloadDecrypted } from './save-stream.js';
 import type { FileMeta, ShareRecord } from './types.js';
 
 function $<T extends HTMLElement = HTMLElement>(id: string): T {
@@ -149,15 +150,17 @@ async function init(): Promise<void> {
     downloadBtn.disabled = true;
     downloadBtn.textContent = 'Downloading\u2026';
     try {
-      const ciphertext = await downloadShareContent(token);
-      const bytes = await decryptContent(fileKeyRaw, record.content_iv, ciphertext, meta.compressed, meta.unpaddedSize ?? null);
-      const blob = new Blob([bytes as BlobPart], { type: meta.mime || 'application/octet-stream' });
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = meta.name;
-      a.click();
-      URL.revokeObjectURL(url);
+      const saved = await downloadDecrypted({
+        request: shareBlobRequest(token),
+        fileKeyRaw,
+        contentIv: record.content_iv,
+        meta,
+      });
+      if (!saved) {
+        downloadBtn.disabled = false;
+        downloadBtn.textContent = 'Download';
+        return;
+      }
 
       record.downloads_used += 1;
       const stillHasDownloadsLeft = downloadsRemaining() > 0;

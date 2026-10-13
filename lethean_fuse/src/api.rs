@@ -15,6 +15,7 @@ pub struct ApiClient {
     base_url: String,
     agent: ureq::Agent,
     stream_agent: ureq::Agent,
+    quick_agent: ureq::Agent,
     vault_id: RwLock<Option<String>>,
     access_token: RwLock<Option<String>>,
 }
@@ -42,6 +43,24 @@ fn assert_safe_share_token(token: &str) -> Result<()> {
     }
 }
 
+#[derive(Debug)]
+pub struct HttpError {
+    pub status: u16,
+    pub message: String,
+}
+
+impl std::fmt::Display for HttpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HttpError {}
+
+pub fn is_missing_endpoint(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<HttpError>().map(|h| h.status == 404 || h.status == 405).unwrap_or(false))
+}
+
 fn finish(label: &str, result: std::result::Result<ureq::Response, ureq::Error>) -> Result<ureq::Response> {
     match result {
         Ok(resp) => Ok(resp),
@@ -49,7 +68,7 @@ fn finish(label: &str, result: std::result::Result<ureq::Response, ureq::Error>)
             let status_text = resp.status_text().to_string();
             let body_text = resp.into_string().unwrap_or_default();
             let detail = serde_json::from_str::<ErrorDetailBody>(&body_text).ok().and_then(|b| b.detail).unwrap_or(status_text.clone());
-            Err(anyhow!("{label}: {detail} ({code})"))
+            Err(HttpError { status: code, message: format!("{label}: {detail} ({code})") }.into())
         }
         Err(ureq::Error::Transport(t)) => Err(anyhow!("{label}: network error ({t})")),
     }
@@ -188,6 +207,7 @@ impl ApiClient {
             base_url: base_url.trim_end_matches('/').to_string(),
             agent: build_agent(Some(Duration::from_secs(180))),
             stream_agent: build_agent(None),
+            quick_agent: ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(4)).timeout(Duration::from_secs(6)).build(),
             vault_id: RwLock::new(None),
             access_token: RwLock::new(None),
         })
@@ -205,6 +225,10 @@ impl ApiClient {
         if let Some(s) = old.as_mut() {
             s.zeroize();
         }
+    }
+
+    pub fn vault_id(&self) -> Option<String> {
+        self.vault_id.read().unwrap().clone()
     }
 
     fn url(&self, path: &str) -> String {
@@ -245,6 +269,110 @@ impl ApiClient {
             }
             let resp = req.send(reader).map_err(AttemptError::from)?;
             resp.into_json::<FileRecord>().map_err(AttemptError::from)
+        })
+    }
+
+    fn token_or(&self, token_override: Option<&str>) -> Option<String> {
+        token_override.map(|s| s.to_string()).or_else(|| self.access_token.read().unwrap().clone())
+    }
+
+    pub fn upload_in_parts<'a, F>(&self, header: &EncryptedHeader, total_len: u64, mut make_body: F, vault_id_override: Option<&str>, access_token_override: Option<&str>) -> Result<FileRecord>
+    where
+        F: FnMut() -> io::Result<Box<dyn Read + 'a>>,
+    {
+        if total_len <= SINGLE_REQUEST_MAX_BYTES {
+            return self.upload_stream(header, total_len, make_body, vault_id_override, access_token_override);
+        }
+        let token = self.token_or(access_token_override);
+        let part_size = MULTIPART_PART_BYTES;
+        let part_count = total_len.div_ceil(part_size);
+
+        let upload_id = match self.start_upload(header, part_count, part_size, total_len, vault_id_override, token.as_deref()) {
+            Ok(id) => id,
+            Err(e) if is_missing_endpoint(&e) => return self.upload_stream(header, total_len, make_body, vault_id_override, access_token_override),
+            Err(e) => return Err(e),
+        };
+
+        let result = (|| -> Result<FileRecord> {
+            let mut body = make_body().map_err(|e| anyhow!("Upload failed: {e}"))?;
+            let mut part = Vec::with_capacity(part_size as usize);
+            for index in 0..part_count {
+                let len = if index == part_count - 1 { total_len - index * part_size } else { part_size };
+                part.clear();
+                part.resize(len as usize, 0);
+                body.read_exact(&mut part).map_err(|e| anyhow!("Upload failed: {e}"))?;
+                retry::run("Upload failed", || {
+                    let mut req = self.with_auth(self.stream_agent.put(&self.url(&format!("/files/uploads/{upload_id}/parts/{index}"))), vault_id_override).set("Content-Type", "application/octet-stream");
+                    if let Some(t) = &token {
+                        req = req.set("X-Access-Token", t);
+                    }
+                    req.send_bytes(&part).map_err(AttemptError::from)?;
+                    Ok(())
+                })?;
+            }
+            retry::run("Upload failed", || {
+                let mut req = self.with_auth(self.agent.post(&self.url(&format!("/files/uploads/{upload_id}/complete"))), vault_id_override);
+                if let Some(t) = &token {
+                    req = req.set("X-Access-Token", t);
+                }
+                let resp = req.call().map_err(AttemptError::from)?;
+                resp.into_json::<FileRecord>().map_err(AttemptError::from)
+            })
+        })();
+        if result.is_err() {
+            let _ = self.with_auth(self.agent.delete(&self.url(&format!("/files/uploads/{upload_id}"))), vault_id_override).call();
+        }
+        result
+    }
+
+    fn start_upload(&self, header: &EncryptedHeader, part_count: u64, part_size: u64, total_size: u64, vault_id_override: Option<&str>, token: Option<&str>) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Started {
+            upload_id: String,
+        }
+        let body = serde_json::json!({
+            "content_iv": header.content_iv,
+            "encrypted_metadata": header.encrypted_metadata,
+            "metadata_iv": header.metadata_iv,
+            "wrapped_file_key": header.wrapped_file_key,
+            "wrap_iv": header.wrap_iv,
+            "part_count": part_count,
+            "part_size": part_size,
+            "total_size": total_size,
+        });
+        let started: Started = retry::run("Upload failed", || {
+            let mut req = self.with_auth(self.agent.post(&self.url("/files/uploads")), vault_id_override);
+            if let Some(t) = token {
+                req = req.set("X-Access-Token", t);
+            }
+            let resp = req.send_json(body.clone()).map_err(AttemptError::from)?;
+            resp.into_json::<Started>().map_err(AttemptError::from)
+        })?;
+        assert_safe_id(&started.upload_id)?;
+        Ok(started.upload_id)
+    }
+
+    pub fn get_duress(&self, token: &str, vault_id: Option<&str>) -> Result<RemoteDuress> {
+        let mut req = self.quick_agent.get(&self.url("/duress")).set("X-Access-Token", token);
+        if let Some(v) = vault_id {
+            req = req.set("Authorization", &format!("Bearer {v}"));
+        }
+        let resp = finish("Could not load duress settings", req.call())?;
+        Ok(resp.into_json::<RemoteDuress>()?)
+    }
+
+    pub fn put_duress(&self, blob: &str, shred_hash: Option<&str>, vault_id: &str, token: &str) -> Result<()> {
+        retry::run("Could not save duress settings", || {
+            let req = self.agent.put(&self.url("/duress")).set("Authorization", &format!("Bearer {vault_id}")).set("X-Access-Token", token);
+            req.send_json(serde_json::json!({ "blob": blob, "shred_hash": shred_hash })).map_err(AttemptError::from)?;
+            Ok(())
+        })
+    }
+
+    pub fn shred_by_secret(&self, secret_b64: &str) -> Result<()> {
+        retry::run("Shred signal failed", || {
+            self.agent.post(&self.url("/vault/shred")).send_json(serde_json::json!({ "secret": secret_b64 })).map_err(AttemptError::from)?;
+            Ok(())
         })
     }
 
@@ -406,6 +534,16 @@ impl Drop for ApiClient {
             }
         }
     }
+}
+
+pub const SINGLE_REQUEST_MAX_BYTES: u64 = 32 * 1024 * 1024 + 1024;
+pub const MULTIPART_PART_BYTES: u64 = 32 * 1024 * 1024 + 16;
+
+#[derive(Debug, Deserialize)]
+pub struct RemoteDuress {
+    pub blob: String,
+    #[serde(default)]
+    pub written: Option<bool>,
 }
 
 pub struct RewrapEntry {

@@ -15,6 +15,8 @@ pub struct FileMeta {
     pub is_folder: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chunk_size: Option<u64>,
 }
 
 impl FileMeta {
@@ -26,6 +28,7 @@ impl FileMeta {
             unpadded_size: Some(unpadded_size),
             is_folder: false,
             parent_id,
+            chunk_size: None,
         }
     }
 
@@ -37,6 +40,7 @@ impl FileMeta {
             unpadded_size: None,
             is_folder: true,
             parent_id,
+            chunk_size: None,
         }
     }
 }

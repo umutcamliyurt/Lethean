@@ -2,7 +2,7 @@
 
 ## A minimal FUSE client for Lethean
 
-This tool mounts the decrypted vault as a network drive, so any program on the machine can open, edit and save files in it directly.
+This tool mounts the decrypted vault as a network drive, so any program on the machine can open, edit and save files in it directly. Everything is encrypted and decrypted on your machine, in the same formats as the web and desktop apps, so files and settings move freely between them.
 
 ## Building
 
@@ -31,4 +31,9 @@ lethean-fuse usage
 lethean-fuse rotate-password
 lethean-fuse share <file-id> --max-downloads 5 --expires-in-seconds 3600
 lethean-fuse unshare <file-id>
+
+# Duress code
+lethean-fuse duress set
+lethean-fuse duress reset
+lethean-fuse duress add-decoy-files notes.txt photo.jpg
 ```

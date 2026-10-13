@@ -3,6 +3,7 @@ import hmac
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 
@@ -170,3 +171,36 @@ def rebind_vault(old_vault_id: str, new_vault_id: str) -> int:
         if moved:
             _write(data)
         return moved
+
+def hash_token(token: str) -> str:
+    return _hash_token(token)
+
+
+def hashes_for_vault(vault_id: str) -> list[str]:
+    with _lock:
+        data = _load()
+        return [
+            h for h, record in data.items()
+            if record.get("vault_id") is not None and hmac.compare_digest(record["vault_id"], vault_id)
+        ]
+
+
+def create_token_pair(label: str | None = None, quota_bytes: int | None = None) -> list[str]:
+    return [create_token(label=label, quota_bytes=quota_bytes), create_token(label=label, quota_bytes=quota_bytes)]
+
+
+_DECOY_LABEL_RE = re.compile(r"\s*\(decoy\)\s*$", re.IGNORECASE)
+
+
+def strip_decoy_labels() -> int:
+    with _lock:
+        data = _load()
+        changed = 0
+        for record in data.values():
+            label = record.get("label")
+            if isinstance(label, str) and _DECOY_LABEL_RE.search(label):
+                record["label"] = _DECOY_LABEL_RE.sub("", label) or None
+                changed += 1
+        if changed:
+            _write(data)
+        return changed
