@@ -16,6 +16,8 @@ pub const STREAM_THRESHOLD: u64 = 4 * 1024 * 1024;
 
 const IO_BUF: usize = 64 * 1024;
 
+const DECRYPT_BATCH: usize = 1024 * 1024;
+
 pub fn padme(len: u64) -> u64 {
     if len < 2 {
         return len;
@@ -34,6 +36,7 @@ struct GcmState {
     pending: [u8; 16],
     pending_len: usize,
     ct_len: u64,
+    aad_len: u64,
 }
 
 impl GcmState {
@@ -61,7 +64,16 @@ impl GcmState {
 
         let ghash = GHash::new((&h).into());
         h.zeroize();
-        Ok(Self { ctr, ghash, tag_mask, pending: [0; 16], pending_len: 0, ct_len: 0 })
+        Ok(Self { ctr, ghash, tag_mask, pending: [0; 16], pending_len: 0, ct_len: 0, aad_len: 0 })
+    }
+
+    fn new_with_aad(key: &[u8], iv: &[u8], aad: &[u8]) -> Result<Self> {
+        let mut s = Self::new(key, iv)?;
+        if !aad.is_empty() {
+            s.ghash.update_padded(aad);
+            s.aad_len = aad.len() as u64;
+        }
+        Ok(s)
     }
 
     fn absorb(&mut self, mut ct: &[u8]) {
@@ -95,6 +107,7 @@ impl GcmState {
             self.ghash.update_padded(&block[..n]);
         }
         let mut lens = [0u8; 16];
+        lens[..8].copy_from_slice(&(self.aad_len * 8).to_be_bytes());
         lens[8..].copy_from_slice(&(self.ct_len * 8).to_be_bytes());
         self.ghash.update_padded(&lens);
         let g = self.ghash.finalize();
@@ -203,30 +216,45 @@ pub const AUTH_FAILED: &str = "AES-GCM decryption failed (wrong key, or corrupte
 
 impl<R: Read> GcmDecryptReader<R> {
     pub fn new(source: R, key: &[u8], iv: &[u8]) -> Result<Self> {
-        Ok(Self { source, state: Some(GcmState::new(key, iv)?), held: Vec::with_capacity(IO_BUF + TAG_LEN), ready: Vec::new(), ready_pos: 0, eof: false, done: false, failed: false })
+        Self::with_aad(source, key, iv, &[])
+    }
+
+    pub fn with_aad(source: R, key: &[u8], iv: &[u8], aad: &[u8]) -> Result<Self> {
+        Ok(Self { source, state: Some(GcmState::new_with_aad(key, iv, aad)?), held: Vec::with_capacity(DECRYPT_BATCH + TAG_LEN), ready: Vec::new(), ready_pos: 0, eof: false, done: false, failed: false })
     }
 
     fn fill(&mut self) -> io::Result<()> {
         if !self.eof {
-            let mut tmp = [0u8; IO_BUF];
-            loop {
-                match self.source.read(&mut tmp) {
-                    Ok(0) => self.eof = true,
-                    Ok(n) => self.held.extend_from_slice(&tmp[..n]),
+            let old = self.held.len();
+            self.held.resize(old + DECRYPT_BATCH, 0);
+            let mut filled = 0;
+            while filled < DECRYPT_BATCH {
+                match self.source.read(&mut self.held[old + filled..]) {
+                    Ok(0) => {
+                        self.eof = true;
+                        break;
+                    }
+                    Ok(n) => filled += n,
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        self.held.truncate(old + filled);
+                        return Err(e);
+                    }
                 }
-                break;
             }
+            self.held.truncate(old + filled);
         }
         if self.held.len() > TAG_LEN {
             let n = self.held.len() - TAG_LEN;
-            self.ready.clear();
-            self.ready.extend_from_slice(&self.held[..n]);
-            self.held.drain(..n);
+            std::mem::swap(&mut self.ready, &mut self.held);
+            self.held.clear();
+            self.held.extend_from_slice(&self.ready[n..]);
+            self.ready.truncate(n);
             let state = self.state.as_mut().expect("state present until verified");
-            state.absorb(&self.ready);
-            state.ctr.apply_keystream(&mut self.ready);
+            for part in self.ready.chunks_mut(IO_BUF) {
+                state.absorb(part);
+                state.ctr.apply_keystream(part);
+            }
             self.ready_pos = 0;
         } else if self.eof {
             self.ready.clear();
@@ -291,6 +319,46 @@ impl<R: Read> Drop for GcmDecryptReader<R> {
 impl<R: Read> Drop for GcmEncryptReader<R> {
     fn drop(&mut self) {
         self.out.zeroize();
+    }
+}
+
+#[cfg(test)]
+mod aad_tests {
+    use super::*;
+    use crate::crypto::chunked::{open_chunk, seal_chunk};
+
+    #[test]
+    fn streaming_decrypt_with_aad_matches_the_chunked_format_and_rejects_tampering() {
+        let key = [7u8; 32];
+        let prefix = [9u8; 8];
+        for (len, index, last) in [(0usize, 0u64, true), (1, 3, false), (70_001, 5, true), (200_000, 0, false)] {
+            let plain: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
+            let mut sealed = plain.clone();
+            seal_chunk(&key, &prefix, index, last, &mut sealed).unwrap();
+
+            let mut nonce = [0u8; 12];
+            nonce[..8].copy_from_slice(&prefix);
+            nonce[8..].copy_from_slice(&(index as u32).to_be_bytes());
+            let mut aad = [0u8; 5];
+            aad[..4].copy_from_slice(&(index as u32).to_be_bytes());
+            aad[4] = last as u8;
+
+            let mut out = Vec::new();
+            GcmDecryptReader::with_aad(io::Cursor::new(&sealed), &key, &nonce, &aad).unwrap().read_to_end(&mut out).unwrap();
+            assert_eq!(out, plain);
+            let mut via_crate = sealed.clone();
+            open_chunk(&key, &prefix, index, last, &mut via_crate).unwrap();
+            assert_eq!(via_crate, plain);
+
+            let mut wrong_aad = aad;
+            wrong_aad[4] ^= 1;
+            assert!(GcmDecryptReader::with_aad(io::Cursor::new(&sealed), &key, &nonce, &wrong_aad).unwrap().read_to_end(&mut Vec::new()).is_err());
+            if len > 0 {
+                let mut bad = sealed.clone();
+                bad[len / 2] ^= 1;
+                assert!(GcmDecryptReader::with_aad(io::Cursor::new(&bad), &key, &nonce, &aad).unwrap().read_to_end(&mut Vec::new()).is_err());
+            }
+        }
     }
 }
 

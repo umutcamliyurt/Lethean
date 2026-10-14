@@ -1,6 +1,7 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use anyhow::{bail, Context, Result};
@@ -15,6 +16,8 @@ use crate::types::{EncryptedHeader, FileMeta, FileRecord};
 
 const PAGE_SIZE: u64 = 200;
 
+const REFRESH_PARALLELISM: usize = 8;
+
 const CONTENT_CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 const CONTENT_CACHE_MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
@@ -25,14 +28,25 @@ const LARGE_CACHE_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 const LARGE_LOAD_ATTEMPTS: u32 = 3;
 
+const MAX_CONCURRENT_CHUNK_FETCHES: usize = 4;
+
+const CHUNK_READAHEAD: u64 = 3;
+
+const SIZE_UNKNOWN: u64 = u64::MAX;
+
 #[derive(Clone)]
 pub struct Entry {
     pub record: FileRecord,
     pub meta: FileMeta,
     pub file_key: Zeroizing<Vec<u8>>,
+    learned_size: Arc<AtomicU64>,
 }
 
 impl Entry {
+    fn new(record: FileRecord, meta: FileMeta, file_key: Zeroizing<Vec<u8>>) -> Self {
+        Self { record, meta, file_key, learned_size: Arc::new(AtomicU64::new(SIZE_UNKNOWN)) }
+    }
+
     pub fn is_folder(&self) -> bool {
         self.meta.is_folder
     }
@@ -45,10 +59,29 @@ impl Entry {
         &self.meta.name
     }
 
-    pub fn size(&self) -> u64 {
+    fn stored_size(&self) -> u64 {
         self.meta.unpadded_size.unwrap_or_else(|| self.record.size.unwrap_or(0))
     }
 
+    pub fn size(&self) -> u64 {
+        if self.meta.compressed {
+            let n = self.learned_size.load(Ordering::Acquire);
+            if n != SIZE_UNKNOWN {
+                return n;
+            }
+        }
+        self.stored_size()
+    }
+
+    pub fn size_is_exact(&self) -> bool {
+        !self.meta.compressed || self.learned_size.load(Ordering::Acquire) != SIZE_UNKNOWN
+    }
+
+    fn learn_size(&self, plain_len: u64) {
+        if self.meta.compressed {
+            self.learned_size.store(plain_len, Ordering::Release);
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +89,13 @@ pub struct ChildInfo {
     pub id: String,
     pub name: String,
     pub is_folder: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Stat {
+    pub is_folder: bool,
+    pub size: u64,
+    pub size_is_exact: bool,
 }
 
 fn parent_key(parent_id: Option<&str>) -> &str {
@@ -70,8 +110,12 @@ fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
     lock.write().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+fn lock_plain<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 struct VaultIndex {
-    entries: HashMap<String, Entry>,
+    entries: HashMap<String, Arc<Entry>>,
     children_by_parent: HashMap<String, Vec<String>>,
     name_index: HashMap<String, HashMap<String, String>>,
 }
@@ -86,32 +130,50 @@ impl VaultIndex {
         self.children_by_parent.clear();
         self.name_index.clear();
     }
+
+    fn insert(&mut self, entry: Entry) -> Option<Arc<Entry>> {
+        if self.entries.contains_key(&entry.record.id) {
+            return None;
+        }
+        let id = entry.record.id.clone();
+        let pk = parent_key(entry.parent_id()).to_string();
+        self.name_index.entry(pk.clone()).or_default().entry(entry.name().to_string()).or_insert_with(|| id.clone());
+        self.children_by_parent.entry(pk).or_default().push(id.clone());
+        let entry = Arc::new(entry);
+        self.entries.insert(id, Arc::clone(&entry));
+        Some(entry)
+    }
 }
 
+type SharedPlaintext = Arc<Zeroizing<Vec<u8>>>;
+
 struct ContentCache {
-    entries: HashMap<String, Arc<Zeroizing<Vec<u8>>>>,
-    order: VecDeque<String>,
+    entries: HashMap<String, (SharedPlaintext, u64)>,
+    order: BTreeMap<u64, String>,
+    next_stamp: u64,
     total_bytes: u64,
 }
 
 impl ContentCache {
     fn new() -> Self {
-        Self { entries: HashMap::new(), order: VecDeque::new(), total_bytes: 0 }
+        Self { entries: HashMap::new(), order: BTreeMap::new(), next_stamp: 0, total_bytes: 0 }
     }
 
-    fn touch(&mut self, id: &str) {
-        if let Some(pos) = self.order.iter().position(|x| x == id) {
-            let id = self.order.remove(pos).expect("position just found");
-            self.order.push_back(id);
-        }
+    fn stamp(&mut self) -> u64 {
+        self.next_stamp += 1;
+        self.next_stamp
     }
 
     fn get(&mut self, id: &str) -> Option<Arc<Zeroizing<Vec<u8>>>> {
-        let hit = self.entries.get(id).cloned();
-        if hit.is_some() {
-            self.touch(id);
+        let new_stamp = self.next_stamp + 1;
+        let (data, stamp) = self.entries.get_mut(id)?;
+        let old = std::mem::replace(stamp, new_stamp);
+        let data = Arc::clone(data);
+        self.next_stamp = new_stamp;
+        if let Some(key) = self.order.remove(&old) {
+            self.order.insert(new_stamp, key);
         }
-        hit
+        Some(data)
     }
 
     fn insert(&mut self, id: String, bytes: Arc<Zeroizing<Vec<u8>>>) {
@@ -120,33 +182,31 @@ impl ContentCache {
             return;
         }
         self.remove(&id);
+        let stamp = self.stamp();
         self.total_bytes += size;
-        self.entries.insert(id.clone(), bytes);
-        self.order.push_back(id);
+        self.entries.insert(id.clone(), (bytes, stamp));
+        self.order.insert(stamp, id);
         while self.total_bytes > CONTENT_CACHE_MAX_BYTES {
-            let Some(oldest) = self.order.pop_front() else { break };
-            if let Some(evicted) = self.entries.remove(&oldest) {
+            let Some((_, oldest)) = self.order.pop_first() else { break };
+            if let Some((evicted, _)) = self.entries.remove(&oldest) {
                 self.total_bytes -= evicted.len() as u64;
             }
         }
     }
 
     fn rekey(&mut self, old_id: &str, new_id: &str) {
-        if let Some(bytes) = self.entries.remove(old_id) {
-            if let Some(pos) = self.order.iter().position(|x| x == old_id) {
-                self.order.remove(pos);
-            }
-            self.entries.insert(new_id.to_string(), bytes);
-            self.order.push_back(new_id.to_string());
+        if let Some((bytes, stamp)) = self.entries.remove(old_id) {
+            self.order.remove(&stamp);
+            let stamp = self.stamp();
+            self.entries.insert(new_id.to_string(), (bytes, stamp));
+            self.order.insert(stamp, new_id.to_string());
         }
     }
 
     fn remove(&mut self, id: &str) {
-        if let Some(evicted) = self.entries.remove(id) {
+        if let Some((evicted, stamp)) = self.entries.remove(id) {
             self.total_bytes -= evicted.len() as u64;
-        }
-        if let Some(pos) = self.order.iter().position(|x| x == id) {
-            self.order.remove(pos);
+            self.order.remove(&stamp);
         }
     }
 
@@ -161,12 +221,98 @@ fn lock_cache(cache: &Mutex<ContentCache>) -> MutexGuard<'_, ContentCache> {
     cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-pub struct LargeFile {
+struct Slots {
+    free: Mutex<usize>,
+    changed: Condvar,
+}
+
+struct SlotGuard<'a>(&'a Slots);
+
+impl Slots {
+    fn new(n: usize) -> Self {
+        Self { free: Mutex::new(n), changed: Condvar::new() }
+    }
+
+    fn acquire(&self) -> SlotGuard<'_> {
+        let mut free = lock_plain(&self.free);
+        while *free == 0 {
+            free = self.changed.wait(free).unwrap_or_else(|p| p.into_inner());
+        }
+        *free -= 1;
+        SlotGuard(self)
+    }
+}
+
+impl Drop for SlotGuard<'_> {
+    fn drop(&mut self) {
+        *lock_plain(&self.0.free) += 1;
+        self.0.changed.notify_one();
+    }
+}
+
+const CHUNK_MISSING: u8 = 0;
+const CHUNK_LOADING: u8 = 1;
+const CHUNK_READY: u8 = 2;
+
+struct ChunkedSource {
+    api: Arc<ApiClient>,
+    id: String,
+    file_key: Zeroizing<Vec<u8>>,
+    prefix: Vec<u8>,
+    chunk_size: u64,
+    count: u64,
+    sealed_total: u64,
     scratch: Mutex<Scratch>,
+    states: Mutex<Vec<u8>>,
+    changed: Condvar,
+    resident: AtomicU64,
+    slots: Arc<Slots>,
+}
+
+enum Backing {
+    Whole(Mutex<Scratch>),
+    Chunked(ChunkedSource),
+}
+
+pub struct LargeFile {
     len: u64,
+    backing: Backing,
+}
+
+fn other_io(e: impl std::fmt::Display) -> io::Error {
+    io::Error::other(e.to_string())
+}
+
+fn is_transient_io(e: &io::Error) -> bool {
+    if e.kind() == io::ErrorKind::InvalidData && e.to_string() == AUTH_FAILED {
+        return false;
+    }
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted | io::ErrorKind::TimedOut | io::ErrorKind::BrokenPipe | io::ErrorKind::UnexpectedEof | io::ErrorKind::NotConnected
+    )
+}
+
+fn read_scratch(scratch: &Mutex<Scratch>, offset: u64, want: usize) -> io::Result<Vec<u8>> {
+    let mut out = vec![0u8; want];
+    let mut s = lock_plain(scratch);
+    let mut got = 0;
+    while got < want {
+        let n = s.read_at(offset + got as u64, &mut out[got..])?;
+        if n == 0 {
+            break;
+        }
+        got += n;
+    }
+    out.truncate(got);
+    Ok(out)
 }
 
 impl LargeFile {
+    fn whole(scratch: Scratch, len: u64) -> Self {
+        Self { len, backing: Backing::Whole(Mutex::new(scratch)) }
+    }
+
     pub fn len(&self) -> u64 {
         self.len
     }
@@ -175,23 +321,161 @@ impl LargeFile {
         self.len == 0
     }
 
-    pub fn read_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    pub fn resident_bytes(&self) -> u64 {
+        match &self.backing {
+            Backing::Whole(_) => self.len,
+            Backing::Chunked(c) => c.resident.load(Ordering::Relaxed),
+        }
+    }
+
+    fn clamp(&self, offset: u64, len: usize) -> usize {
         if offset >= self.len || len == 0 {
+            0
+        } else {
+            len.min((self.len - offset) as usize)
+        }
+    }
+
+    pub fn read_at(self: &Arc<Self>, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let want = self.clamp(offset, len);
+        if want == 0 {
             return Ok(Vec::new());
         }
-        let want = len.min((self.len - offset) as usize);
-        let mut out = vec![0u8; want];
-        let mut s = self.scratch.lock().unwrap_or_else(|p| p.into_inner());
-        let mut got = 0;
-        while got < want {
-            let n = s.read_at(offset + got as u64, &mut out[got..])?;
+        match &self.backing {
+            Backing::Whole(s) => read_scratch(s, offset, want),
+            Backing::Chunked(c) => {
+                let first = offset / c.chunk_size;
+                let last = (offset + want as u64 - 1) / c.chunk_size;
+                for i in first..=last {
+                    c.ensure(i, self.len)?;
+                }
+                let end_in_chunk = (offset + want as u64 - 1) % c.chunk_size;
+                if end_in_chunk >= c.chunk_size / 8 {
+                    for next in last + 1..=(last + CHUNK_READAHEAD).min(c.count - 1) {
+                        if c.state(next) == CHUNK_MISSING {
+                            let me = Arc::clone(self);
+                            std::thread::spawn(move || {
+                                if let Backing::Chunked(c) = &me.backing {
+                                    if let Err(e) = c.ensure(next, me.len) {
+                                        log::debug!("[lethean-cli] read-ahead of chunk {next} failed: {e}");
+                                    }
+                                }
+                            });
+                        }
+                    }
+                }
+                read_scratch(&c.scratch, offset, want)
+            }
+        }
+    }
+
+    pub fn read_if_resident(&self, offset: u64, len: usize) -> Option<io::Result<Vec<u8>>> {
+        let want = self.clamp(offset, len);
+        if want == 0 {
+            return Some(Ok(Vec::new()));
+        }
+        match &self.backing {
+            Backing::Whole(s) => Some(read_scratch(s, offset, want)),
+            Backing::Chunked(c) => {
+                let first = offset / c.chunk_size;
+                let last = (offset + want as u64 - 1) / c.chunk_size;
+                if (first..=last).all(|i| c.state(i) == CHUNK_READY) {
+                    Some(read_scratch(&c.scratch, offset, want))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+}
+
+struct LoadingReset<'a> {
+    src: &'a ChunkedSource,
+    index: usize,
+    done: bool,
+}
+
+impl Drop for LoadingReset<'_> {
+    fn drop(&mut self) {
+        let mut st = lock_plain(&self.src.states);
+        st[self.index] = if self.done { CHUNK_READY } else { CHUNK_MISSING };
+        drop(st);
+        self.src.changed.notify_all();
+    }
+}
+
+impl ChunkedSource {
+    fn state(&self, i: u64) -> u8 {
+        lock_plain(&self.states).get(i as usize).copied().unwrap_or(CHUNK_READY)
+    }
+
+    fn ensure(&self, i: u64, file_len: u64) -> io::Result<()> {
+        let index = i as usize;
+        {
+            let mut st = lock_plain(&self.states);
+            loop {
+                match st.get(index).copied() {
+                    None | Some(CHUNK_READY) => return Ok(()),
+                    Some(CHUNK_LOADING) => st = self.changed.wait(st).unwrap_or_else(|p| p.into_inner()),
+                    Some(_) => {
+                        st[index] = CHUNK_LOADING;
+                        break;
+                    }
+                }
+            }
+        }
+        let mut reset = LoadingReset { src: self, index, done: false };
+        let take = (file_len - i * self.chunk_size).min(self.chunk_size);
+        let _slot = self.slots.acquire();
+        let mut last_err = None;
+        for attempt in 0..LARGE_LOAD_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(500 * (1 << attempt)));
+            }
+            match self.fetch(i, take) {
+                Ok(()) => {
+                    self.resident.fetch_add(take, Ordering::Relaxed);
+                    reset.done = true;
+                    return Ok(());
+                }
+                Err(e) if is_transient_io(&e) => {
+                    log::warn!("[lethean-cli] download of chunk {i} was interrupted ({e}); retrying");
+                    last_err = Some(e);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(last_err.expect("loop ran at least once"))
+    }
+
+    fn fetch(&self, i: u64, take: u64) -> io::Result<()> {
+        let sealed = self.chunk_size + chunked::TAG_LEN;
+        let start = i * sealed;
+        let (body, total) = self.api.open_blob_range(&self.id, start, start + sealed - 1).map_err(|e| other_io(format!("{e:#}")))?;
+        if total != self.sealed_total {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, AUTH_FAILED));
+        }
+        let nonce = chunked::nonce_for(&self.prefix, i)?;
+        let aad = chunked::aad_for(i, i == self.count - 1);
+        let mut dec = GcmDecryptReader::with_aad(body, &self.file_key, &nonce, &aad).map_err(other_io)?;
+        let base = i * self.chunk_size;
+        let mut buf = Zeroizing::new(vec![0u8; 256 * 1024]);
+        let mut got = 0u64;
+        loop {
+            let n = chunked::read_full(&mut dec, &mut buf)?;
             if n == 0 {
                 break;
             }
-            got += n;
+            let keep = take.saturating_sub(got).min(n as u64) as usize;
+            if keep > 0 {
+                lock_plain(&self.scratch).write_at(base + got, &buf[..keep])?;
+            }
+            got += n as u64;
         }
-        out.truncate(got);
-        Ok(out)
+        if got != self.chunk_size {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "chunk ended early"));
+        }
+        Ok(())
     }
 }
 
@@ -208,6 +492,9 @@ impl LargeCache {
     }
 
     fn touch(&mut self, id: &str) {
+        if self.order.back().map(|k| k == id).unwrap_or(false) {
+            return;
+        }
         if let Some(pos) = self.order.iter().position(|x| x == id) {
             let k = self.order.remove(pos).expect("position just found");
             self.order.push_back(k);
@@ -222,23 +509,27 @@ impl LargeCache {
         hit
     }
 
-    fn insert(&mut self, id: &str, file: Arc<LargeFile>) {
-        self.remove(id);
-        self.total_bytes += file.len;
-        self.map.insert(id.to_string(), file);
-        self.order.push_back(id.to_string());
+    fn enforce(&mut self) {
+        self.total_bytes = self.map.values().map(|f| f.resident_bytes()).sum();
         while self.total_bytes > self.max_bytes && self.order.len() > 1 {
             if let Some(old) = self.order.pop_front() {
                 if let Some(f) = self.map.remove(&old) {
-                    self.total_bytes -= f.len;
+                    self.total_bytes -= f.resident_bytes().min(self.total_bytes);
                 }
             }
         }
     }
 
+    fn insert(&mut self, id: &str, file: Arc<LargeFile>) {
+        self.remove(id);
+        self.map.insert(id.to_string(), file);
+        self.order.push_back(id.to_string());
+        self.enforce();
+    }
+
     fn remove(&mut self, id: &str) {
         if let Some(f) = self.map.remove(id) {
-            self.total_bytes -= f.len;
+            self.total_bytes -= f.resident_bytes().min(self.total_bytes);
             self.order.retain(|k| k != id);
         }
     }
@@ -280,7 +571,7 @@ impl Drop for ClaimGuard<'_> {
 }
 
 pub struct Vault {
-    pub api: ApiClient,
+    pub api: Arc<ApiClient>,
     wrapping_key_raw: RwLock<Zeroizing<Vec<u8>>>,
     index: RwLock<VaultIndex>,
     content_cache: Mutex<ContentCache>,
@@ -288,6 +579,7 @@ pub struct Vault {
     loading: Mutex<HashSet<String>>,
     load_done: Condvar,
     pool: Arc<ScratchPool>,
+    chunk_slots: Arc<Slots>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -299,7 +591,7 @@ pub struct ReadInfo {
 impl Vault {
     pub fn new(api: ApiClient, wrapping_key_raw: Vec<u8>) -> Self {
         Self {
-            api,
+            api: Arc::new(api),
             wrapping_key_raw: RwLock::new(Zeroizing::new(wrapping_key_raw)),
             index: RwLock::new(VaultIndex::new()),
             content_cache: Mutex::new(ContentCache::new()),
@@ -307,6 +599,7 @@ impl Vault {
             loading: Mutex::new(HashSet::new()),
             load_done: Condvar::new(),
             pool: ScratchPool::new(DEFAULT_POOL_BYTES, scratch::default_dir()),
+            chunk_slots: Arc::new(Slots::new(MAX_CONCURRENT_CHUNK_FETCHES)),
         }
     }
 
@@ -329,12 +622,6 @@ impl Vault {
         lock_large(&self.large_cache).wipe();
     }
 
-    fn index_insert(index: &mut VaultIndex, id: String, parent_id: Option<&str>, name: &str) {
-        let pk = parent_key(parent_id).to_string();
-        index.name_index.entry(pk.clone()).or_default().entry(name.to_string()).or_insert_with(|| id.clone());
-        index.children_by_parent.entry(pk).or_default().push(id);
-    }
-
     fn index_remove(index: &mut VaultIndex, id: &str, parent_id: Option<&str>, name: &str) {
         let pk = parent_key(parent_id);
         if let Some(v) = index.children_by_parent.get_mut(pk) {
@@ -354,10 +641,9 @@ impl Vault {
         }
     }
 
-    fn ingest_record(&self, record: FileRecord) {
-        let wrapping_key = self.wrapping_key();
+    fn decode_record(wrapping_key: &[u8], mut record: FileRecord) -> Entry {
         let decoded = (|| -> Result<(FileMeta, Zeroizing<Vec<u8>>)> {
-            let file_key = Zeroizing::new(aead::unwrap_file_key(&wrapping_key, &record.wrapped_file_key, &record.wrap_iv)?);
+            let file_key = Zeroizing::new(aead::unwrap_file_key(wrapping_key, &record.wrapped_file_key, &record.wrap_iv)?);
             let meta = aead::decrypt_metadata(&file_key, &record.encrypted_metadata, &record.metadata_iv)?;
             Ok((meta, file_key))
         })();
@@ -377,47 +663,103 @@ impl Vault {
                 Zeroizing::new(Vec::new()),
             ),
         };
+        record.encrypted_metadata = String::new();
+        record.metadata_iv = String::new();
+        Entry::new(record, meta, file_key)
+    }
 
-        let id = record.id.clone();
-        let parent_id = meta.parent_id.clone();
-        let mut index = write_lock(&self.index);
-        if index.entries.contains_key(&id) {
-            return;
-        }
-        let name = meta.name.clone();
-        index.entries.insert(id.clone(), Entry { record, meta, file_key });
-        Self::index_insert(&mut index, id, parent_id.as_deref(), &name);
+    fn ingest_record(&self, record: FileRecord) -> Option<Arc<Entry>> {
+        let entry = Self::decode_record(&self.wrapping_key(), record);
+        write_lock(&self.index).insert(entry)
     }
 
     pub fn refresh_all(&self) -> Result<()> {
-        write_lock(&self.index).clear();
+        let wrapping_key = self.wrapping_key();
+        let mut fresh = VaultIndex::new();
         let mut offset = 0u64;
-        loop {
+
+        let first = self.api.list_files(0, Some(PAGE_SIZE))?;
+        let mut last_page_full = first.len() as u64 >= PAGE_SIZE;
+        offset += first.len() as u64;
+        for record in first {
+            fresh.insert(Self::decode_record(&wrapping_key, record));
+        }
+        let expected = if last_page_full { self.api.get_usage(None).ok().map(|u| u.file_count).unwrap_or(0) } else { 0 };
+        let pages = expected.div_ceil(PAGE_SIZE);
+        if pages > 1 {
+            let next_page = AtomicU64::new(1);
+            let results: Mutex<Vec<(u64, Result<Vec<Entry>>)>> = Mutex::new(Vec::new());
+            std::thread::scope(|s| {
+                for _ in 0..REFRESH_PARALLELISM.min(pages as usize - 1) {
+                    s.spawn(|| loop {
+                        let page = next_page.fetch_add(1, Ordering::Relaxed);
+                        if page >= pages {
+                            break;
+                        }
+                        let result = self.api.list_files(page * PAGE_SIZE, Some(PAGE_SIZE)).map(|records| records.into_iter().map(|r| Self::decode_record(&wrapping_key, r)).collect::<Vec<_>>());
+                        let failed = result.is_err();
+                        lock_plain(&results).push((page, result));
+                        if failed {
+                            break;
+                        }
+                    });
+                }
+            });
+            let mut results = results.into_inner().unwrap_or_else(|p| p.into_inner());
+            results.sort_by_key(|(page, _)| *page);
+            for (_, result) in results {
+                let entries = result?;
+                last_page_full = entries.len() as u64 == PAGE_SIZE;
+                offset += entries.len() as u64;
+                for e in entries {
+                    fresh.insert(e);
+                }
+                if !last_page_full {
+                    break;
+                }
+            }
+        }
+
+        while last_page_full {
             let page = self.api.list_files(offset, Some(PAGE_SIZE))?;
             let got = page.len() as u64;
             for record in page {
-                self.ingest_record(record);
+                fresh.insert(Self::decode_record(&wrapping_key, record));
             }
-            if got < PAGE_SIZE {
-                break;
-            }
+            last_page_full = got >= PAGE_SIZE;
             offset += got;
         }
+
+        *write_lock(&self.index) = fresh;
         Ok(())
     }
 
     pub fn get(&self, id: &str) -> Option<Entry> {
+        read_lock(&self.index).entries.get(id).map(|e| (**e).clone())
+    }
+
+    pub fn entry(&self, id: &str) -> Option<Arc<Entry>> {
         read_lock(&self.index).entries.get(id).cloned()
     }
 
+    pub fn stat(&self, id: &str) -> Option<Stat> {
+        let index = read_lock(&self.index);
+        let e = index.entries.get(id)?;
+        Some(Stat { is_folder: e.is_folder(), size: e.size(), size_is_exact: e.size_is_exact() })
+    }
+
+    pub fn entry_count(&self) -> usize {
+        read_lock(&self.index).entries.len()
+    }
+
     pub fn all_entries(&self) -> Vec<Entry> {
-        read_lock(&self.index).entries.values().cloned().collect()
+        read_lock(&self.index).entries.values().map(|e| (**e).clone()).collect()
     }
 
     pub fn children_of(&self, parent_id: Option<&str>) -> Vec<Entry> {
         let index = read_lock(&self.index);
         let mut kids: Vec<Entry> = match index.children_by_parent.get(parent_key(parent_id)) {
-            Some(ids) => ids.iter().filter_map(|id| index.entries.get(id).cloned()).collect(),
+            Some(ids) => ids.iter().filter_map(|id| index.entries.get(id).map(|e| (**e).clone())).collect(),
             None => Vec::new(),
         };
         drop(index);
@@ -429,10 +771,14 @@ impl Vault {
         kids
     }
 
-    pub fn find_child_by_name(&self, parent_id: Option<&str>, name: &str) -> Option<Entry> {
+    pub fn find_child(&self, parent_id: Option<&str>, name: &str) -> Option<Arc<Entry>> {
         let index = read_lock(&self.index);
         let id = index.name_index.get(parent_key(parent_id))?.get(name)?;
         index.entries.get(id).cloned()
+    }
+
+    pub fn find_child_by_name(&self, parent_id: Option<&str>, name: &str) -> Option<Entry> {
+        self.find_child(parent_id, name).map(|e| (*e).clone())
     }
 
     pub fn list_children(&self, parent_id: Option<&str>) -> Vec<ChildInfo> {
@@ -442,7 +788,7 @@ impl Vault {
             None => Vec::new(),
         };
         drop(index);
-        kids.sort_by(|a, b| match (a.is_folder, b.is_folder) {
+        kids.sort_unstable_by(|a, b| match (a.is_folder, b.is_folder) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
             _ => a.name.cmp(&b.name),
@@ -506,8 +852,11 @@ impl Vault {
             drop(reader);
             let payload = aead::encrypt_file(&wrapping_key, name, mime, &buf, parent_id)?;
             let record = self.api.upload_file(&payload, None, None).context("upload failed")?;
+            drop(payload);
             let id = record.id.clone();
-            self.ingest_record(record);
+            if let Some(entry) = self.ingest_record(record) {
+                entry.learn_size(buf.len() as u64);
+            }
             lock_cache(&self.content_cache).insert(id.clone(), Arc::new(buf));
             return self.get(&id).context("upload succeeded but the new entry vanished (likely deleted concurrently)");
         }
@@ -579,7 +928,7 @@ impl Vault {
 
 
     fn is_large(entry: &Entry) -> bool {
-        entry.meta.chunk_size.is_some() || entry.size().max(entry.record.size.unwrap_or(0)) > IN_MEMORY_READ_MAX
+        entry.meta.chunk_size.is_some() || entry.stored_size().max(entry.record.size.unwrap_or(0)) > IN_MEMORY_READ_MAX
     }
 
     fn stream_decrypted(&self, entry: &Entry, w: &mut dyn Write) -> Result<u64> {
@@ -598,30 +947,27 @@ impl Vault {
 
         let written = if entry.meta.compressed {
             let mut gz = flate2::read::GzDecoder::new((&mut dec).take(limit));
-            io::copy(&mut gz, w)?
+            copy_in_blocks(&mut gz, w)?
         } else {
-            io::copy(&mut (&mut dec).take(limit), w)?
+            copy_in_blocks(&mut (&mut dec).take(limit), w)?
         };
         io::copy(&mut dec, &mut io::sink())?;
+        entry.learn_size(written);
         Ok(written)
     }
 
-    fn download_large(&self, id: &str) -> Result<Arc<LargeFile>> {
-        let entry = self.get(id).context("unknown file")?;
-        if entry.is_folder() {
-            bail!("cannot read a folder's content");
-        }
+    fn download_large(&self, entry: &Entry) -> Result<Arc<LargeFile>> {
         let mut last_err = None;
         for attempt in 0..LARGE_LOAD_ATTEMPTS {
             if attempt > 0 {
                 std::thread::sleep(std::time::Duration::from_millis(500 * (1 << attempt)));
             }
             let mut scratch = self.pool.new_scratch();
-            let result = self.stream_decrypted(&entry, &mut ScratchWriter::new(&mut scratch));
+            let result = self.stream_decrypted(entry, &mut ScratchWriter::new(&mut scratch));
             match result {
                 Ok(_) => {
                     let len = scratch.len();
-                    return Ok(Arc::new(LargeFile { scratch: Mutex::new(scratch), len }));
+                    return Ok(Arc::new(LargeFile::whole(scratch, len)));
                 }
                 Err(e) if is_transient_stream_error(&e) => {
                     log::warn!("[lethean-cli] download of \"{}\" was interrupted ({e:#}); retrying", entry.name());
@@ -633,10 +979,44 @@ impl Vault {
         Err(last_err.expect("loop ran at least once"))
     }
 
-    pub fn load_large(&self, id: &str) -> Result<Arc<LargeFile>> {
+    fn open_chunked(&self, entry: &Entry, chunk_size: u64) -> Result<Arc<LargeFile>> {
+        if entry.file_key.is_empty() {
+            bail!("\"{}\" could not be decrypted (wrong vault password, or a corrupted item)", entry.name());
+        }
+        if !(chunked::MIN_CHUNK..=chunked::MAX_CHUNK).contains(&chunk_size) {
+            bail!("unsupported chunk size {chunk_size}");
+        }
+        let true_size = entry.meta.unpadded_size.context("chunked file without a size in its metadata")?;
+        let prefix = aead::from_base64(&entry.record.content_iv)?;
+        if prefix.len() != chunked::PREFIX_LEN {
+            bail!("chunked file has a {}-byte nonce prefix, expected {}", prefix.len(), chunked::PREFIX_LEN);
+        }
+        let count = chunked::chunk_count(true_size, chunk_size);
+        let mut scratch = self.pool.new_scratch();
+        scratch.set_len(true_size)?;
+        Ok(Arc::new(LargeFile {
+            len: true_size,
+            backing: Backing::Chunked(ChunkedSource {
+                api: Arc::clone(&self.api),
+                id: entry.record.id.clone(),
+                file_key: entry.file_key.clone(),
+                prefix,
+                chunk_size,
+                count,
+                sealed_total: chunked::sealed_len(true_size, chunk_size),
+                scratch: Mutex::new(scratch),
+                states: Mutex::new(vec![CHUNK_MISSING; count as usize]),
+                changed: Condvar::new(),
+                resident: AtomicU64::new(0),
+                slots: Arc::clone(&self.chunk_slots),
+            }),
+        }))
+    }
+
+    fn single_flight<T>(&self, id: &str, cached: impl Fn() -> Option<T>, work: impl FnOnce() -> Result<T>) -> Result<T> {
         loop {
-            if let Some(f) = lock_large(&self.large_cache).get(id) {
-                return Ok(f);
+            if let Some(v) = cached() {
+                return Ok(v);
             }
             {
                 let mut set = self.loading.lock().unwrap_or_else(|p| p.into_inner());
@@ -649,25 +1029,51 @@ impl Vault {
                 set.insert(id.to_string());
             }
             let _claim = ClaimGuard { vault: self, id: id.to_string() };
-            if let Some(f) = lock_large(&self.large_cache).get(id) {
-                return Ok(f);
+            if let Some(v) = cached() {
+                return Ok(v);
             }
-            let file = self.download_large(id)?;
-            if self.get(id).is_some() {
-                lock_large(&self.large_cache).insert(id, Arc::clone(&file));
-            }
-            return Ok(file);
+            return work();
         }
     }
 
+    pub fn load_large(&self, id: &str) -> Result<Arc<LargeFile>> {
+        self.single_flight(
+            id,
+            || lock_large(&self.large_cache).get(id),
+            || {
+                let entry = self.entry(id).context("unknown file")?;
+                if entry.is_folder() {
+                    bail!("cannot read a folder's content");
+                }
+                let file = match entry.meta.chunk_size {
+                    Some(cs) if self.api.supports_ranges(id).unwrap_or(false) => self.open_chunked(&entry, cs)?,
+                    _ => self.download_large(&entry)?,
+                };
+                if self.entry(id).is_some() {
+                    lock_large(&self.large_cache).insert(id, Arc::clone(&file));
+                }
+                Ok(file)
+            },
+        )
+    }
+
+    pub fn read_large(&self, file: &Arc<LargeFile>, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let before = file.resident_bytes();
+        let out = file.read_at(offset, len)?;
+        if file.resident_bytes() != before {
+            lock_large(&self.large_cache).enforce();
+        }
+        Ok(out)
+    }
+
     pub fn read_range(&self, id: &str, offset: u64, len: usize) -> Result<Vec<u8>> {
-        let entry = self.get(id).context("unknown file")?;
+        let entry = self.entry(id).context("unknown file")?;
         if entry.is_folder() {
             bail!("cannot read a folder's content");
         }
         if Self::is_large(&entry) {
             let f = self.load_large(id)?;
-            return Ok(f.read_at(offset, len)?);
+            return Ok(self.read_large(&f, offset, len)?);
         }
         let data = self.download_arc(id)?;
         Ok(slice_of(&data, offset, len))
@@ -678,7 +1084,11 @@ impl Vault {
             return Some(slice_of(&data, offset, len));
         }
         let f = lock_large(&self.large_cache).get(id)?;
-        f.read_at(offset, len).ok()
+        f.read_if_resident(offset, len)?.ok()
+    }
+
+    pub fn cached_small(&self, id: &str) -> Option<Arc<Zeroizing<Vec<u8>>>> {
+        lock_cache(&self.content_cache).get(id)
     }
 
     pub fn download_arc(&self, id: &str) -> Result<Arc<Zeroizing<Vec<u8>>>> {
@@ -686,7 +1096,7 @@ impl Vault {
             return Ok(cached);
         }
 
-        let entry = self.get(id).context("unknown file")?;
+        let entry = self.entry(id).context("unknown file")?;
         if entry.is_folder() {
             bail!("cannot read a folder's content");
         }
@@ -697,11 +1107,18 @@ impl Vault {
             return Ok(Arc::new(out));
         }
 
-        let ciphertext = self.api.download_content(id)?;
-        let bytes = aead::decrypt_content_owned(&entry.file_key, &entry.record.content_iv, ciphertext, entry.meta.compressed, entry.meta.unpadded_size)?;
-        let shared = Arc::new(Zeroizing::new(bytes));
-        lock_cache(&self.content_cache).insert(id.to_string(), Arc::clone(&shared));
-        Ok(shared)
+        self.single_flight(
+            id,
+            || lock_cache(&self.content_cache).get(id),
+            || {
+                let ciphertext = self.api.download_content(id)?;
+                let bytes = aead::decrypt_content_owned(&entry.file_key, &entry.record.content_iv, ciphertext, entry.meta.compressed, entry.meta.unpadded_size)?;
+                entry.learn_size(bytes.len() as u64);
+                let shared = Arc::new(Zeroizing::new(bytes));
+                lock_cache(&self.content_cache).insert(id.to_string(), Arc::clone(&shared));
+                Ok(shared)
+            },
+        )
     }
 
     pub fn download_decrypted(&self, id: &str) -> Result<Vec<u8>> {
@@ -709,7 +1126,7 @@ impl Vault {
     }
 
     pub fn stream_plaintext(&self, id: &str, w: &mut dyn Write) -> Result<u64> {
-        let entry = self.get(id).context("unknown file")?;
+        let entry = self.entry(id).context("unknown file")?;
         if entry.is_folder() {
             bail!("cannot read a folder's content");
         }
@@ -722,7 +1139,7 @@ impl Vault {
         if let Some(f) = cached {
             let mut pos = 0u64;
             while pos < f.len() {
-                let part = f.read_at(pos, 1024 * 1024)?;
+                let part = self.read_large(&f, pos, 1024 * 1024)?;
                 if part.is_empty() {
                     break;
                 }
@@ -839,7 +1256,11 @@ impl Vault {
         };
 
         let id = record.id.clone();
-        self.ingest_record(record);
+        if let Some(new_entry) = self.ingest_record(record) {
+            if old.meta.compressed && old.size_is_exact() {
+                new_entry.learn_size(old.size());
+            }
+        }
         lock_cache(&self.content_cache).rekey(&old.record.id, &id);
         lock_large(&self.large_cache).rekey(&old.record.id, &id);
         self.get(&id).context("reupload succeeded but the new entry vanished (likely deleted concurrently)")
@@ -860,6 +1281,19 @@ impl Vault {
         self.api.set_vault_id(Some(new_vault_id.to_string()));
         *write_lock(&self.wrapping_key_raw) = Zeroizing::new(new_wrapping_key_raw.to_vec());
         Ok(result.files_moved)
+    }
+}
+
+fn copy_in_blocks(r: &mut impl Read, w: &mut dyn Write) -> io::Result<u64> {
+    let mut buf = Zeroizing::new(vec![0u8; 256 * 1024]);
+    let mut total = 0u64;
+    loop {
+        let n = chunked::read_full(r, &mut buf)?;
+        if n == 0 {
+            return Ok(total);
+        }
+        w.write_all(&buf[..n])?;
+        total += n as u64;
     }
 }
 
@@ -995,7 +1429,7 @@ mod large_cache_tests {
 
     fn file(len: u64) -> Arc<LargeFile> {
         let pool = ScratchPool::new(1024 * 1024, std::env::temp_dir());
-        Arc::new(LargeFile { scratch: Mutex::new(pool.new_scratch()), len })
+        Arc::new(LargeFile::whole(pool.new_scratch(), len))
     }
 
     #[test]

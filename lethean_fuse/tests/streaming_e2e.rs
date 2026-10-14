@@ -296,5 +296,125 @@ fn files_over_32_mib_use_the_web_clients_chunked_format_and_round_trip() {
     }
     let tampered = new_vault(server.addr, &key);
     tampered.refresh_all().unwrap();
-    assert!(tampered.read_range(&id, 0, 16).is_err(), "a tampered chunk must fail the whole read");
+    assert_eq!(tampered.read_range(&id, 0, 16).unwrap(), expected(0, 16));
+    let err = tampered.read_range(&id, CHUNK_SIZE + 10, 16).expect_err("a tampered chunk must not be served");
+    assert!(format!("{err:#}").contains("AES-GCM"), "{err:#}");
+    assert!(tampered.read_range(&id, CHUNK_SIZE + 10, 16).is_err(), "and it is not cached as if it were fine");
+    assert!(tampered.try_read_cached(&id, CHUNK_SIZE + 10, 16).is_none());
+    assert!(tampered.read_range(&id, CHUNK_SIZE - 8, 16).is_err(), "a read spanning into the tampered chunk fails too");
+}
+
+fn upload_chunked(server: &Server, key: &[u8], size: u64) -> String {
+    let vault = new_vault(server.addr, key);
+    let started = Arc::new(AtomicUsize::new(0));
+    upload(&vault, "chunked.bin", "application/octet-stream", size, &started)
+}
+
+#[test]
+fn chunked_files_are_read_by_range_fetching_only_the_chunks_touched() {
+    use lethean_fuse_lib::crypto::chunked::{sealed_len, CHUNK_SIZE};
+    let server = start_server(ServerOpts { support_range: true, fail_first_upload: false, discard_blobs: false });
+    let key = aead::generate_aes_key_raw();
+    let size = 3 * CHUNK_SIZE + 4 * MIB + 3;
+    let id = upload_chunked(&server, &key, size);
+
+    let reader = new_vault(server.addr, &key);
+    reader.refresh_all().unwrap();
+    let served0 = server.bytes_served.load(Ordering::SeqCst);
+    let tail = reader.read_range(&id, size - 4096, 4096).unwrap();
+    assert_eq!(tail, expected(size - 4096, 4096));
+    let fetched = (server.bytes_served.load(Ordering::SeqCst) - served0) as u64;
+    assert!(fetched <= CHUNK_SIZE + 64, "reading the tail fetched {fetched} bytes, expected one chunk");
+    assert_eq!(server.full_gets.load(Ordering::SeqCst), 0, "no whole-file download");
+
+    let gets0 = server.range_gets.load(Ordering::SeqCst);
+    std::thread::scope(|s| {
+        for t in 0..8u64 {
+            let (reader, id) = (&reader, &id);
+            s.spawn(move || {
+                let off = CHUNK_SIZE + t * 1000;
+                assert_eq!(reader.read_range(id, off, 512).unwrap(), expected(off, 512));
+            });
+        }
+    });
+    assert_eq!(server.range_gets.load(Ordering::SeqCst) - gets0, 1, "one ranged GET for the shared chunk");
+
+    for off in [0, CHUNK_SIZE - 7, 2 * CHUNK_SIZE - 1, size - 1] {
+        assert_eq!(reader.read_range(&id, off, 64).unwrap(), expected(off, (size - off).min(64) as usize), "offset {off}");
+    }
+    let mut all = Vec::new();
+    assert_eq!(reader.stream_plaintext(&id, &mut all).unwrap(), size);
+    assert!(all == expected(0, size as usize));
+    assert!((server.bytes_served.load(Ordering::SeqCst) - served0) as u64 <= sealed_len(size, CHUNK_SIZE) + 64, "each chunk fetched at most once");
+}
+
+#[test]
+fn chunked_files_fall_back_to_a_full_download_when_the_server_ignores_ranges() {
+    use lethean_fuse_lib::crypto::chunked::CHUNK_SIZE;
+    let server = start_server(ServerOpts { support_range: false, fail_first_upload: false, discard_blobs: false });
+    let key = aead::generate_aes_key_raw();
+    let size = CHUNK_SIZE + 1234;
+    let id = upload_chunked(&server, &key, size);
+
+    let reader = new_vault(server.addr, &key);
+    reader.refresh_all().unwrap();
+    assert_eq!(reader.read_range(&id, size - 100, 100).unwrap(), expected(size - 100, 100));
+    assert_eq!(reader.read_range(&id, 5, 100).unwrap(), expected(5, 100));
+    assert_eq!(server.range_gets.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn a_truncated_chunked_blob_is_rejected_even_when_reading_an_intact_chunk() {
+    use lethean_fuse_lib::crypto::chunked::CHUNK_SIZE;
+    let server = start_server(ServerOpts { support_range: true, fail_first_upload: false, discard_blobs: false });
+    let key = aead::generate_aes_key_raw();
+    let size = 2 * CHUNK_SIZE + 99;
+    let id = upload_chunked(&server, &key, size);
+    {
+        let mut files = server.files.lock().unwrap();
+        let n = files[0].1.blob.len();
+        files[0].1.blob.truncate(n - (CHUNK_SIZE as usize + 16));
+        files[0].1.blob_len = files[0].1.blob.len() as u64;
+    }
+    let reader = new_vault(server.addr, &key);
+    reader.refresh_all().unwrap();
+    assert!(reader.read_range(&id, 0, 16).is_err(), "the size the server reports no longer matches the metadata");
+}
+
+#[test]
+#[ignore]
+fn downloading_a_huge_chunked_file_stays_within_the_scratch_budget() {
+    use lethean_fuse_lib::crypto::chunked::{plan_chunked_upload, ChunkedEncryptReader};
+    let mib = rss_test_mib();
+    let size = mib * MIB + 777;
+    let server = start_server(ServerOpts { support_range: true, fail_first_upload: false, discard_blobs: true });
+    let key = aead::generate_aes_key_raw();
+    let plan = plan_chunked_upload(&key, "huge.bin", "application/octet-stream", size, None).unwrap();
+    let (fk, prefix) = (plan.file_key.to_vec(), plan.prefix.clone());
+    let gen: Generator = Arc::new(move || {
+        let src = PatternReader::new(size, Arc::new(AtomicUsize::new(0)));
+        Box::new(ChunkedEncryptReader::new(src, &fk, &prefix, size))
+    });
+    let h = &plan.header;
+    let id = inject_virtual(
+        &server,
+        [("content_iv", h.content_iv.clone()), ("encrypted_metadata", h.encrypted_metadata.clone()), ("metadata_iv", h.metadata_iv.clone()), ("wrapped_file_key", h.wrapped_file_key.clone()), ("wrap_iv", h.wrap_iv.clone())],
+        plan.body_len(),
+        gen,
+    );
+
+    let scratch_dir = std::env::temp_dir().join(format!("lethean-rss-c-{}", std::process::id()));
+    let mut vault = new_vault(server.addr, &key);
+    vault.set_scratch_dir(scratch_dir.clone(), 64 * MIB);
+    vault.refresh_all().unwrap();
+
+    let before = vm_hwm_kib();
+    let t = std::time::Instant::now();
+    let tail = vault.read_range(&id, size - 4096, 4096).expect("read");
+    let secs = t.elapsed().as_secs_f64();
+    let growth = (vm_hwm_kib().saturating_sub(before)) as f64 / 1024.0;
+    assert_eq!(tail, expected(size - 4096, 4096));
+    println!("chunked: downloaded+verified+decrypted {mib} MiB in {secs:.2}s ({:.0} MiB/s), peak RSS grew by {growth:.1} MiB", mib as f64 / secs);
+    drop(vault);
+    let _ = std::fs::remove_dir_all(&scratch_dir);
 }

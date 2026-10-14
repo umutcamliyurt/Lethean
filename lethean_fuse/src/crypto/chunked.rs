@@ -7,7 +7,7 @@ use anyhow::{bail, Result};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::crypto::aead::{aes_gcm_encrypt, pad_metadata_bytes, random_bytes, to_base64};
-use crate::crypto::gcm_stream::AUTH_FAILED;
+use crate::crypto::gcm_stream::{GcmDecryptReader, AUTH_FAILED};
 use crate::types::{EncryptedHeader, FileMeta};
 
 pub const CHUNK_SIZE: u64 = 32 * 1024 * 1024;
@@ -15,8 +15,8 @@ pub const TAG_LEN: u64 = 16;
 pub const SEALED_CHUNK: u64 = CHUNK_SIZE + TAG_LEN;
 pub const PREFIX_LEN: usize = 8;
 
-const MIN_CHUNK: u64 = 1024;
-const MAX_CHUNK: u64 = 256 * 1024 * 1024;
+pub const MIN_CHUNK: u64 = 1024;
+pub const MAX_CHUNK: u64 = 256 * 1024 * 1024;
 
 pub fn chunk_count(true_size: u64, chunk_size: u64) -> u64 {
     true_size.div_ceil(chunk_size).max(1)
@@ -33,7 +33,7 @@ fn cipher(key: &[u8]) -> Result<Aes256Gcm> {
     Ok(Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key)))
 }
 
-fn nonce_for(prefix: &[u8], index: u64) -> io::Result<[u8; 12]> {
+pub fn nonce_for(prefix: &[u8], index: u64) -> io::Result<[u8; 12]> {
     if prefix.len() != PREFIX_LEN {
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("chunked file has a {}-byte nonce prefix, expected {PREFIX_LEN}", prefix.len())));
     }
@@ -44,7 +44,7 @@ fn nonce_for(prefix: &[u8], index: u64) -> io::Result<[u8; 12]> {
     Ok(n)
 }
 
-fn aad_for(index: u64, last: bool) -> [u8; 5] {
+pub fn aad_for(index: u64, last: bool) -> [u8; 5] {
     let mut a = [0u8; 5];
     a[..4].copy_from_slice(&(index as u32).to_be_bytes());
     a[4] = last as u8;
@@ -163,22 +163,48 @@ impl<R: Read> Read for ChunkedEncryptReader<R> {
     }
 }
 
+pub fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match r.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
 pub fn decrypt_chunked<R: Read>(mut source: R, key: &[u8], prefix: &[u8], chunk_size: u64, true_size: u64, w: &mut dyn Write) -> io::Result<u64> {
     if !(MIN_CHUNK..=MAX_CHUNK).contains(&chunk_size) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unsupported chunk size {chunk_size}")));
     }
     let count = chunk_count(true_size, chunk_size);
-    let sealed = (chunk_size + TAG_LEN) as usize;
-    let mut buf = Zeroizing::new(Vec::with_capacity(sealed));
+    let sealed = chunk_size + TAG_LEN;
+    let mut buf = Zeroizing::new(vec![0u8; 256 * 1024]);
     let mut written = 0u64;
     for index in 0..count {
-        buf.clear();
-        buf.resize(sealed, 0);
-        source.read_exact(&mut buf)?;
-        open_chunk(key, prefix, index, index == count - 1, &mut buf)?;
-        let take = (true_size - written).min(chunk_size) as usize;
-        w.write_all(&buf[..take])?;
-        written += take as u64;
+        let nonce = nonce_for(prefix, index)?;
+        let aad = aad_for(index, index == count - 1);
+        let mut dec = GcmDecryptReader::with_aad((&mut source).take(sealed), key, &nonce, &aad).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
+        let take = (true_size - written).min(chunk_size);
+        let mut got = 0u64;
+        loop {
+            let n = read_full(&mut dec, &mut buf)?;
+            if n == 0 {
+                break;
+            }
+            let keep = (take.saturating_sub(got)).min(n as u64) as usize;
+            if keep > 0 {
+                w.write_all(&buf[..keep])?;
+            }
+            got += n as u64;
+        }
+        if got != chunk_size {
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "encrypted file ended in the middle of a chunk"));
+        }
+        written += take;
     }
     let mut probe = [0u8; 1];
     loop {

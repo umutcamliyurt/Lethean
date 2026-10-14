@@ -83,6 +83,7 @@ pub fn start_server(opts: ServerOpts) -> Server {
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
+            let _ = stream.set_nodelay(true);
             let files = Arc::clone(&files);
             let uploads_seen = Arc::clone(&uploads_seen);
             let range_gets = Arc::clone(&range_gets);
@@ -181,45 +182,65 @@ pub fn start_server(opts: ServerOpts) -> Server {
                             return;
                         }
                     } else if method == "GET" && path.starts_with("/files") && path.ends_with("/blob") {
-                        let id = path.trim_start_matches("/files/").trim_end_matches("/blob").to_string();
-                        let stored = files.lock().unwrap().iter().find(|(i, _)| *i == id).map(|(_, s)| (s.blob.clone(), s.generator.clone(), s.blob_len));
-                        let Some((blob, generator, blob_len)) = stored else {
-                            let _ = respond(&mut writer, "404 Not Found", "", b"");
-                            continue;
-                        };
-                        if let Some(gen) = generator {
-                            full_gets.fetch_add(1, Ordering::SeqCst);
-                            if write!(writer, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {blob_len}\r\n\r\n").is_err() {
-                                return;
-                            }
-                            let mut src = gen();
-                            let mut buf = vec![0u8; 64 * 1024];
-                            loop {
-                                let n = match src.read(&mut buf) {
-                                    Ok(0) | Err(_) => break,
-                                    Ok(n) => n,
-                                };
-                                if writer.write_all(&buf[..n]).is_err() {
-                                    return;
-                                }
-                                bytes_served.fetch_add(n, Ordering::SeqCst);
-                            }
-                            let _ = writer.flush();
-                            continue;
+                        if let Some(ms) = std::env::var("MOCK_BLOB_DELAY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+                            thread::sleep(std::time::Duration::from_millis(ms));
                         }
+                        let id = path.trim_start_matches("/files/").trim_end_matches("/blob").to_string();
                         let ranged = range.as_deref().and_then(|r| r.strip_prefix("bytes=")).and_then(|r| {
                             let (a, b) = r.split_once('-')?;
                             Some((a.parse::<usize>().ok()?, b.parse::<usize>().ok()?))
                         });
-                        let result = match ranged {
-                            Some((a, b)) if opts.support_range => {
-                                range_gets.fetch_add(1, Ordering::SeqCst);
-                                let b = b.min(blob.len() - 1);
-                                let body = &blob[a..=b];
-                                bytes_served.fetch_add(body.len(), Ordering::SeqCst);
-                                respond(&mut writer, "206 Partial Content", &format!("Content-Range: bytes {a}-{b}/{}\r\n", blob.len()), body)
+                        enum Plan {
+                            Missing,
+                            Virtual(Generator, u64),
+                            Partial(Vec<u8>, usize, usize, usize),
+                            Full(Vec<u8>),
+                        }
+                        let plan = {
+                            let files = files.lock().unwrap();
+                            match files.iter().find(|(i, _)| *i == id).map(|(_, s)| s) {
+                                None => Plan::Missing,
+                                Some(s) if s.generator.is_some() => Plan::Virtual(s.generator.clone().unwrap(), s.blob_len),
+                                Some(s) => match ranged {
+                                    Some((a, b)) if opts.support_range && a < s.blob.len() => {
+                                        let b = b.min(s.blob.len() - 1);
+                                        Plan::Partial(s.blob[a..=b].to_vec(), a, b, s.blob.len())
+                                    }
+                                    _ => Plan::Full(s.blob.clone()),
+                                },
                             }
-                            _ => {
+                        };
+                        let result = match plan {
+                            Plan::Missing => {
+                                let _ = respond(&mut writer, "404 Not Found", "", b"");
+                                continue;
+                            }
+                            Plan::Virtual(gen, blob_len) => {
+                                full_gets.fetch_add(1, Ordering::SeqCst);
+                                if write!(writer, "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {blob_len}\r\n\r\n").is_err() {
+                                    return;
+                                }
+                                let mut src = gen();
+                                let mut buf = vec![0u8; 64 * 1024];
+                                loop {
+                                    let n = match src.read(&mut buf) {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(n) => n,
+                                    };
+                                    if writer.write_all(&buf[..n]).is_err() {
+                                        return;
+                                    }
+                                    bytes_served.fetch_add(n, Ordering::SeqCst);
+                                }
+                                let _ = writer.flush();
+                                continue;
+                            }
+                            Plan::Partial(body, a, b, total) => {
+                                range_gets.fetch_add(1, Ordering::SeqCst);
+                                bytes_served.fetch_add(body.len(), Ordering::SeqCst);
+                                respond(&mut writer, "206 Partial Content", &format!("Content-Range: bytes {a}-{b}/{total}\r\n"), &body)
+                            }
+                            Plan::Full(blob) => {
                                 full_gets.fetch_add(1, Ordering::SeqCst);
                                 bytes_served.fetch_add(blob.len(), Ordering::SeqCst);
                                 respond(&mut writer, "200 OK", "", &blob)
@@ -235,9 +256,14 @@ pub fn start_server(opts: ServerOpts) -> Server {
                             return;
                         }
                     } else if method == "GET" && path.starts_with("/files") {
+                        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+                        let param = |k: &str| query.split('&').find_map(|kv| kv.strip_prefix(k).and_then(|v| v.strip_prefix('='))).and_then(|v| v.parse::<usize>().ok());
+                        let (offset, limit) = (param("offset").unwrap_or(0), param("limit").unwrap_or(usize::MAX));
                         let list = files.lock().unwrap();
                         let items: Vec<String> = list
                             .iter()
+                            .skip(offset)
+                            .take(limit)
                             .map(|(id, s)| {
                                 format!(
                                     r#"{{"id":"{id}","content_iv":"{}","encrypted_metadata":"{}","metadata_iv":"{}","wrapped_file_key":"{}","wrap_iv":"{}","size":{}}}"#,

@@ -1,4 +1,6 @@
-use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::io::{self, Read};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -6,17 +8,20 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
+use fuser::consts::{FOPEN_DIRECT_IO, FOPEN_KEEP_CACHE};
 use fuser::{FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow};
 use libc::{c_int, EBADF, EDQUOT, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, O_ACCMODE, O_TRUNC};
 use log::{error, warn};
 use zeroize::Zeroizing;
 
 use crate::scratch::{Scratch, ScratchPool, ScratchReader, ScratchWriter, DEFAULT_POOL_BYTES};
-use crate::vault::{LargeFile, Vault};
+use crate::vault::{LargeFile, Stat, Vault};
 
-const TTL: Duration = Duration::from_secs(1);
+const TTL: Duration = Duration::from_secs(5);
 const ROOT_INO: u64 = 1;
 
+const NET_WORKERS: usize = 64;
+const IO_WORKERS: usize = 8;
 
 #[derive(Clone)]
 enum Node {
@@ -56,32 +61,28 @@ enum Pinned {
     Large(Arc<LargeFile>),
 }
 
-impl Pinned {
-    fn read(&self, offset: u64, size: usize) -> std::io::Result<Vec<u8>> {
-        match self {
-            Pinned::Mem(data) => {
-                let start = (offset as usize).min(data.len());
-                let end = start.saturating_add(size).min(data.len());
-                Ok(data[start..end].to_vec())
-            }
-            Pinned::Large(f) => f.read_at(offset, size),
-        }
-    }
-}
-
 enum Handle {
     Read { id: String, pinned: Option<Pinned> },
     Write { ino: u64 },
 }
 
+struct DirEntry {
+    ino: u64,
+    kind: FileType,
+    name: String,
+}
+
 struct FsState {
     ino_of_id: HashMap<String, u64>,
     node_of_ino: HashMap<u64, Node>,
+    lookups: HashMap<u64, u64>,
     next_ino: u64,
     handles: HashMap<u64, Handle>,
+    dir_handles: HashMap<u64, Arc<Vec<DirEntry>>>,
     next_fh: u64,
     pending_by_key: HashMap<(Option<String>, String), u64>,
     writers: HashMap<u64, Writer>,
+    cached_content: HashMap<u64, String>,
 }
 
 fn lock_state(state: &Mutex<FsState>) -> MutexGuard<'_, FsState> {
@@ -168,6 +169,101 @@ impl Drop for NetPermit {
     }
 }
 
+type Job = Box<dyn FnOnce() + Send + 'static>;
+
+struct PoolQueue {
+    jobs: Mutex<(VecDeque<Job>, bool)>,
+    ready: Condvar,
+}
+
+struct WorkerPool {
+    queue: Arc<PoolQueue>,
+}
+
+impl WorkerPool {
+    fn new(name: &str, threads: usize) -> Self {
+        let queue = Arc::new(PoolQueue { jobs: Mutex::new((VecDeque::new(), false)), ready: Condvar::new() });
+        for i in 0..threads {
+            let queue = Arc::clone(&queue);
+            thread::Builder::new()
+                .name(format!("{name}-{i}"))
+                .spawn(move || loop {
+                    let job = {
+                        let mut guard = lock_plain(&queue.jobs);
+                        loop {
+                            if let Some(job) = guard.0.pop_front() {
+                                break Some(job);
+                            }
+                            if guard.1 {
+                                break None;
+                            }
+                            guard = queue.ready.wait(guard).unwrap_or_else(|p| p.into_inner());
+                        }
+                    };
+                    match job {
+                        Some(job) => {
+                            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                        }
+                        None => break,
+                    }
+                })
+                .expect("could not start a worker thread");
+        }
+        Self { queue }
+    }
+
+    fn run(&self, job: impl FnOnce() + Send + 'static) {
+        lock_plain(&self.queue.jobs).0.push_back(Box::new(job));
+        self.queue.ready.notify_one();
+    }
+}
+
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        lock_plain(&self.queue.jobs).1 = true;
+        self.queue.ready.notify_all();
+    }
+}
+
+struct BurstPool {
+    name: &'static str,
+    cap: usize,
+    state: Arc<Mutex<(usize, VecDeque<Job>)>>,
+}
+
+impl BurstPool {
+    fn new(name: &'static str, cap: usize) -> Self {
+        Self { name, cap, state: Arc::new(Mutex::new((0, VecDeque::new()))) }
+    }
+
+    fn run(&self, job: impl FnOnce() + Send + 'static) {
+        let job: Job = Box::new(job);
+        let mut st = lock_plain(&self.state);
+        if st.0 >= self.cap {
+            st.1.push_back(job);
+            return;
+        }
+        st.0 += 1;
+        drop(st);
+        let state = Arc::clone(&self.state);
+        let spawned = thread::Builder::new().name(self.name.to_string()).spawn(move || {
+            let mut next = Some(job);
+            while let Some(job) = next {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(job));
+                let mut st = lock_plain(&state);
+                next = st.1.pop_front();
+                if next.is_none() {
+                    st.0 -= 1;
+                }
+            }
+        });
+        if let Err(e) = spawned {
+            error!("[lethean-cli] could not start a worker thread: {e}");
+            lock_plain(&self.state).0 -= 1;
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FsOptions {
     pub scratch_dir: Option<PathBuf>,
@@ -190,6 +286,8 @@ pub struct VaultFs {
     ctx: AttrCtx,
     net_sem: Arc<NetSemaphore>,
     pool: Arc<ScratchPool>,
+    net_workers: BurstPool,
+    io_workers: WorkerPool,
 }
 
 fn guess_mime(name: &str) -> String {
@@ -225,8 +323,8 @@ fn name_str(name: &std::ffi::OsStr) -> Result<&str, c_int> {
 fn dir_id_of_ino(state: &FsState, vault: &Vault, ino: u64) -> Result<Option<String>, c_int> {
     match state.node_of_ino.get(&ino) {
         Some(Node::Root) => Ok(None),
-        Some(Node::Remote(id)) => match vault.get(id) {
-            Some(e) if e.is_folder() => Ok(Some(id.clone())),
+        Some(Node::Remote(id)) => match vault.stat(id) {
+            Some(s) if s.is_folder => Ok(Some(id.clone())),
             Some(_) => Err(ENOTDIR),
             None => Err(ENOENT),
         },
@@ -235,20 +333,48 @@ fn dir_id_of_ino(state: &FsState, vault: &Vault, ino: u64) -> Result<Option<Stri
     }
 }
 
+fn hashed_ino(id: &str, salt: u64) -> u64 {
+    let mut h = DefaultHasher::new();
+    salt.hash(&mut h);
+    id.hash(&mut h);
+    (h.finish() & ((1u64 << 62) - 1)) | (1u64 << 62)
+}
+
 fn ino_for_remote(state: &mut FsState, id: &str) -> u64 {
     if let Some(&ino) = state.ino_of_id.get(id) {
         return ino;
     }
-    let ino = state.next_ino;
-    state.next_ino += 1;
-    state.ino_of_id.insert(id.to_string(), ino);
-    state.node_of_ino.insert(ino, Node::Remote(id.to_string()));
-    ino
+    let mut salt = 0;
+    loop {
+        let ino = hashed_ino(id, salt);
+        match state.node_of_ino.get(&ino) {
+            Some(Node::Remote(other)) if other == id => {}
+            Some(_) => {
+                salt += 1;
+                continue;
+            }
+            None => {
+                state.node_of_ino.insert(ino, Node::Remote(id.to_string()));
+            }
+        }
+        state.ino_of_id.insert(id.to_string(), ino);
+        return ino;
+    }
+}
+
+fn peek_ino(state: &FsState, id: &str) -> u64 {
+    state.ino_of_id.get(id).copied().unwrap_or_else(|| hashed_ino(id, 0))
+}
+
+fn add_lookup(state: &mut FsState, ino: u64) {
+    *state.lookups.entry(ino).or_insert(0) += 1;
 }
 
 fn repoint_ino_to(state: &mut FsState, ino: u64, old_id: Option<&str>, new_id: &str) {
     if let Some(old) = old_id {
-        state.ino_of_id.remove(old);
+        if state.ino_of_id.get(old) == Some(&ino) {
+            state.ino_of_id.remove(old);
+        }
     }
     if let Some(Node::Pending(p)) = state.node_of_ino.get(&ino) {
         let key = (p.parent_id.clone(), p.name.clone());
@@ -293,19 +419,23 @@ fn file_attr(ctx: AttrCtx, ino: u64, size: u64) -> FileAttr {
     make_attr(ctx, ino, FileType::RegularFile, size, 0o644)
 }
 
+fn attr_from_stat(state: &FsState, ctx: AttrCtx, ino: u64, stat: Stat) -> FileAttr {
+    if stat.is_folder {
+        dir_attr(ctx, ino)
+    } else {
+        let live_size = state.writers.get(&ino).map(|w| w.file.len.load(Ordering::Acquire));
+        file_attr(ctx, ino, live_size.unwrap_or(stat.size))
+    }
+}
+
 fn attr_for_known_ino(state: &FsState, vault: &Vault, ctx: AttrCtx, ino: u64) -> Option<FileAttr> {
-    let live_size = state.writers.get(&ino).map(|w| w.file.len.load(Ordering::Acquire));
     match state.node_of_ino.get(&ino)? {
         Node::Root => Some(dir_attr(ctx, ino)),
-        Node::Remote(id) => {
-            let entry = vault.get(id)?;
-            if entry.is_folder() {
-                Some(dir_attr(ctx, ino))
-            } else {
-                Some(file_attr(ctx, ino, live_size.unwrap_or_else(|| entry.size())))
-            }
+        Node::Remote(id) => Some(attr_from_stat(state, ctx, ino, vault.stat(id)?)),
+        Node::Pending(_) => {
+            let live_size = state.writers.get(&ino).map(|w| w.file.len.load(Ordering::Acquire));
+            Some(file_attr(ctx, ino, live_size.unwrap_or(0)))
         }
-        Node::Pending(_) => Some(file_attr(ctx, ino, live_size.unwrap_or(0))),
     }
 }
 
@@ -358,7 +488,7 @@ fn commit_write_file(vault: &Vault, state: &Mutex<FsState>, ino: u64, file: &Arc
         }
         WriteTarget::NewFile { parent_id, name, mime } => vault.create_file_streaming(name, mime, len, parent_id.as_deref(), factory),
         WriteTarget::ExistingFile { id } => {
-            if vault.get(id).is_none() {
+            if vault.stat(id).is_none() {
                 warn!("[lethean-cli] dropping unsaved changes to a file that no longer exists");
                 lock_scratch(&file.scratch).mark_committed(generation);
                 return true;
@@ -401,6 +531,28 @@ fn truncate_remote(vault: &Vault, pool: &Arc<ScratchPool>, id: &str, new_size: u
     })
 }
 
+fn slice_reply(data: &[u8], offset: u64, size: usize) -> &[u8] {
+    let start = (offset as usize).min(data.len());
+    let end = start.saturating_add(size).min(data.len());
+    &data[start..end]
+}
+
+fn build_listing(state: &FsState, vault: &Vault, ino: u64, dir_id: Option<&str>) -> Vec<DirEntry> {
+    let children = vault.list_children(dir_id);
+    let mut entries = Vec::with_capacity(children.len() + 2);
+    entries.push(DirEntry { ino, kind: FileType::Directory, name: ".".to_string() });
+    entries.push(DirEntry { ino: ROOT_INO, kind: FileType::Directory, name: "..".to_string() });
+    for child in children {
+        entries.push(DirEntry { ino: peek_ino(state, &child.id), kind: if child.is_folder { FileType::Directory } else { FileType::RegularFile }, name: child.name });
+    }
+    for ((parent, name), pino) in &state.pending_by_key {
+        if parent.as_deref() == dir_id {
+            entries.push(DirEntry { ino: *pino, kind: FileType::RegularFile, name: name.clone() });
+        }
+    }
+    entries
+}
+
 impl VaultFs {
     pub fn new(vault: Vault) -> Self {
         Self::with_options(vault, FsOptions::default())
@@ -417,15 +569,20 @@ impl VaultFs {
             state: Arc::new(Mutex::new(FsState {
                 ino_of_id: HashMap::new(),
                 node_of_ino,
+                lookups: HashMap::new(),
                 next_ino: 2,
                 handles: HashMap::new(),
+                dir_handles: HashMap::new(),
                 next_fh: 1,
                 pending_by_key: HashMap::new(),
                 writers: HashMap::new(),
+                cached_content: HashMap::new(),
             })),
             ctx: AttrCtx { uid: unsafe { libc::getuid() }, gid: unsafe { libc::getgid() }, mount_time: SystemTime::now() },
             net_sem: Arc::new(NetSemaphore::new(MAX_CONCURRENT_NETWORK_OPS)),
             pool,
+            net_workers: BurstPool::new("lethean-net", NET_WORKERS),
+            io_workers: WorkerPool::new("lethean-io", IO_WORKERS),
         }
     }
 
@@ -461,18 +618,47 @@ impl Filesystem for VaultFs {
 
         if let Some(&ino) = state.pending_by_key.get(&(parent_id.clone(), name.to_string())) {
             if let Some(attr) = attr_for_known_ino(&state, &self.vault, self.ctx, ino) {
+                add_lookup(&mut state, ino);
                 return reply.entry(&TTL, &attr, 0);
             }
         }
 
-        let child_id = match self.vault.find_child_by_name(parent_id.as_deref(), name) {
-            Some(e) => e.record.id,
-            None => return reply.error(ENOENT),
+        let Some(child) = self.vault.find_child(parent_id.as_deref(), name) else {
+            return reply.error(ENOENT);
         };
-        let ino = ino_for_remote(&mut state, &child_id);
-        match attr_for_known_ino(&state, &self.vault, self.ctx, ino) {
-            Some(attr) => reply.entry(&TTL, &attr, 0),
-            None => reply.error(ENOENT),
+        let ino = ino_for_remote(&mut state, &child.record.id);
+        let stat = Stat { is_folder: child.is_folder(), size: child.size(), size_is_exact: child.size_is_exact() };
+        let attr = attr_from_stat(&state, self.ctx, ino, stat);
+        add_lookup(&mut state, ino);
+        reply.entry(&TTL, &attr, 0)
+    }
+
+    fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
+        if ino == ROOT_INO {
+            return;
+        }
+        let mut state = lock_state(&self.state);
+        let remaining = match state.lookups.get_mut(&ino) {
+            Some(n) => {
+                *n = n.saturating_sub(nlookup);
+                *n
+            }
+            None => 0,
+        };
+        if remaining > 0 {
+            return;
+        }
+        state.lookups.remove(&ino);
+        if state.writers.contains_key(&ino) {
+            return;
+        }
+        if let Some(Node::Remote(id)) = state.node_of_ino.get(&ino) {
+            let id = id.clone();
+            state.node_of_ino.remove(&ino);
+            if state.ino_of_id.get(&id) == Some(&ino) {
+                state.ino_of_id.remove(&id);
+            }
+            state.cached_content.remove(&ino);
         }
     }
 
@@ -534,8 +720,8 @@ impl Filesystem for VaultFs {
             };
         };
 
-        match self.vault.get(&id) {
-            Some(e) if e.is_folder() => return reply.error(EISDIR),
+        match self.vault.stat(&id) {
+            Some(s) if s.is_folder => return reply.error(EISDIR),
             Some(_) => {}
             None => return reply.error(ENOENT),
         }
@@ -545,7 +731,7 @@ impl Filesystem for VaultFs {
         let ctx = self.ctx;
         let net_sem = Arc::clone(&self.net_sem);
         let pool = Arc::clone(&self.pool);
-        thread::spawn(move || {
+        self.net_workers.run(move || {
             let _permit = net_sem.acquire();
             let outcome = run_guarded("truncate", move || {
                 let new_entry = truncate_remote(&vault, &pool, &id, new_size).map_err(|e| {
@@ -575,7 +761,7 @@ impl Filesystem for VaultFs {
                 Err(e) => return reply.error(e),
             }
         };
-        if self.vault.find_child_by_name(parent_id.as_deref(), &name).is_some() {
+        if self.vault.find_child(parent_id.as_deref(), &name).is_some() {
             return reply.error(EEXIST);
         }
 
@@ -583,7 +769,7 @@ impl Filesystem for VaultFs {
         let state_arc = Arc::clone(&self.state);
         let ctx = self.ctx;
         let net_sem = Arc::clone(&self.net_sem);
-        thread::spawn(move || {
+        self.net_workers.run(move || {
             let _permit = net_sem.acquire();
             let outcome = run_guarded("mkdir", move || {
                 let entry = vault.create_folder(&name, parent_id.as_deref()).map_err(|e| {
@@ -592,7 +778,9 @@ impl Filesystem for VaultFs {
                 })?;
                 let mut state = lock_state(&state_arc);
                 let ino = ino_for_remote(&mut state, &entry.record.id);
-                attr_for_known_ino(&state, &vault, ctx, ino).ok_or(EIO)
+                let attr = attr_for_known_ino(&state, &vault, ctx, ino).ok_or(EIO)?;
+                add_lookup(&mut state, ino);
+                Ok(attr)
             });
             match outcome {
                 Ok(attr) => reply.entry(&TTL, &attr, 0),
@@ -625,7 +813,7 @@ impl Filesystem for VaultFs {
             }
         }
 
-        let entry = match self.vault.find_child_by_name(parent_id.as_deref(), name) {
+        let entry = match self.vault.find_child(parent_id.as_deref(), name) {
             Some(e) => e,
             None => return reply.error(ENOENT),
         };
@@ -635,9 +823,9 @@ impl Filesystem for VaultFs {
 
         let vault = Arc::clone(&self.vault);
         let state_arc = Arc::clone(&self.state);
-        let id = entry.record.id;
+        let id = entry.record.id.clone();
         let net_sem = Arc::clone(&self.net_sem);
-        thread::spawn(move || {
+        self.net_workers.run(move || {
             let _permit = net_sem.acquire();
             let outcome = run_guarded("unlink", move || {
                 vault.delete_one(&id).map_err(|e| {
@@ -646,6 +834,7 @@ impl Filesystem for VaultFs {
                 })?;
                 let mut state = lock_state(&state_arc);
                 if let Some(ino) = state.ino_of_id.remove(&id) {
+                    state.cached_content.remove(&ino);
                     if let Some(w) = state.writers.get(&ino) {
                         *lock_plain(&w.file.target) = WriteTarget::Discarded;
                     }
@@ -671,7 +860,7 @@ impl Filesystem for VaultFs {
                 Err(e) => return reply.error(e),
             }
         };
-        let entry = match self.vault.find_child_by_name(parent_id.as_deref(), name) {
+        let entry = match self.vault.find_child(parent_id.as_deref(), name) {
             Some(e) => e,
             None => return reply.error(ENOENT),
         };
@@ -688,9 +877,9 @@ impl Filesystem for VaultFs {
 
         let vault = Arc::clone(&self.vault);
         let state_arc = Arc::clone(&self.state);
-        let id = entry.record.id;
+        let id = entry.record.id.clone();
         let net_sem = Arc::clone(&self.net_sem);
-        thread::spawn(move || {
+        self.net_workers.run(move || {
             let _permit = net_sem.acquire();
             let outcome = run_guarded("rmdir", move || {
                 vault.delete_one(&id).map_err(|e| {
@@ -728,20 +917,20 @@ impl Filesystem for VaultFs {
             };
             (p, np)
         };
-        let entry = match self.vault.find_child_by_name(parent_id.as_deref(), &name) {
+        let entry = match self.vault.find_child(parent_id.as_deref(), &name) {
             Some(e) => e,
             None => return reply.error(ENOENT),
         };
-        let existing_id_to_replace = self.vault.find_child_by_name(new_parent_id.as_deref(), &newname).map(|e| e.record.id).filter(|id| *id != entry.record.id);
+        let existing_id_to_replace = self.vault.find_child(new_parent_id.as_deref(), &newname).map(|e| e.record.id.clone()).filter(|id| *id != entry.record.id);
 
         let name_changed = if name == newname { None } else { Some(newname) };
         let parent_changed = if parent_id == new_parent_id { None } else { Some(new_parent_id) };
 
         let vault = Arc::clone(&self.vault);
         let state_arc = Arc::clone(&self.state);
-        let entry_id = entry.record.id;
+        let entry_id = entry.record.id.clone();
         let net_sem = Arc::clone(&self.net_sem);
-        thread::spawn(move || {
+        self.net_workers.run(move || {
             let _permit = net_sem.acquire();
             let outcome = run_guarded("rename", move || {
                 if let Some(existing_id) = &existing_id_to_replace {
@@ -792,20 +981,30 @@ impl Filesystem for VaultFs {
                 reply.opened(fh, 0);
             }
             Node::Remote(id) => {
-                let entry = match self.vault.get(&id) {
-                    Some(e) => e,
+                let stat = match self.vault.stat(&id) {
+                    Some(s) => s,
                     None => return reply.error(ENOENT),
                 };
-                if entry.is_folder() {
+                if stat.is_folder {
                     return reply.error(EISDIR);
                 }
 
                 if accmode == libc::O_RDONLY {
                     let mut state = lock_state(&self.state);
+                    let open_flags = if !stat.size_is_exact {
+                        FOPEN_DIRECT_IO
+                    } else if state.writers.contains_key(&ino) {
+                        0
+                    } else if state.cached_content.get(&ino) == Some(&id) {
+                        FOPEN_KEEP_CACHE
+                    } else {
+                        state.cached_content.insert(ino, id.clone());
+                        0
+                    };
                     let fh = alloc_fh(&mut state);
                     state.handles.insert(fh, Handle::Read { id, pinned: None });
                     drop(state);
-                    return reply.opened(fh, 0);
+                    return reply.opened(fh, open_flags);
                 }
 
                 {
@@ -839,12 +1038,13 @@ impl Filesystem for VaultFs {
                 let state_arc = Arc::clone(&self.state);
                 let net_sem = Arc::clone(&self.net_sem);
                 let pool = Arc::clone(&self.pool);
-                thread::spawn(move || {
+                self.net_workers.run(move || {
                     let _permit = net_sem.acquire();
                     let outcome = run_guarded("open", move || {
                         let mut scratch = pool.new_scratch();
                         vault.stream_plaintext(&id, &mut ScratchWriter::new(&mut scratch)).map_err(|e| {
-                            error!("[lethean-cli] could not load \"{}\" for writing: {e:#}", entry.name());
+                            let name = vault.entry(&id).map(|e| e.name().to_string()).unwrap_or_default();
+                            error!("[lethean-cli] could not load \"{name}\" for writing: {e:#}");
                             errno_of(&e)
                         })?;
                         scratch.mark_committed(scratch.generation());
@@ -903,13 +1103,10 @@ impl Filesystem for VaultFs {
                     }
                 }
             }
-            Plan::Remote { pinned: Some(Pinned::Mem(data)), .. } => {
-                let start = (offset as usize).min(data.len());
-                let end = start.saturating_add(size).min(data.len());
-                reply.data(&data[start..end]);
-            }
+            Plan::Remote { pinned: Some(Pinned::Mem(data)), .. } => reply.data(slice_reply(&data, offset, size)),
             Plan::Remote { pinned: Some(Pinned::Large(file)), .. } => {
-                thread::spawn(move || match file.read_at(offset, size) {
+                let vault = Arc::clone(&self.vault);
+                self.io_workers.run(move || match vault.read_large(&file, offset, size) {
                     Ok(bytes) => reply.data(&bytes),
                     Err(e) => {
                         error!("[lethean-cli] read failed: {e}");
@@ -918,10 +1115,17 @@ impl Filesystem for VaultFs {
                 });
             }
             Plan::Remote { id, pinned: None } => {
+                if let Some(data) = self.vault.cached_small(&id) {
+                    reply.data(slice_reply(&data, offset, size));
+                    if let Some(Handle::Read { pinned: slot @ None, .. }) = lock_state(&self.state).handles.get_mut(&fh) {
+                        *slot = Some(Pinned::Mem(data));
+                    }
+                    return;
+                }
                 let vault = Arc::clone(&self.vault);
                 let state_arc = Arc::clone(&self.state);
                 let net_sem = Arc::clone(&self.net_sem);
-                thread::spawn(move || {
+                self.net_workers.run(move || {
                     if let Some(bytes) = vault.try_read_cached(&id, offset, size) {
                         return reply.data(&bytes);
                     }
@@ -939,7 +1143,13 @@ impl Filesystem for VaultFs {
                                 errno_of(&e)
                             })?)
                         };
-                        let bytes = pinned.read(offset, size).map_err(|e| errno_of_io(&e))?;
+                        let bytes = match &pinned {
+                            Pinned::Mem(data) => slice_reply(data, offset, size).to_vec(),
+                            Pinned::Large(f) => vault.read_large(f, offset, size).map_err(|e| {
+                                error!("[lethean-cli] read failed: {e}");
+                                errno_of_io(&e)
+                            })?,
+                        };
                         if let Some(Handle::Read { pinned: slot, .. }) = lock_state(&state_arc).handles.get_mut(&fh) {
                             *slot = Some(pinned);
                         }
@@ -989,7 +1199,7 @@ impl Filesystem for VaultFs {
         let vault = Arc::clone(&self.vault);
         let state_arc = Arc::clone(&self.state);
         let net_sem = Arc::clone(&self.net_sem);
-        thread::spawn(move || {
+        self.net_workers.run(move || {
             let _permit = net_sem.acquire();
             match run_guarded("flush", move || Ok::<bool, c_int>(commit_write_session(&vault, &state_arc, fh))) {
                 Ok(true) => reply.ok(),
@@ -1009,7 +1219,7 @@ impl Filesystem for VaultFs {
         let vault = Arc::clone(&self.vault);
         let state_arc = Arc::clone(&self.state);
         let net_sem = Arc::clone(&self.net_sem);
-        thread::spawn(move || {
+        self.net_workers.run(move || {
             let _permit = net_sem.acquire();
             let state_for_cleanup = Arc::clone(&state_arc);
             match run_guarded("release", move || Ok::<bool, c_int>(commit_write_session(&vault, &state_arc, fh))) {
@@ -1050,7 +1260,7 @@ impl Filesystem for VaultFs {
         };
         let already_pending = state.pending_by_key.contains_key(&(parent_id.clone(), name.to_string()));
         drop(state);
-        if already_pending || self.vault.find_child_by_name(parent_id.as_deref(), name).is_some() {
+        if already_pending || self.vault.find_child(parent_id.as_deref(), name).is_some() {
             return reply.error(EEXIST);
         }
 
@@ -1069,6 +1279,9 @@ impl Filesystem for VaultFs {
         state.handles.insert(fh, Handle::Write { ino });
 
         let attr = attr_for_known_ino(&state, &self.vault, self.ctx, ino);
+        if attr.is_some() {
+            add_lookup(&mut state, ino);
+        }
         drop(state);
         let _ = flags;
         match attr {
@@ -1078,39 +1291,42 @@ impl Filesystem for VaultFs {
     }
 
     fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        let state = lock_state(&self.state);
+        let mut state = lock_state(&self.state);
         match dir_id_of_ino(&state, &self.vault, ino) {
-            Ok(_) => reply.opened(0, 0),
+            Ok(_) => {
+                let fh = alloc_fh(&mut state);
+                reply.opened(fh, 0)
+            }
             Err(e) => reply.error(e),
         }
     }
 
-    fn readdir(&mut self, _req: &Request<'_>, ino: u64, _fh: u64, offset: i64, mut reply: ReplyDirectory) {
+    fn readdir(&mut self, _req: &Request<'_>, ino: u64, fh: u64, offset: i64, mut reply: ReplyDirectory) {
         let mut state = lock_state(&self.state);
-        let dir_id = match dir_id_of_ino(&state, &self.vault, ino) {
-            Ok(p) => p,
-            Err(e) => return reply.error(e),
-        };
-
-        let mut entries: Vec<(u64, FileType, String)> = vec![(ino, FileType::Directory, ".".to_string())];
-        entries.push((ROOT_INO, FileType::Directory, "..".to_string()));
-
-        for child in self.vault.list_children(dir_id.as_deref()) {
-            let child_ino = ino_for_remote(&mut state, &child.id);
-            entries.push((child_ino, if child.is_folder { FileType::Directory } else { FileType::RegularFile }, child.name));
-        }
-        for ((parent, name), pino) in &state.pending_by_key {
-            if *parent == dir_id {
-                entries.push((*pino, FileType::RegularFile, name.clone()));
+        let listing = match (offset, state.dir_handles.get(&fh)) {
+            (o, Some(l)) if o > 0 => Arc::clone(l),
+            _ => {
+                let dir_id = match dir_id_of_ino(&state, &self.vault, ino) {
+                    Ok(p) => p,
+                    Err(e) => return reply.error(e),
+                };
+                let listing = Arc::new(build_listing(&state, &self.vault, ino, dir_id.as_deref()));
+                state.dir_handles.insert(fh, Arc::clone(&listing));
+                listing
             }
-        }
+        };
         drop(state);
 
-        for (i, (entry_ino, kind, name)) in entries.into_iter().enumerate().skip(offset as usize) {
-            if reply.add(entry_ino, (i + 1) as i64, kind, &name) {
+        for (i, entry) in listing.iter().enumerate().skip(offset.max(0) as usize) {
+            if reply.add(entry.ino, (i + 1) as i64, entry.kind, &entry.name) {
                 break;
             }
         }
+        reply.ok();
+    }
+
+    fn releasedir(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _flags: i32, reply: ReplyEmpty) {
+        lock_state(&self.state).dir_handles.remove(&fh);
         reply.ok();
     }
 
@@ -1189,6 +1405,74 @@ mod tests {
         .expect("the outer worker thread must not panic");
 
         assert_eq!(*sem.available.lock().unwrap(), 2, "permit must be returned even after a panic inside the guarded work");
+    }
+
+    #[test]
+    fn burst_pool_runs_every_job_with_bounded_threads_and_survives_panics() {
+        use std::sync::atomic::AtomicUsize;
+        let pool = BurstPool::new("test-burst", 4);
+        let running = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
+        for i in 0..200 {
+            let (running, peak, done) = (Arc::clone(&running), Arc::clone(&peak), Arc::clone(&done));
+            pool.run(move || {
+                let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(now, Ordering::SeqCst);
+                thread::sleep(Duration::from_millis(1));
+                running.fetch_sub(1, Ordering::SeqCst);
+                done.fetch_add(1, Ordering::SeqCst);
+                if i % 50 == 0 {
+                    panic!("simulated bug in a job");
+                }
+            });
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while done.load(Ordering::SeqCst) < 200 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(done.load(Ordering::SeqCst), 200, "every queued job must run, even after panics");
+        assert!(peak.load(Ordering::SeqCst) <= 4, "at most `cap` jobs at once, saw {}", peak.load(Ordering::SeqCst));
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(lock_plain(&pool.state).0, 0, "threads exit once the queue is empty");
+    }
+
+    #[test]
+    fn worker_pool_runs_jobs_and_survives_panics() {
+        use std::sync::atomic::AtomicUsize;
+        let pool = WorkerPool::new("test-pool", 2);
+        let done = Arc::new(AtomicUsize::new(0));
+        for i in 0..100 {
+            let done = Arc::clone(&done);
+            pool.run(move || {
+                done.fetch_add(1, Ordering::SeqCst);
+                if i % 10 == 0 {
+                    panic!("simulated bug in a job");
+                }
+            });
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while done.load(Ordering::SeqCst) < 100 && std::time::Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(done.load(Ordering::SeqCst), 100);
+    }
+
+    #[test]
+    fn inode_numbers_are_stable_per_id_and_never_collide_with_counters_or_each_other() {
+        let mut node_of_ino = HashMap::new();
+        node_of_ino.insert(ROOT_INO, Node::Root);
+        let mut st = FsState { ino_of_id: HashMap::new(), node_of_ino, lookups: HashMap::new(), next_ino: 2, handles: HashMap::new(), dir_handles: HashMap::new(), next_fh: 1, pending_by_key: HashMap::new(), writers: HashMap::new(), cached_content: HashMap::new() };
+        let a = ino_for_remote(&mut st, "file-a");
+        assert_eq!(peek_ino(&st, "file-b"), hashed_ino("file-b", 0), "listings report the same number lookup will assign");
+        let b = ino_for_remote(&mut st, "file-b");
+        assert_ne!(a, b);
+        assert!(a >= 1 << 62 && b >= 1 << 62, "hashed inodes live above the counter range");
+        assert_eq!(ino_for_remote(&mut st, "file-a"), a);
+        st.ino_of_id.remove("file-b");
+        st.node_of_ino.insert(b, Node::Remote("someone-else".into()));
+        let b2 = ino_for_remote(&mut st, "file-b");
+        assert_ne!(b2, b, "a taken number is never handed out twice");
     }
 
     #[test]

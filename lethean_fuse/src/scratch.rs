@@ -341,6 +341,12 @@ impl Scratch {
             let within = (pos % BLOCK as u64) as usize;
             let n = (BLOCK - within).min(src.len());
             let full = within == 0 && n == BLOCK;
+            if full && !self.cache.contains_key(&idx) && self.cache.len() >= MAX_CACHED_BLOCKS {
+                self.write_slot(idx, &src[..BLOCK])?;
+                pos += n as u64;
+                src = &src[n..];
+                continue;
+            }
             let blk = self.cached_block_mut(idx, !full)?;
             blk.data[within..within + n].copy_from_slice(&src[..n]);
             blk.dirty = true;
@@ -548,6 +554,31 @@ mod tests {
         assert_eq!(read_all(&mut s), model);
         drop(s);
         assert_eq!(pool.used_bytes(), 0, "dropping a scratch must give its reservation back");
+    }
+
+    #[test]
+    fn full_block_writes_past_the_ram_share_go_straight_to_disk_and_stay_correct() {
+        let pool = ScratchPool::new(1 << 30, tmp_dir("direct"));
+        let mut s = pool.new_scratch();
+        let mut rng = StdRng::seed_from_u64(42);
+        let blocks = MAX_CACHED_BLOCKS + 40;
+        let mut model: Vec<u8> = (0..blocks * BLOCK).map(|_| rng.gen()).collect();
+        ScratchWriter::new(&mut s).write_all(&model).unwrap();
+        assert!(s.cache.len() <= MAX_CACHED_BLOCKS);
+        assert_eq!(read_all(&mut s), model);
+        for _ in 0..300 {
+            let off = rng.gen_range(0..model.len() - 3 * BLOCK);
+            let n = if rng.gen_bool(0.5) { BLOCK } else { rng.gen_range(1..3 * BLOCK) };
+            let off = if n == BLOCK { off / BLOCK * BLOCK } else { off };
+            let data: Vec<u8> = (0..n).map(|_| rng.gen()).collect();
+            s.write_at(off as u64, &data).unwrap();
+            model[off..off + n].copy_from_slice(&data);
+        }
+        assert_eq!(read_all(&mut s), model);
+        s.set_len((10 * BLOCK + 7) as u64).unwrap();
+        s.set_len((blocks * BLOCK) as u64).unwrap();
+        model[10 * BLOCK + 7..].fill(0);
+        assert_eq!(read_all(&mut s), model);
     }
 
     #[test]

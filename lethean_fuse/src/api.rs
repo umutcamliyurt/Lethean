@@ -1,5 +1,6 @@
 
 use std::io::{self, Cursor, Read, Write as _};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::RwLock;
 use std::time::Duration;
 
@@ -18,6 +19,18 @@ pub struct ApiClient {
     quick_agent: ureq::Agent,
     vault_id: RwLock<Option<String>>,
     access_token: RwLock<Option<String>>,
+    range_support: AtomicU8,
+}
+
+const RANGE_UNKNOWN: u8 = 0;
+const RANGE_YES: u8 = 1;
+const RANGE_NO: u8 = 2;
+
+fn parse_content_range(v: &str) -> Option<(u64, u64, u64)> {
+    let rest = v.trim().strip_prefix("bytes")?.trim_start();
+    let (span, total) = rest.split_once('/')?;
+    let (a, b) = span.split_once('-')?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?, total.trim().parse().ok()?))
 }
 
 #[derive(Deserialize)]
@@ -210,7 +223,47 @@ impl ApiClient {
             quick_agent: ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(4)).timeout(Duration::from_secs(6)).build(),
             vault_id: RwLock::new(None),
             access_token: RwLock::new(None),
+            range_support: AtomicU8::new(RANGE_UNKNOWN),
         })
+    }
+
+    pub fn supports_ranges(&self, probe_file_id: &str) -> Result<bool> {
+        match self.range_support.load(Ordering::Acquire) {
+            RANGE_YES => return Ok(true),
+            RANGE_NO => return Ok(false),
+            _ => {}
+        }
+        assert_safe_id(probe_file_id)?;
+        let supported = retry::run("Download failed", || {
+            let req = self.with_auth(self.agent.get(&self.url(&format!("/files/{probe_file_id}/blob"))), None).set("Range", "bytes=0-0");
+            let resp = req.call().map_err(AttemptError::from)?;
+            Ok(resp.status() == 206 && resp.header("Content-Range").and_then(parse_content_range).is_some())
+        })?;
+        self.range_support.store(if supported { RANGE_YES } else { RANGE_NO }, Ordering::Release);
+        Ok(supported)
+    }
+
+    pub fn open_blob_range(&self, file_id: &str, start: u64, end: u64) -> Result<(Box<dyn Read + Send + Sync + 'static>, u64)> {
+        assert_safe_id(file_id)?;
+        if end < start {
+            bail!("invalid byte range {start}-{end}");
+        }
+        let range = format!("bytes={start}-{end}");
+        let (resp, total) = retry::run("Download failed", || {
+            let req = self.with_auth(self.stream_agent.get(&self.url(&format!("/files/{file_id}/blob"))), None).set("Range", &range);
+            let resp = req.call().map_err(AttemptError::from)?;
+            let parsed = resp.header("Content-Range").and_then(parse_content_range);
+            Ok((resp, parsed))
+        })?;
+        if resp.status() != 206 {
+            self.range_support.store(RANGE_NO, Ordering::Release);
+            bail!("Download failed: the server ignored the byte-range request");
+        }
+        match total {
+            Some((a, b, total)) if a == start && b == end => Ok((Box::new(resp.into_reader().take(end - start + 1)), total)),
+            Some((a, b, total)) => bail!("Download failed: asked for bytes {start}-{end}, server sent {a}-{b}/{total}"),
+            None => bail!("Download failed: partial response without a valid Content-Range"),
+        }
     }
 
     pub fn set_vault_id(&self, id: Option<String>) {

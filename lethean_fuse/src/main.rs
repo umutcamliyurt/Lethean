@@ -166,7 +166,7 @@ fn unlock_session(cli: &Cli, config: &Config) -> Result<Vault> {
     let vault = Vault::new(api, unlocked.wrapping_key_raw);
     eprintln!("Fetching file index…");
     vault.refresh_all().context("could not list vault files (wrong password/access token, or server unreachable?)")?;
-    eprintln!("Loaded {} item(s).", vault.all_entries().len());
+    eprintln!("Loaded {} item(s).", vault.entry_count());
     if duress::reconcile(&vault.api, &vault_id, access_token.as_deref(), &ConfigDuressCache) {
         eprintln!("Note: duress codes now sync across your devices. A code set only on this device before the update still works here; run `lethean-fuse duress set` to make one code work everywhere.");
     }
