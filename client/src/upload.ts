@@ -1,7 +1,7 @@
 import * as api from './api.js';
 import { encryptPool } from './encrypt-pool.js';
 import { depositSlot, chooseFilesBtn, newFolderBtn, fileInput, uploadQueue } from './dom.js';
-import { prepareChunkedFile, CHUNK_SIZE } from './crypto-encrypt-core.js';
+import { prepareChunkedFile, paddedSize, CHUNK_SIZE, GCM_TAG_BYTES } from './crypto-encrypt-core.js';
 import { getWrappingKeyRaw } from './state.js';
 import { icon, showToast } from './utils.js';
 import type { ChunkedFilePayload, EncryptedFilePayload } from './types.js';
@@ -155,7 +155,59 @@ async function waitWithCountdown(
   }
 }
 
+const UPLOAD_MEMORY_BUDGET_BYTES = 256 * 1024 * 1024;
+let uploadMemoryInUse = 0;
+const uploadMemoryWaiters: Array<() => void> = [];
+
+interface MemoryReservation {
+  shrinkTo(bytes: number): void;
+  release(): void;
+}
+
+async function reserveUploadMemory(bytes: number): Promise<MemoryReservation> {
+  let held = Math.min(bytes, UPLOAD_MEMORY_BUDGET_BYTES);
+  while (uploadMemoryInUse > 0 && uploadMemoryInUse + held > UPLOAD_MEMORY_BUDGET_BYTES) {
+    await new Promise<void>((resolve) => uploadMemoryWaiters.push(resolve));
+  }
+  uploadMemoryInUse += held;
+  const wake = () => { for (const w of uploadMemoryWaiters.splice(0)) w(); };
+  return {
+    shrinkTo(next: number) {
+      next = Math.min(next, held);
+      uploadMemoryInUse -= held - next;
+      held = next;
+      wake();
+    },
+    release() {
+      uploadMemoryInUse -= held;
+      held = 0;
+      wake();
+    },
+  };
+}
+
+function isChunkedUpload(file: File): boolean {
+  return file.size > CHUNK_SIZE;
+}
+
+function encryptWorkingSet(file: File): number {
+  return isChunkedUpload(file) ? 2 * (CHUNK_SIZE + GCM_TAG_BYTES) : 2 * paddedSize(file.size);
+}
+
+function uploadWorkingSet(file: File): number {
+  return isChunkedUpload(file) ? 2 * (CHUNK_SIZE + GCM_TAG_BYTES) : paddedSize(file.size);
+}
+
 async function uploadOne(file: File, rowItem: UploadRowItem): Promise<void> {
+  const reservation = await reserveUploadMemory(encryptWorkingSet(file));
+  try {
+    await uploadOneWithinBudget(file, rowItem, reservation);
+  } finally {
+    reservation.release();
+  }
+}
+
+async function uploadOneWithinBudget(file: File, rowItem: UploadRowItem, reservation: MemoryReservation): Promise<void> {
   const row = rowItem.el;
   const statusEl = row.querySelector('.status') as HTMLElement;
   const barEl = row.querySelector('.bar-fill') as HTMLElement;
@@ -185,9 +237,10 @@ async function uploadOne(file: File, rowItem: UploadRowItem): Promise<void> {
 
   statusEl.textContent = 'Encrypting\u2026';
   try {
-    encrypted = file.size > CHUNK_SIZE
+    encrypted = isChunkedUpload(file)
       ? await prepareChunkedFile(getWrappingKeyRaw()!, file, getCurrentFolderId())
       : await encryptPool.encryptFile(getWrappingKeyRaw()!, file, getCurrentFolderId());
+    reservation.shrinkTo(uploadWorkingSet(file));
   } catch (err) {
     row.classList.add('error');
     statusEl.textContent = 'Failed';

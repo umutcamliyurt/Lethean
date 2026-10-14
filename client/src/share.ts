@@ -1,5 +1,6 @@
 import * as api from './api.js';
 import { lightbox } from './dom.js';
+import { closeLightbox, releaseLightboxPreview } from './lightbox.js';
 import { fileKeyCache, metaCache } from './state.js';
 import { toBase64 } from './crypto-encrypt-core.js';
 import { icon, escapeHtml, showToast } from './utils.js';
@@ -38,6 +39,7 @@ function detachShareModalViewportSync(): void {
 }
 
 function openShareModal(innerHtml: string): void {
+  releaseLightboxPreview();
   lightbox.innerHTML = `
     <button class="btn-icon lightbox-close" id="share-modal-close" aria-label="Close">${icon('close')}</button>
     <div id="${SHARE_MODAL_SCROLL_ID}" class="share-modal-scroll">
@@ -55,9 +57,8 @@ function openShareModal(innerHtml: string): void {
 
 function closeShareModal(): void {
   detachShareModalViewportSync();
-  lightbox.classList.add('hidden');
-  lightbox.innerHTML = '';
   lightbox.removeEventListener('click', onBackdropClick);
+  closeLightbox();
 }
 
 function shareBase(): string {

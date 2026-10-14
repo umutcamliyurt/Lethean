@@ -235,7 +235,7 @@ async function moveOneRecord(oldId: string, newParentId: string | null): Promise
   };
   const newRecord = await api.uploadFile(
     ciphertextBlob.size <= api.SINGLE_UPLOAD_MAX_BYTES
-      ? { ...fields, ciphertext: new Uint8Array(await ciphertextBlob.arrayBuffer()) }
+      ? { ...fields, ciphertext: ciphertextBlob }
       : api.ciphertextBlobAsParts(fields, ciphertextBlob)
   );
 
@@ -397,20 +397,30 @@ function scheduleUsageRefresh(): void {
   }, USAGE_REFRESH_DEBOUNCE_MS);
 }
 
-function appendRecordIfVisible(record: FileRecord): void {
-  if (parentIdOf(record.id) !== currentFolderId) return;
+function isVisibleInCurrentView(record: FileRecord): boolean {
+  if (parentIdOf(record.id) !== currentFolderId) return false;
   if (searchQuery) {
     const name = (metaCache.get(record.id)?.name || '').toLowerCase();
-    if (!name.includes(searchQuery.toLowerCase())) return;
+    if (!name.includes(searchQuery.toLowerCase())) return false;
   }
+  return true;
+}
 
+function appendVisibleRecords(toAppend: FileRecord[]): void {
   const shown = visibleRecords();
   updateEmptyState(shown, !!searchQuery);
   updateGridLabel(shown, !!searchQuery);
 
   const target = viewMode === 'list' ? fileListBody : boxGrid;
   const render = viewMode === 'list' ? renderListRow : renderTile;
-  target.appendChild(render(record));
+  const fragment = document.createDocumentFragment();
+  for (const record of toAppend) fragment.appendChild(render(record));
+  target.appendChild(fragment);
+}
+
+function appendRecordIfVisible(record: FileRecord): void {
+  if (!isVisibleInCurrentView(record)) return;
+  appendVisibleRecords([record]);
 }
 
 function updateUsagePill(usage: UsageResponse): void {
@@ -450,8 +460,14 @@ async function loadNextPage(): Promise<void> {
       }
     }));
 
+    const isFirstPage = records.length === 0;
     records = records.concat(fresh);
-    renderCurrentView();
+    const freshVisible = fresh.filter((r) => isVisibleInCurrentView(r));
+    if (isFirstPage || freshVisible.some((r) => metaCache.get(r.id)?.isFolder)) {
+      renderCurrentView();
+    } else if (freshVisible.length) {
+      appendVisibleRecords(freshVisible);
+    }
   } catch (err) {
     showToast((err as Error).message, 'error');
     hasMorePages = false;
@@ -875,23 +891,28 @@ function openItemContextMenu(e: MouseEvent, record: FileRecord, anchor: HTMLElem
   if (e.detail === 0 || (e.clientX === 0 && e.clientY === 0)) menu.querySelector<HTMLButtonElement>('button')?.focus();
 }
 
-export async function getDecryptedBytes(record: FileRecord): Promise<Uint8Array> {
+export async function getDecryptedBytes(record: FileRecord, signal?: AbortSignal): Promise<Uint8Array> {
   const fileKeyRaw = fileKeyCache.get(record.id)!;
-  const ciphertext = await api.downloadContent(record.id);
+  const ciphertext = await api.downloadContent(record.id, undefined, signal);
+  signal?.throwIfAborted();
   const meta = metaCache.get(record.id)!;
   return C.decryptContent(fileKeyRaw, record.content_iv, ciphertext, meta.compressed, meta.unpaddedSize ?? null, meta.chunkSize ?? null);
 }
 
-export async function getDecryptedBlob(record: FileRecord): Promise<Blob> {
+export async function getDecryptedBlob(record: FileRecord, signal?: AbortSignal): Promise<Blob> {
   const fileKeyRaw = fileKeyCache.get(record.id)!;
   const meta = metaCache.get(record.id)!;
-  const { stream } = await api.openDownloadStream(record.id);
+  const { stream } = await api.openDownloadStream(record.id, undefined, signal);
   return C.streamToBlob(C.decryptToStream(fileKeyRaw, record.content_iv, stream, meta), meta.mime);
 }
 
-export async function getDecryptedUrl(record: FileRecord): Promise<string> {
-  if (objectUrlCache.has(record.id)) return objectUrlCache.get(record.id)!;
-  const blob = await getDecryptedBlob(record);
+export async function getDecryptedUrl(record: FileRecord, signal?: AbortSignal): Promise<string> {
+  const cached = objectUrlCache.get(record.id);
+  if (cached) return cached;
+  const blob = await getDecryptedBlob(record, signal);
+  signal?.throwIfAborted();
+  const existing = objectUrlCache.get(record.id);
+  if (existing) return existing;
   const url = URL.createObjectURL(blob);
   objectUrlCache.set(record.id, url);
   return url;

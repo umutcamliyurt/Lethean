@@ -91,6 +91,7 @@ function sendXhr(o: XhrOptions): Promise<XMLHttpRequest> {
 
     let stalled = false;
     let watchdog: ReturnType<typeof setTimeout>;
+    const { signal, onProgress } = o;
 
     const armWatchdog = (timeoutMs: number) => {
       clearTimeout(watchdog);
@@ -99,12 +100,20 @@ function sendXhr(o: XhrOptions): Promise<XMLHttpRequest> {
         xhr.abort();
       }, timeoutMs);
     };
-    const clearWatchdog = () => clearTimeout(watchdog);
+    const onAbortSignal = () => xhr.abort();
+    const cleanup = () => {
+      clearTimeout(watchdog);
+      signal?.removeEventListener('abort', onAbortSignal);
+      xhr.upload.onprogress = null;
+      xhr.onload = null;
+      xhr.onabort = null;
+      xhr.onerror = null;
+    };
 
     armWatchdog(STALL_TIMEOUT_MS);
 
     xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable && o.onProgress) o.onProgress(e.loaded / e.total);
+      if (e.lengthComputable && onProgress) onProgress(e.loaded / e.total);
       if (e.lengthComputable && e.loaded >= e.total) {
         armWatchdog(RESPONSE_WAIT_TIMEOUT_MS);
       } else {
@@ -113,7 +122,7 @@ function sendXhr(o: XhrOptions): Promise<XMLHttpRequest> {
     };
 
     xhr.onload = () => {
-      clearWatchdog();
+      cleanup();
       if (xhr.status >= 200 && xhr.status < 300) { resolve(xhr); return; }
       let detail: string = xhr.statusText;
       try {
@@ -128,7 +137,7 @@ function sendXhr(o: XhrOptions): Promise<XMLHttpRequest> {
     };
 
     xhr.onabort = () => {
-      clearWatchdog();
+      cleanup();
       if (stalled) {
         reject(new Error('Upload stalled (no progress) \u2014 will retry'));
       } else {
@@ -136,13 +145,13 @@ function sendXhr(o: XhrOptions): Promise<XMLHttpRequest> {
       }
     };
 
-    if (o.signal) {
-      if (o.signal.aborted) { clearWatchdog(); reject(new DOMException('Upload cancelled', 'AbortError')); return; }
-      o.signal.addEventListener('abort', () => xhr.abort());
+    if (signal) {
+      if (signal.aborted) { cleanup(); reject(new DOMException('Upload cancelled', 'AbortError')); return; }
+      signal.addEventListener('abort', onAbortSignal, { once: true });
     }
 
     xhr.onerror = () => {
-      clearWatchdog();
+      cleanup();
       reject(new Error('network error'));
     };
 
@@ -162,14 +171,14 @@ export async function uploadFile(
 ): Promise<FileRecord> {
   const common = { signal, vaultIdOverride, accessTokenOverride };
 
-  if ('ciphertext' in encrypted && encrypted.ciphertext.length <= SINGLE_REQUEST_MAX_BYTES) {
+  if ('ciphertext' in encrypted && byteLength(encrypted.ciphertext) <= SINGLE_REQUEST_MAX_BYTES) {
     const form = new FormData();
     form.append('content_iv', encrypted.contentIv);
     form.append('encrypted_metadata', encrypted.encryptedMetadata);
     form.append('metadata_iv', encrypted.metadataIv);
     form.append('wrapped_file_key', encrypted.wrappedFileKey);
     form.append('wrap_iv', encrypted.wrapIv);
-    form.append('blob', new Blob([encrypted.ciphertext as BlobPart]));
+    form.append('blob', asBlob(encrypted.ciphertext));
     const xhr = await sendXhr({ method: 'POST', url: `${BASE_URL}/files`, body: form, onProgress, ...common });
     return JSON.parse(xhr.responseText) as FileRecord;
   }
@@ -253,18 +262,24 @@ async function uploadSingleRequest(
   return JSON.parse(xhr.responseText) as FileRecord;
 }
 
+function byteLength(data: Uint8Array | Blob): number {
+  return data instanceof Blob ? data.size : data.length;
+}
+
+function asBlob(data: Uint8Array | Blob): Blob {
+  return data instanceof Blob ? data : new Blob([data as BlobPart]);
+}
+
 function wrapCiphertextAsParts(e: EncryptedFilePayload): ChunkedFilePayload {
-  const partCount = Math.max(1, Math.ceil(e.ciphertext.length / MULTIPART_PART_BYTES));
+  const { ciphertext, ...fields } = e;
+  if (ciphertext instanceof Blob) return ciphertextBlobAsParts(fields, ciphertext);
+  const partCount = Math.max(1, Math.ceil(ciphertext.length / MULTIPART_PART_BYTES));
   return {
-    contentIv: e.contentIv,
-    encryptedMetadata: e.encryptedMetadata,
-    metadataIv: e.metadataIv,
-    wrappedFileKey: e.wrappedFileKey,
-    wrapIv: e.wrapIv,
+    ...fields,
     partCount,
     partSize: MULTIPART_PART_BYTES,
-    totalSize: e.ciphertext.length,
-    readPart: async (i) => e.ciphertext.subarray(i * MULTIPART_PART_BYTES, (i + 1) * MULTIPART_PART_BYTES),
+    totalSize: ciphertext.length,
+    readPart: async (i) => ciphertext.subarray(i * MULTIPART_PART_BYTES, (i + 1) * MULTIPART_PART_BYTES),
   };
 }
 
@@ -376,9 +391,9 @@ export async function openDownloadStream(fileId: string, onProgress?: ProgressCa
   return bodyAsStream(res, onProgress);
 }
 
-export async function downloadContent(fileId: string, onProgress?: ProgressCallback): Promise<Uint8Array> {
+export async function downloadContent(fileId: string, onProgress?: ProgressCallback, signal?: AbortSignal): Promise<Uint8Array> {
   assertSafeId(fileId);
-  const res = await privateFetch(`${BASE_URL}/files/${fileId}/blob`, { headers: authHeaders(), credentials: 'omit' });
+  const res = await privateFetch(`${BASE_URL}/files/${fileId}/blob`, { headers: authHeaders(), credentials: 'omit', signal });
   await checkOk(res, 'Download failed');
   return readBodyWithProgress(res, onProgress);
 }

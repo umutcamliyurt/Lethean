@@ -39,8 +39,11 @@ self.onmessage = async (event: MessageEvent<EncryptRequest>) => {
       ? await encryptFile(req.wrappingKeyRaw, req.file, req.parentId)
       : await encryptFolder(req.wrappingKeyRaw, req.name, req.parentId);
 
-    const response: EncryptSuccess = { id: req.id, ok: true, result };
-    (self as unknown as Worker).postMessage(response, [result.ciphertext.buffer]);
+    const ciphertext = result.ciphertext instanceof Blob
+      ? result.ciphertext
+      : new Blob([result.ciphertext as BlobPart], { type: 'application/octet-stream' });
+    const response: EncryptSuccess = { id: req.id, ok: true, result: { ...result, ciphertext } };
+    self.postMessage(response);
   } catch (err) {
     const response: EncryptFailure = {
       id: req.id,

@@ -135,6 +135,8 @@ export async function openPdfPreview(
       window.removeEventListener('resize', onResize);
       if (renderTask) renderTask.cancel();
       void loadingTask.destroy();
+      canvas.width = 0;
+      canvas.height = 0;
       canvas.remove();
     },
   };

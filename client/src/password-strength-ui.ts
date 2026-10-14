@@ -1,4 +1,4 @@
-import { validatePasswordStrength } from './crypto.js';
+import { preloadPasswordDictionary, validatePasswordStrength } from './crypto.js';
 
 const confirmInput = document.getElementById('password-confirm') as HTMLInputElement | null;
 const strengthMeter = document.getElementById('password-strength') as HTMLElement | null;
@@ -31,6 +31,7 @@ if (confirmInput && strengthMeter && strengthHint) {
     strengthHint.classList.toggle('error', !valid);
   };
 
+  confirmInput.addEventListener('focus', preloadPasswordDictionary);
   confirmInput.addEventListener('input', update);
   update();
 }

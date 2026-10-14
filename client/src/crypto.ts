@@ -226,25 +226,52 @@ export async function checkDuress(input: string, duressConfig: DuressConfig): Pr
   }
 }
 
-function memoizeWithRetry<T>(factory: () => Promise<T>): () => Promise<T> {
+function memoizeWithRetry<T>(factory: () => Promise<T>): (() => Promise<T>) & { reset(): void } {
   let cached: Promise<T> | null = null;
-  return () => {
+  const get = () => {
     if (!cached) {
-      cached = factory().catch((err) => {
-        cached = null;
+      const attempt: Promise<T> = factory().catch((err) => {
+        if (cached === attempt) cached = null;
         console.warn('[crypto] common-password dictionary unavailable, retrying next call:', err);
         throw err;
       });
+      cached = attempt;
     }
     return cached;
   };
+  return Object.assign(get, { reset: () => { cached = null; } });
 }
 
-const loadCommonPasswordsRaw = memoizeWithRetry(async (): Promise<string> => {
+interface PasswordDictionaries {
+  common: Set<string>;
+  matcher: AhoCorasick;
+}
+
+const DICTIONARY_IDLE_RELEASE_MS = 2 * 60 * 1000;
+let dictionaryReleaseTimer: ReturnType<typeof setTimeout> | null = null;
+
+const loadPasswordDictionaries = memoizeWithRetry(async (): Promise<PasswordDictionaries> => {
   const res = await fetch(new URL('./common_passwords.txt', import.meta.url));
   if (!res.ok) throw new Error(`Failed to load common-password list: HTTP ${res.status}`);
-  return res.text();
+  const words = parseWordList(await res.text());
+  const common = new Set(words);
+  const matcher = new AhoCorasick(words.filter((w) => w.length >= 5 && w.length <= 20 && /^[a-z]+$/.test(w)));
+  return { common, matcher };
 });
+
+async function getPasswordDictionaries(): Promise<PasswordDictionaries> {
+  const dicts = await loadPasswordDictionaries();
+  if (dictionaryReleaseTimer) clearTimeout(dictionaryReleaseTimer);
+  dictionaryReleaseTimer = setTimeout(() => {
+    dictionaryReleaseTimer = null;
+    loadPasswordDictionaries.reset();
+  }, DICTIONARY_IDLE_RELEASE_MS);
+  return dicts;
+}
+
+export function preloadPasswordDictionary(): void {
+  getPasswordDictionaries().catch(() => {});
+}
 
 function parseWordList(raw: string): string[] {
   if (raw.charCodeAt(0) === 0xfeff) raw = raw.slice(1);
@@ -254,11 +281,6 @@ function parseWordList(raw: string): string[] {
     .filter(Boolean);
 }
 
-const getCommonPasswordSet = memoizeWithRetry(async (): Promise<Set<string>> => {
-  const raw = await loadCommonPasswordsRaw();
-  return new Set(parseWordList(raw));
-});
-
 const LEET_MAP: Record<string, string> = { '0': 'o', '1': 'i', '3': 'e', '4': 'a', '5': 's', '7': 't', '@': 'a', '$': 's' };
 function deleetify(str: string): string {
   let out = '';
@@ -267,7 +289,7 @@ function deleetify(str: string): string {
 }
 
 async function isCommonPassword(password: string): Promise<boolean> {
-  const dict = await getCommonPasswordSet();
+  const dict = (await getPasswordDictionaries()).common;
   const lower = password.toLowerCase();
 
   const candidates = new Set<string>([lower]);
@@ -284,24 +306,12 @@ async function isCommonPassword(password: string): Promise<boolean> {
   return false;
 }
 
-const getDictionaryMatcher = memoizeWithRetry(async (): Promise<AhoCorasick> => {
-  const raw = await loadCommonPasswordsRaw();
-  const words = parseWordList(raw).filter((w) => w.length >= 5 && w.length <= 20 && /^[a-z]+$/.test(w));
-  return new AhoCorasick(words);
-});
-
-if (typeof requestIdleCallback === 'function') {
-  requestIdleCallback(() => { getDictionaryMatcher().catch(() => {}); });
-} else if (typeof window !== 'undefined') {
-  setTimeout(() => { getDictionaryMatcher().catch(() => {}); }, 0);
-}
-
 const DICTIONARY_COVERAGE_REJECT_RATIO = 0.6;
 const DICTIONARY_COVERAGE_LENIENT_WORD_COUNT = 5;
 const DICTIONARY_COVERAGE_LENIENT_MIN_LENGTH = 30;
 
 async function hasSignificantDictionaryCoverage(password: string): Promise<boolean> {
-  const matcher = await getDictionaryMatcher();
+  const { matcher } = await getPasswordDictionaries();
   const lower = password.toLowerCase();
   const deleeted = deleetify(lower);
 

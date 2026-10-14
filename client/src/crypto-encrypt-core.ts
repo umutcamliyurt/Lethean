@@ -51,22 +51,57 @@ export async function compressBytes(bytes: Uint8Array): Promise<Uint8Array | nul
   return new Uint8Array(await new Response(stream).arrayBuffer());
 }
 
-export async function readAndMaybeCompressFile(file: File): Promise<{ bytes: Uint8Array; compressed: boolean }> {
-  if (!canCompress) {
-    return { bytes: new Uint8Array(await file.arrayBuffer()), compressed: false };
-  }
-  try {
-    const [rawStream, gzipStream] = file.stream().tee();
-    const rawPromise = new Response(rawStream).arrayBuffer();
-    const compressedPromise = new Response(gzipStream.pipeThrough(new CompressionStream('gzip'))).arrayBuffer();
-    const [rawBuf, gzippedBuf] = await Promise.all([rawPromise, compressedPromise]);
-    if (gzippedBuf.byteLength < rawBuf.byteLength) {
-      return { bytes: new Uint8Array(gzippedBuf), compressed: true };
+const INCOMPRESSIBLE_MIME = /^(?:image\/(?:jpeg|png|gif|webp|avif|heic|heif|jxl)|video\/|audio\/(?:mpeg|mp4|aac|ogg|opus|webm|flac|x-m4a)|application\/(?:zip|gzip|x-gzip|x-7z-compressed|x-rar-compressed|vnd\.rar|x-bzip2|x-xz|zstd|x-zstd|epub\+zip|vnd\.openxmlformats-officedocument\.|vnd\.oasis\.opendocument\.))/i;
+
+async function gzipIfSmaller(file: File, limit: number): Promise<{ chunks: Uint8Array[]; length: number } | null> {
+  const reader = file.stream().pipeThrough(new CompressionStream('gzip')).getReader();
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) return { chunks, length };
+    length += value.length;
+    if (length >= limit) {
+      await reader.cancel().catch(() => {});
+      return null;
     }
-    return { bytes: new Uint8Array(rawBuf), compressed: false };
-  } catch {
-    return { bytes: new Uint8Array(await file.arrayBuffer()), compressed: false };
+    chunks.push(value);
   }
+}
+
+async function readIntoPadded(file: File): Promise<{ padded: Uint8Array; length: number }> {
+  const padded = new Uint8Array(paddedSize(file.size));
+  const reader = file.stream().getReader();
+  let length = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    if (length + value.length > file.size) {
+      await reader.cancel().catch(() => {});
+      throw new Error('File changed while it was being read');
+    }
+    padded.set(value, length);
+    length += value.length;
+  }
+  return { padded, length };
+}
+
+export async function readPaddedContent(file: File): Promise<{ padded: Uint8Array; unpaddedSize: number; compressed: boolean }> {
+  if (canCompress && file.size > 0 && !INCOMPRESSIBLE_MIME.test(file.type)) {
+    try {
+      const gz = await gzipIfSmaller(file, file.size);
+      if (gz) {
+        const padded = new Uint8Array(paddedSize(gz.length));
+        let off = 0;
+        for (const c of gz.chunks) { padded.set(c, off); off += c.length; }
+        gz.chunks.length = 0;
+        return { padded, unpaddedSize: gz.length, compressed: true };
+      }
+    } catch {
+    }
+  }
+  const { padded, length } = await readIntoPadded(file);
+  return { padded, unpaddedSize: length, compressed: false };
 }
 
 export async function decompressBytes(bytes: Uint8Array): Promise<Uint8Array> {
@@ -368,10 +403,7 @@ export async function encryptFile(
   const fileKeyRaw = generateAesKeyRaw();
   const fileKey = await importAesKey(fileKeyRaw);
 
-  const { bytes: contentBytes, compressed } = await readAndMaybeCompressFile(file);
-
-  const unpaddedSize = contentBytes.length;
-  const paddedContentBytes = padToBucket(contentBytes);
+  const { padded: paddedContentBytes, unpaddedSize, compressed } = await readPaddedContent(file);
 
   const metadataBytes = padMetadataBytes(utf8(JSON.stringify({
     name: file.name,
@@ -422,12 +454,16 @@ export async function prepareChunkedFile(
 
   const readPart = async (index: number): Promise<Uint8Array> => {
     const start = index * CHUNK_SIZE;
-    const plain = new Uint8Array(CHUNK_SIZE);
-    plain.set(new Uint8Array(await file.slice(start, Math.min(start + CHUNK_SIZE, file.size)).arrayBuffer()));
+    const slice = new Uint8Array(await file.slice(start, Math.min(start + CHUNK_SIZE, file.size)).arrayBuffer());
+    let plain: Uint8Array = slice;
+    if (slice.length !== CHUNK_SIZE) {
+      plain = new Uint8Array(CHUNK_SIZE);
+      plain.set(slice);
+    }
     const sealed = await crypto.subtle.encrypt(
       { name: 'AES-GCM', iv: asBufferSource(chunkIv(prefix, index)), additionalData: asBufferSource(chunkAad(index, index === partCount - 1)), tagLength: 128 },
       fileKey,
-      plain
+      asBufferSource(plain)
     );
     return new Uint8Array(sealed);
   };

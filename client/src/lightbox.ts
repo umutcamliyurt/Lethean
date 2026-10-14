@@ -213,13 +213,34 @@ function releaseEphemeralPreview(id: string | null): void {
   }
 }
 
-function switchPreview(newId: string | null): void {
+let previewGeneration = 0;
+let previewAbort: AbortController | null = null;
+
+interface PreviewTicket {
+  readonly signal: AbortSignal;
+  isStale(): boolean;
+}
+
+function switchPreview(newId: string | null): PreviewTicket {
   if (currentPreviewId && currentPreviewId !== newId) releaseEphemeralPreview(currentPreviewId);
   if (currentPdfHandle) {
     currentPdfHandle.destroy();
     currentPdfHandle = null;
   }
+  previewAbort?.abort();
+  const controller = new AbortController();
+  previewAbort = newId ? controller : null;
+  const generation = ++previewGeneration;
   currentPreviewId = newId;
+  return { signal: controller.signal, isStale: () => generation !== previewGeneration };
+}
+
+function discardStalePreview(id: string): void {
+  if (id !== currentPreviewId) releaseEphemeralPreview(id);
+}
+
+function isAbortError(err: unknown): boolean {
+  return (err as { name?: string } | null)?.name === 'AbortError';
 }
 
 const MOBILE_INLINE_VIDEO_LIMIT_BYTES = 150 * 1024 * 1024;
@@ -302,14 +323,14 @@ export async function openTile(fileId: string): Promise<void> {
 async function openOtherPreview(record: FileRecord, meta: FileMeta, kind: 'pdf' | 'audio' | 'text'): Promise<void> {
   lightboxMediaList = [];
   lightboxIndex = -1;
-  switchPreview(record.id);
+  const ticket = switchPreview(record.id);
   const tileEl = boxGrid.querySelector(`[data-id="${CSS.escape(record.id)}"]`);
   tileEl?.classList.add('decrypting');
   showLightbox(`<div class="lightbox-content"><div class="spinner spinner-lg"></div></div>`, { keepMedia: true });
 
   try {
     if (kind === 'pdf') {
-      await renderPdfLightbox(record, meta);
+      await renderPdfLightbox(record, meta, ticket);
       return;
     }
 
@@ -317,13 +338,15 @@ async function openOtherPreview(record: FileRecord, meta: FileMeta, kind: 'pdf' 
     let objectUrl: string | null = null;
 
     if (kind === 'text') {
-      const bytes = await getDecryptedBytes(record);
+      const bytes = await getDecryptedBytes(record, ticket.signal);
+      if (ticket.isStale()) return;
       const text = new TextDecoder('utf-8', { fatal: false }).decode(bytes);
       inner = isMarkdownFile(meta)
         ? `<div class="editor-preview lightbox-markdown" id="lightbox-media">${renderMarkdownPreview(text)}</div>`
         : `<pre class="lightbox-text" id="lightbox-media">${escapeHtml(text)}</pre>`;
     } else {
-      objectUrl = await getDecryptedUrl(record);
+      objectUrl = await getDecryptedUrl(record, ticket.signal);
+      if (ticket.isStale()) { discardStalePreview(record.id); return; }
       inner = `<audio src="${objectUrl}" controls autoplay id="lightbox-media"></audio>`;
     }
 
@@ -349,6 +372,7 @@ async function openOtherPreview(record: FileRecord, meta: FileMeta, kind: 'pdf' 
       if (await handleDelete(record.id)) closeLightbox();
     });
   } catch (err) {
+    if (ticket.isStale() || isAbortError(err)) { discardStalePreview(record.id); return; }
     const unsafeErr = err as UnsafePdfError;
     if (unsafeErr.unsafePdf) {
       showLightbox(`
@@ -370,8 +394,9 @@ async function openOtherPreview(record: FileRecord, meta: FileMeta, kind: 'pdf' 
   }
 }
 
-async function renderPdfLightbox(record: FileRecord, meta: FileMeta): Promise<void> {
-  const bytes = await getDecryptedBytes(record);
+async function renderPdfLightbox(record: FileRecord, meta: FileMeta, ticket: PreviewTicket): Promise<void> {
+  const bytes = await getDecryptedBytes(record, ticket.signal);
+  if (ticket.isStale()) return;
   if (!looksLikePdf(bytes)) {
     const err: UnsafePdfError = new Error("This file is named/labeled as a PDF but its contents don't look like one, so it can't be previewed safely.");
     err.unsafePdf = true;
@@ -416,7 +441,7 @@ async function renderPdfLightbox(record: FileRecord, meta: FileMeta): Promise<vo
     },
   });
 
-  if (currentPreviewId !== record.id) {
+  if (ticket.isStale()) {
     handle.destroy();
     return;
   }
@@ -442,7 +467,7 @@ async function openMediaAt(list: FileRecord[], index: number): Promise<void> {
 
   lightboxMediaList = list;
   lightboxIndex = index;
-  switchPreview(record.id);
+  const ticket = switchPreview(record.id);
 
   const kind = fileKind(meta.mime);
   const showNav = lightboxMediaList.length > 1;
@@ -467,7 +492,8 @@ async function openMediaAt(list: FileRecord[], index: number): Promise<void> {
   }
 
   try {
-    const url = await getDecryptedUrl(record);
+    const url = await getDecryptedUrl(record, ticket.signal);
+    if (ticket.isStale()) { discardStalePreview(record.id); return; }
     currentMediaCtx = { record, meta, url };
 
     if (canUpdateInPlace && existingMedia) {
@@ -529,6 +555,7 @@ async function openMediaAt(list: FileRecord[], index: number): Promise<void> {
       }
     }
   } catch (err) {
+    if (ticket.isStale() || isAbortError(err)) { discardStalePreview(record.id); return; }
     showToast("Couldn't decrypt that file. " + (err as Error).message, 'error');
     closeLightbox();
   } finally {
@@ -541,18 +568,30 @@ function navigateLightbox(delta: number): void {
   openMediaAt(lightboxMediaList, lightboxIndex + delta);
 }
 
+function releaseMediaElements(): void {
+  lightbox.querySelectorAll<HTMLMediaElement>('video, audio').forEach((el) => {
+    el.pause();
+    el.removeAttribute('src');
+    el.load();
+  });
+  lightbox.querySelectorAll<HTMLImageElement>('img').forEach((el) => el.removeAttribute('src'));
+}
+
+let backdropCloseArmed = false;
+lightbox.addEventListener('click', (e) => {
+  if (!backdropCloseArmed || e.target !== lightbox) return;
+  backdropCloseArmed = false;
+  closeLightbox();
+});
+
 export function showLightbox(innerHtml: string, { keepMedia = false }: { keepMedia?: boolean } = {}): void {
   if (!keepMedia) {
     lightboxMediaList = [];
     lightboxIndex = -1;
     lightbox.classList.remove('has-nav');
-    releaseEphemeralPreview(currentPreviewId);
-    currentPreviewId = null;
-    if (currentPdfHandle) {
-      currentPdfHandle.destroy();
-      currentPdfHandle = null;
-    }
+    switchPreview(null);
   }
+  releaseMediaElements();
   lightbox.innerHTML = `
     <button class="btn-icon lightbox-close" id="lightbox-close" aria-label="Close">${icon('close')}</button>
     ${innerHtml}
@@ -561,12 +600,21 @@ export function showLightbox(innerHtml: string, { keepMedia = false }: { keepMed
   lightbox.tabIndex = -1;
   lightbox.focus({ preventScroll: true });
   document.getElementById('lightbox-close')!.addEventListener('click', closeLightbox);
-  lightbox.addEventListener('click', (e) => { if (e.target === lightbox) closeLightbox(); }, { once: true });
+  backdropCloseArmed = true;
+}
+
+export function releaseLightboxPreview(): void {
+  backdropCloseArmed = false;
+  releaseMediaElements();
+  lightboxMediaList = [];
+  lightboxIndex = -1;
+  currentMediaCtx = null;
+  switchPreview(null);
 }
 
 export function closeLightbox(): void {
-  const av = lightbox.querySelector('video, audio') as (HTMLVideoElement | HTMLAudioElement | null);
-  if (av) av.pause();
+  backdropCloseArmed = false;
+  releaseMediaElements();
   if (isNativeFullscreenActive()) exitFullscreenCompat().catch(() => {});
   if (pseudoFullscreenActive) {
     const mediaEl = document.getElementById('lightbox-media') as HTMLElement | null;
@@ -579,12 +627,8 @@ export function closeLightbox(): void {
   lightbox.innerHTML = '';
   lightboxMediaList = [];
   lightboxIndex = -1;
-  releaseEphemeralPreview(currentPreviewId);
-  currentPreviewId = null;
-  if (currentPdfHandle) {
-    currentPdfHandle.destroy();
-    currentPdfHandle = null;
-  }
+  currentMediaCtx = null;
+  switchPreview(null);
 }
 
 document.addEventListener('keydown', (e) => {

@@ -23,7 +23,7 @@ export interface FileRecord {
 }
 
 export interface EncryptedFilePayload {
-  ciphertext: Uint8Array;
+  ciphertext: Uint8Array | Blob;
   contentIv: string;
   encryptedMetadata: string;
   metadataIv: string;
