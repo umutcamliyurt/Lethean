@@ -183,23 +183,19 @@ The apps only connect to an `https://` server URL (`http://` is allowed for `loc
 
 ## Threat Model
 
-### Defends against:
-- **Passive server compromise**: the adversary can read stored server data but cannot alter server responses, observe live operations, or control server behavior. Only encrypted data and encrypted metadata are stored, and file sizes remain hidden: files up to 32 MiB are padded to size buckets (16 KiB up to 64 MiB), larger files to a multiple of 32 MiB.
-- Offline brute-force attacks against a stolen database
-- Coerced unlock: the duress path is indistinguishable from the normal path at the network, storage, and UI levels, works from any of your devices, and leaves nothing that proves a duress code existed
-- Passive network eavesdropping during unlock attempts
-- **Active server compromise, for the desktop and mobile apps**: an adversary who controls the server, its responses and its stored data. The apps' code ships in the build rather than being loaded from the server, and every secret stays on the device, so even full control of the server yields:
-  - **No passwords, keys or plaintext.** The server only ever receives the vault ID and ciphertext, and it already holds both.
-  - **No undetected tampering.** Every key, metadata record and file is authenticated encryption, and chunked files bind each chunk's position, so altered, swapped, reordered or truncated data fails to decrypt instead of being shown. The server also can't move items between folders or change a file's format. Items not yet upgraded are the exception (see [Upgrading older vaults](#upgrading-older-vaults)).
-  - **No forged duress settings.** Without the duress password the server can't create settings that match it, or learn anything from the ones it stores.
+### Defends against
+- **Stolen server data**: the server stores only ciphertext and encrypted metadata. Files up to 32 MiB are padded to size buckets (16 KiB to 64 MiB), larger files to a multiple of 32 MiB. Argon2id slows offline password guessing.
+- **Passive network eavesdropping** during unlock.
+- **Coerced unlock**: the duress path looks identical to a normal unlock on the network, in storage and in the UI, works from any of your devices, and leaves no proof that a duress code existed.
+- **A malicious server, for the desktop, mobile and FUSE clients**: their code ships in the build, so the server never receives passwords, keys or plaintext. Tampered data is rejected: altered, swapped, reordered or truncated data fails to decrypt, and the server can't move items between folders or change a file's format. The server also can't forge duress settings. Items not yet upgraded are the exception (see [Upgrading older vaults](#upgrading-older-vaults)).
 
-### Does not defend against:
-- **Active server compromise, for the web app**: the web app's JavaScript is delivered by the server, so a compromised server can serve modified code that captures passwords and keys. The same applies to share links, which recipients open in the web page even when the sender uses an app. Use the desktop or mobile apps if you don't trust the server operator.
-- **Availability under active server compromise**, for any client: a server in someone else's control can refuse service, withhold or delete files, show files you deleted again, ignore a duress wipe request, or replace the duress settings with random ones so the duress password stops wiping. It can't read anything in the process.
-- A compromised client, including a malicious browser, extension, or tampered JavaScript
-- Weak or reused passwords, including a weak duress password: anyone holding your access token can fetch the encrypted duress settings and try to guess the duress password offline (Argon2id-hardened, rate-limited online). A guessed duress password lets them wipe the vault, not read it
-- Sustained forensic analysis of server-side metadata, including timing and access patterns. For example, the server sees when duress settings are written after a vault's first unlock (which in practice suggests a duress code was set, though it can't tell setting from removing one), when the second token of a pair starts being used (which suggests decoy files were added), and the 32 MiB padding steps of large files.
-- A compromised admin password: whoever holds it can create, edit and revoke access tokens and revoke share links, though not read any vault contents.
+### Does not defend against
+- **A malicious server, for the web app and share links**: the server delivers the JavaScript, so it can serve code that captures passwords and keys. Share links always open in the web app.
+- **Denial of service by the server**: it can withhold or delete files, restore deleted ones, ignore a wipe request, or replace the duress settings so the duress password stops wiping. It can't read anything this way.
+- **A compromised device**, browser or extension.
+- **Weak passwords**: anyone holding your access token can try to guess the duress password offline. A correct guess lets them wipe the vault, not read it.
+- **Metadata analysis**: the server sees timing, access patterns and padded sizes, including when duress settings are written after the first unlock (suggesting a code was set) and when the second token of a pair starts being used (suggesting decoy files).
+- **A compromised admin password**: it allows managing tokens and share links, not reading vaults.
 
 ## License
 
