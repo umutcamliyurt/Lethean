@@ -688,7 +688,7 @@ export async function downloadAndSave(record: FileRecord, meta: FileMeta, existi
 
     await downloadDecrypted({
       request: api.fileBlobRequest(record.id),
-      fileKeyRaw: fileKeyCache.get(record.id)!,
+      fileKey: fileKeyCache.get(record.id)!,
       contentIv: record.content_iv,
       meta,
     });

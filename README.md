@@ -43,9 +43,13 @@ Lethean is a zero-knowledge encrypted storage accountless web app. Your chosen p
 | `vaultId` | Acts like a "key card", user shows it to the server to prove they can access a vault. Think of it like an unguessable link: possession is access. | Sent to the server on every request |
 | `wrappingKey` | Locks and unlocks the individual encryption key for each file user uploads. | Stays in the browser |
 
-Each file gets its own random key, wrapped by `wrappingKey`. Files up to 32 MiB are encrypted as one AES-256-GCM message (gzip-compressed first when that helps). Larger files are split into 32 MiB chunks, each sealed separately with its position and an "is last chunk" flag bound in, so chunks can't be reordered, dropped or truncated without detection. That lets them be uploaded in parts and decrypted as a stream.
+Each file gets its own random key, wrapped by `wrappingKey`. Separate keys for the file's name and its contents are derived from that file key. Files up to 32 MiB are encrypted as one AES-256-GCM message (gzip-compressed first when that helps). Larger files are split into 32 MiB chunks, each sealed separately with its position and an "is last chunk" flag bound in, so chunks can't be reordered, dropped or truncated without detection. That lets them be uploaded in parts and decrypted as a stream.
 
 For the full design, see [`CRYPTOGRAPHY.md`](CRYPTOGRAPHY.md).
+
+### Upgrading older vaults
+
+Items created before this format still open, but a malicious server can tamper with them. **Settings → Upgrade Vault** re-encrypts them in the current format, keeping names, contents and folders, and checks each copy before deleting the original. It uploads every old item again, and share links to upgraded items stop working. Afterwards, the device refuses old-format items for that vault. Clients that predate this format, including older FUSE builds, can't open new items; update every device. The FUSE client upgrades with `lethean-fuse upgrade`.
 
 ## Access Tokens
 
@@ -175,6 +179,8 @@ npm run tauri:android:build  # android
 
 The release APK lands under `client/src-tauri/gen/android/app/build/outputs/apk/`.
 
+The apps only connect to an `https://` server URL (`http://` is allowed for `localhost`).
+
 ## Threat Model
 
 ### Defends against:
@@ -184,7 +190,7 @@ The release APK lands under `client/src-tauri/gen/android/app/build/outputs/apk/
 - Passive network eavesdropping during unlock attempts
 - **Active server compromise, for the desktop and mobile apps**: an adversary who controls the server, its responses and its stored data. The apps' code ships in the build rather than being loaded from the server, and every secret stays on the device, so even full control of the server yields:
   - **No passwords, keys or plaintext.** The server only ever receives the vault ID and ciphertext, and it already holds both.
-  - **No undetected tampering.** Every key, metadata record and file is authenticated encryption, and chunked files bind each chunk's position, so altered, swapped, reordered or truncated data fails to decrypt instead of being shown.
+  - **No undetected tampering.** Every key, metadata record and file is authenticated encryption, and chunked files bind each chunk's position, so altered, swapped, reordered or truncated data fails to decrypt instead of being shown. The server also can't move items between folders or change a file's format. Items not yet upgraded are the exception (see [Upgrading older vaults](#upgrading-older-vaults)).
   - **No forged duress settings.** Without the duress password the server can't create settings that match it, or learn anything from the ones it stores.
 
 ### Does not defend against:

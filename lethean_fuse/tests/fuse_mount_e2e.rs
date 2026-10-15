@@ -7,7 +7,6 @@ use std::path::Path;
 
 use common::*;
 use lethean_fuse_lib::crypto::aead;
-use lethean_fuse_lib::crypto::gcm_stream::padme;
 
 const CHUNK_SIZE: u32 = 1024 * 1024;
 use lethean_fuse_lib::fuse_fs::{FsOptions, VaultFs};
@@ -69,7 +68,7 @@ fn mounted_filesystem_round_trips_small_and_chunked_files() {
     {
         let files = server.files.lock().unwrap();
         assert_eq!(files.len(), 2, "one small blob and one streamed blob");
-        assert!(files.iter().any(|(_, s)| s.blob.len() as u64 == padme(size) + 16));
+        assert!(files.iter().any(|(_, s)| s.blob.len() as u64 == aead::padded_size(size) + 16));
     }
 
     let got = read_all(&big);

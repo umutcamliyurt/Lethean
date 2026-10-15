@@ -26,6 +26,8 @@ In scope:
 - Any way to learn whether a vault has a duress code, or which token of a pair is the decoy, from stored data alone, or to recover a vault ID or file keys from the duress settings
 - Any way to wipe a vault without its duress secret, or to change another vault's duress settings
 - Attacks on chunked files: reordering, dropping, truncating or splicing chunks without detection
+- Making a client read a format-2 file as legacy, accept non-canonical format-2 data, or place a format-2 item in the wrong folder
+- Data loss during a vault upgrade, or legacy records accepted by a device that has seen the vault legacy-free
 - Quota or authorization bypass through multi-part uploads, and access to another vault's upload sessions
 - Issues in the download service worker or thumbnail workers, such as serving one file's plaintext to another origin, or keys or credentials outliving the download they were given for
 - Admin panel and share link vulnerabilities
@@ -42,6 +44,7 @@ Out of scope, as documented in the [threat model](README.md#threat-model):
 - Offline guessing of a weak duress password by someone who holds your access token (the duress settings are readable with the token by design, so devices can fetch them before unlocking)
 - A compromised admin password
 - Anyone holding a complete share link, which is the decryption key for that file
+- Documented weaknesses of legacy-format items that haven't been upgraded yet
 - Volumetric denial of service, and third-party dependency issues with no exploitable path (report those upstream)
 
 ## Safe Harbor

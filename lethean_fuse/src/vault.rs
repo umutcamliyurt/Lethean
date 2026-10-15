@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -10,6 +10,7 @@ use zeroize::Zeroizing;
 use crate::api::{ApiClient, RewrapEntry};
 use crate::crypto::aead;
 use crate::crypto::chunked::{self, ChunkedEncryptReader, CHUNK_SIZE};
+use crate::crypto::format::{ContentKey, FileFormat, FileKey, ParentRef};
 use crate::crypto::gcm_stream::{GcmDecryptReader, GcmEncryptReader, AUTH_FAILED, STREAM_THRESHOLD};
 use crate::scratch::{self, Scratch, ScratchPool, ScratchWriter, DEFAULT_POOL_BYTES};
 use crate::types::{EncryptedHeader, FileMeta, FileRecord};
@@ -38,21 +39,36 @@ const SIZE_UNKNOWN: u64 = u64::MAX;
 pub struct Entry {
     pub record: FileRecord,
     pub meta: FileMeta,
-    pub file_key: Zeroizing<Vec<u8>>,
+    pub file_key: Option<FileKey>,
+    pub content: ContentKey,
+    pub node_ref: Option<String>,
+    pub readable: bool,
     learned_size: Arc<AtomicU64>,
 }
 
 impl Entry {
-    fn new(record: FileRecord, meta: FileMeta, file_key: Zeroizing<Vec<u8>>) -> Self {
-        Self { record, meta, file_key, learned_size: Arc::new(AtomicU64::new(SIZE_UNKNOWN)) }
+    fn new(record: FileRecord, meta: FileMeta, file_key: Option<FileKey>) -> Self {
+        let content = file_key.as_ref().map(|k| k.content_key()).unwrap_or(ContentKey { key: Zeroizing::new(Vec::new()), format: FileFormat::Legacy });
+        let node_ref = file_key.as_ref().map(|k| k.node_ref());
+        Self { record, meta, file_key, content, node_ref, readable: true, learned_size: Arc::new(AtomicU64::new(SIZE_UNKNOWN)) }
+    }
+
+    fn unreadable(record: FileRecord, file_key: Option<FileKey>) -> Self {
+        let mut e = Self::new(record, FileMeta::unreadable(), file_key);
+        e.readable = false;
+        e
     }
 
     pub fn is_folder(&self) -> bool {
         self.meta.is_folder
     }
 
-    pub fn parent_id(&self) -> Option<&str> {
-        self.meta.parent_id.as_deref()
+    pub fn is_v2(&self) -> bool {
+        self.file_key.as_ref().map(|k| k.is_v2()).unwrap_or(false)
+    }
+
+    pub fn is_legacy(&self) -> bool {
+        self.file_key.as_ref().map(|k| !k.is_v2()).unwrap_or(false)
     }
 
     pub fn name(&self) -> &str {
@@ -60,10 +76,13 @@ impl Entry {
     }
 
     fn stored_size(&self) -> u64 {
-        self.meta.unpadded_size.unwrap_or_else(|| self.record.size.unwrap_or(0))
+        self.meta.size.or(self.meta.unpadded_size).unwrap_or_else(|| self.record.size.unwrap_or(0))
     }
 
     pub fn size(&self) -> u64 {
+        if self.meta.size.is_some() {
+            return self.stored_size();
+        }
         if self.meta.compressed {
             let n = self.learned_size.load(Ordering::Acquire);
             if n != SIZE_UNKNOWN {
@@ -74,7 +93,7 @@ impl Entry {
     }
 
     pub fn size_is_exact(&self) -> bool {
-        !self.meta.compressed || self.learned_size.load(Ordering::Acquire) != SIZE_UNKNOWN
+        self.meta.size.is_some() || !self.meta.compressed || self.learned_size.load(Ordering::Acquire) != SIZE_UNKNOWN
     }
 
     fn learn_size(&self, plain_len: u64) {
@@ -114,21 +133,102 @@ fn lock_plain<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+pub const UNRESOLVED_PARENT: &str = "\u{0}unresolved";
+
 struct VaultIndex {
     entries: HashMap<String, Arc<Entry>>,
     children_by_parent: HashMap<String, Vec<String>>,
     name_index: HashMap<String, HashMap<String, String>>,
+    placed: HashMap<String, String>,
+    folders_by_ref: HashMap<String, BTreeSet<String>>,
+    folders_by_from: HashMap<String, BTreeSet<String>>,
+    dependents: HashMap<String, BTreeSet<String>>,
 }
 
 impl VaultIndex {
     fn new() -> Self {
-        Self { entries: HashMap::new(), children_by_parent: HashMap::new(), name_index: HashMap::new() }
+        Self {
+            entries: HashMap::new(),
+            children_by_parent: HashMap::new(),
+            name_index: HashMap::new(),
+            placed: HashMap::new(),
+            folders_by_ref: HashMap::new(),
+            folders_by_from: HashMap::new(),
+            dependents: HashMap::new(),
+        }
     }
 
     fn clear(&mut self) {
-        self.entries.clear();
-        self.children_by_parent.clear();
-        self.name_index.clear();
+        *self = Self::new();
+    }
+
+    fn resolve(&self, entry: &Entry) -> String {
+        let declared = entry.meta.parent_id.as_deref();
+        if !entry.is_v2() {
+            return parent_key(declared).to_string();
+        }
+        let Some(declared) = declared else { return String::new() };
+        let Some(pref) = entry.meta.pref.as_deref() else { return UNRESOLVED_PARENT.to_string() };
+        let me = entry.record.id.as_str();
+        let pick = |set: Option<&BTreeSet<String>>| -> Option<String> {
+            let set = set?;
+            if set.contains(declared) && declared != me {
+                return Some(declared.to_string());
+            }
+            set.iter().find(|id| id.as_str() != me).cloned()
+        };
+        pick(self.folders_by_ref.get(pref)).or_else(|| pick(self.folders_by_from.get(pref))).unwrap_or_else(|| UNRESOLVED_PARENT.to_string())
+    }
+
+    fn attach(&mut self, id: &str) {
+        let Some(entry) = self.entries.get(id).cloned() else { return };
+        let pk = self.resolve(&entry);
+        self.name_index.entry(pk.clone()).or_default().entry(entry.name().to_string()).or_insert_with(|| id.to_string());
+        self.children_by_parent.entry(pk.clone()).or_default().push(id.to_string());
+        self.placed.insert(id.to_string(), pk);
+    }
+
+    fn detach(&mut self, id: &str) {
+        let Some(pk) = self.placed.remove(id) else { return };
+        let name = self.entries.get(id).map(|e| e.name().to_string()).unwrap_or_default();
+        if let Some(v) = self.children_by_parent.get_mut(&pk) {
+            if let Some(pos) = v.iter().position(|x| x == id) {
+                v.swap_remove(pos);
+            }
+        }
+        let owned_name_slot = self.name_index.get(&pk).and_then(|m| m.get(&name)).map(|cur| cur == id).unwrap_or(false);
+        if owned_name_slot {
+            if let Some(m) = self.name_index.get_mut(&pk) {
+                m.remove(&name);
+            }
+            let replacement = self.children_by_parent.get(&pk).and_then(|sibs| sibs.iter().find(|sid| self.entries.get(*sid).map(|e| e.name() == name).unwrap_or(false)).cloned());
+            if let Some(rid) = replacement {
+                self.name_index.entry(pk).or_default().insert(name, rid);
+            }
+        }
+    }
+
+    fn reattach_dependents(&mut self, keys: &[Option<String>]) {
+        let mut ids = BTreeSet::new();
+        for key in keys.iter().flatten() {
+            if let Some(d) = self.dependents.get(key) {
+                ids.extend(d.iter().cloned());
+            }
+        }
+        for id in ids {
+            if self.entries.contains_key(&id) {
+                self.detach(&id);
+                self.attach(&id);
+            }
+        }
+    }
+
+    fn folder_keys(entry: &Entry) -> [Option<String>; 2] {
+        if !entry.is_folder() {
+            return [None, None];
+        }
+        let from = if entry.is_v2() { entry.meta.from.clone() } else { None };
+        [entry.node_ref.clone(), from]
     }
 
     fn insert(&mut self, entry: Entry) -> Option<Arc<Entry>> {
@@ -136,12 +236,53 @@ impl VaultIndex {
             return None;
         }
         let id = entry.record.id.clone();
-        let pk = parent_key(entry.parent_id()).to_string();
-        self.name_index.entry(pk.clone()).or_default().entry(entry.name().to_string()).or_insert_with(|| id.clone());
-        self.children_by_parent.entry(pk).or_default().push(id.clone());
+        let [node_ref, from] = Self::folder_keys(&entry);
+        if let Some(r) = &node_ref {
+            self.folders_by_ref.entry(r.clone()).or_default().insert(id.clone());
+        }
+        if let Some(f) = &from {
+            self.folders_by_from.entry(f.clone()).or_default().insert(id.clone());
+        }
+        if entry.is_v2() {
+            if let Some(pref) = &entry.meta.pref {
+                self.dependents.entry(pref.clone()).or_default().insert(id.clone());
+            }
+        }
         let entry = Arc::new(entry);
-        self.entries.insert(id, Arc::clone(&entry));
+        self.entries.insert(id.clone(), Arc::clone(&entry));
+        self.attach(&id);
+        if node_ref.is_some() || from.is_some() {
+            self.reattach_dependents(&[node_ref, from]);
+        }
         Some(entry)
+    }
+
+    fn remove(&mut self, id: &str) -> Option<Arc<Entry>> {
+        self.detach(id);
+        let entry = self.entries.remove(id)?;
+        let [node_ref, from] = Self::folder_keys(&entry);
+        let unregister = |map: &mut HashMap<String, BTreeSet<String>>, key: &Option<String>| {
+            if let Some(k) = key {
+                if let Some(set) = map.get_mut(k) {
+                    set.remove(id);
+                    if set.is_empty() {
+                        map.remove(k);
+                    }
+                }
+            }
+        };
+        unregister(&mut self.folders_by_ref, &node_ref);
+        unregister(&mut self.folders_by_from, &from);
+        unregister(&mut self.dependents, &entry.meta.pref);
+        if node_ref.is_some() || from.is_some() {
+            self.reattach_dependents(&[node_ref, from]);
+        }
+        Some(entry)
+    }
+
+    fn parent_of(&self, id: &str) -> Option<Option<String>> {
+        let pk = self.placed.get(id)?;
+        Some(if pk.is_empty() { None } else { Some(pk.clone()) })
     }
 }
 
@@ -257,7 +398,7 @@ const CHUNK_READY: u8 = 2;
 struct ChunkedSource {
     api: Arc<ApiClient>,
     id: String,
-    file_key: Zeroizing<Vec<u8>>,
+    content: ContentKey,
     prefix: Vec<u8>,
     chunk_size: u64,
     count: u64,
@@ -456,8 +597,8 @@ impl ChunkedSource {
             return Err(io::Error::new(io::ErrorKind::InvalidData, AUTH_FAILED));
         }
         let nonce = chunked::nonce_for(&self.prefix, i)?;
-        let aad = chunked::aad_for(i, i == self.count - 1);
-        let mut dec = GcmDecryptReader::with_aad(body, &self.file_key, &nonce, &aad).map_err(other_io)?;
+        let aad = chunked::aad_for(self.content.format, i, i == self.count - 1);
+        let mut dec = GcmDecryptReader::with_aad(body, &self.content.key, &nonce, &aad).map_err(other_io)?;
         let base = i * self.chunk_size;
         let mut buf = Zeroizing::new(vec![0u8; 256 * 1024]);
         let mut got = 0u64;
@@ -470,6 +611,7 @@ impl ChunkedSource {
             if keep > 0 {
                 lock_plain(&self.scratch).write_at(base + got, &buf[..keep])?;
             }
+            chunked::check_filler(self.content.format, &buf[keep..n])?;
             got += n as u64;
         }
         if got != self.chunk_size {
@@ -570,10 +712,18 @@ impl Drop for ClaimGuard<'_> {
     }
 }
 
+#[derive(Clone)]
+pub struct Quarantined {
+    pub record: FileRecord,
+    pub file_key: FileKey,
+}
+
 pub struct Vault {
     pub api: Arc<ApiClient>,
     wrapping_key_raw: RwLock<Zeroizing<Vec<u8>>>,
     index: RwLock<VaultIndex>,
+    strict: std::sync::atomic::AtomicBool,
+    quarantined: RwLock<Vec<Quarantined>>,
     content_cache: Mutex<ContentCache>,
     large_cache: Mutex<LargeCache>,
     loading: Mutex<HashSet<String>>,
@@ -588,12 +738,20 @@ pub struct ReadInfo {
     pub large: bool,
 }
 
+#[allow(clippy::large_enum_variant)]
+enum Decoded {
+    Entry(Entry),
+    Quarantined(Quarantined),
+}
+
 impl Vault {
     pub fn new(api: ApiClient, wrapping_key_raw: Vec<u8>) -> Self {
         Self {
             api: Arc::new(api),
             wrapping_key_raw: RwLock::new(Zeroizing::new(wrapping_key_raw)),
             index: RwLock::new(VaultIndex::new()),
+            strict: std::sync::atomic::AtomicBool::new(false),
+            quarantined: RwLock::new(Vec::new()),
             content_cache: Mutex::new(ContentCache::new()),
             large_cache: Mutex::new(LargeCache::new(LARGE_CACHE_MAX_BYTES)),
             loading: Mutex::new(HashSet::new()),
@@ -618,77 +776,76 @@ impl Vault {
     pub fn close(&self) {
         *write_lock(&self.wrapping_key_raw) = Zeroizing::new(Vec::new());
         write_lock(&self.index).clear();
+        write_lock(&self.quarantined).clear();
         lock_cache(&self.content_cache).wipe();
         lock_large(&self.large_cache).wipe();
     }
 
-    fn index_remove(index: &mut VaultIndex, id: &str, parent_id: Option<&str>, name: &str) {
-        let pk = parent_key(parent_id);
-        if let Some(v) = index.children_by_parent.get_mut(pk) {
-            if let Some(pos) = v.iter().position(|x| x == id) {
-                v.swap_remove(pos);
-            }
+    pub fn set_strict(&self, strict: bool) {
+        self.strict.store(strict, Ordering::Release);
+    }
+
+    pub fn is_strict(&self) -> bool {
+        self.strict.load(Ordering::Acquire)
+    }
+
+    fn decode_record(wrapping_key: &[u8], mut record: FileRecord, strict: bool) -> Decoded {
+        let file_key = match aead::unwrap_file_key(wrapping_key, &record.wrapped_file_key, &record.wrap_iv) {
+            Ok(k) => k,
+            Err(_) => return Decoded::Entry(Entry::unreadable(Self::scrub(record), None)),
+        };
+        if strict && !file_key.is_v2() {
+            return Decoded::Quarantined(Quarantined { record, file_key });
         }
-        let owned_name_slot = index.name_index.get(pk).and_then(|m| m.get(name)).map(|cur| cur == id).unwrap_or(false);
-        if owned_name_slot {
-            if let Some(m) = index.name_index.get_mut(pk) {
-                m.remove(name);
+        match aead::decrypt_metadata(&file_key, &record.encrypted_metadata, &record.metadata_iv) {
+            Ok(meta) => {
+                record = Self::scrub(record);
+                Decoded::Entry(Entry::new(record, meta, Some(file_key)))
             }
-            let replacement = index.children_by_parent.get(pk).and_then(|sibs| sibs.iter().find(|sid| index.entries.get(*sid).map(|e| e.name() == name).unwrap_or(false)).cloned());
-            if let Some(rid) = replacement {
-                index.name_index.entry(pk.to_string()).or_default().insert(name.to_string(), rid);
-            }
+            Err(_) => Decoded::Entry(Entry::unreadable(Self::scrub(record), Some(file_key))),
         }
     }
 
-    fn decode_record(wrapping_key: &[u8], mut record: FileRecord) -> Entry {
-        let decoded = (|| -> Result<(FileMeta, Zeroizing<Vec<u8>>)> {
-            let file_key = Zeroizing::new(aead::unwrap_file_key(wrapping_key, &record.wrapped_file_key, &record.wrap_iv)?);
-            let meta = aead::decrypt_metadata(&file_key, &record.encrypted_metadata, &record.metadata_iv)?;
-            Ok((meta, file_key))
-        })();
-
-        let (meta, file_key) = match decoded {
-            Ok(v) => v,
-            Err(_) => (
-                FileMeta {
-                    name: "Unreadable item".to_string(),
-                    mime: "application/octet-stream".to_string(),
-                    compressed: false,
-                    unpadded_size: None,
-                    is_folder: false,
-                    parent_id: None,
-                    chunk_size: None,
-                },
-                Zeroizing::new(Vec::new()),
-            ),
-        };
+    fn scrub(mut record: FileRecord) -> FileRecord {
         record.encrypted_metadata = String::new();
         record.metadata_iv = String::new();
-        Entry::new(record, meta, file_key)
+        record
     }
 
     fn ingest_record(&self, record: FileRecord) -> Option<Arc<Entry>> {
-        let entry = Self::decode_record(&self.wrapping_key(), record);
-        write_lock(&self.index).insert(entry)
+        match Self::decode_record(&self.wrapping_key(), record, self.is_strict()) {
+            Decoded::Entry(entry) => write_lock(&self.index).insert(entry),
+            Decoded::Quarantined(q) => {
+                write_lock(&self.quarantined).push(q);
+                None
+            }
+        }
     }
 
     pub fn refresh_all(&self) -> Result<()> {
         let wrapping_key = self.wrapping_key();
+        let strict = self.is_strict();
         let mut fresh = VaultIndex::new();
+        let mut quarantined = Vec::new();
         let mut offset = 0u64;
+        let mut add = |fresh: &mut VaultIndex, d: Decoded| match d {
+            Decoded::Entry(e) => {
+                fresh.insert(e);
+            }
+            Decoded::Quarantined(q) => quarantined.push(q),
+        };
 
         let first = self.api.list_files(0, Some(PAGE_SIZE))?;
         let mut last_page_full = first.len() as u64 >= PAGE_SIZE;
         offset += first.len() as u64;
         for record in first {
-            fresh.insert(Self::decode_record(&wrapping_key, record));
+            add(&mut fresh, Self::decode_record(&wrapping_key, record, strict));
         }
         let expected = if last_page_full { self.api.get_usage(None).ok().map(|u| u.file_count).unwrap_or(0) } else { 0 };
         let pages = expected.div_ceil(PAGE_SIZE);
         if pages > 1 {
             let next_page = AtomicU64::new(1);
-            let results: Mutex<Vec<(u64, Result<Vec<Entry>>)>> = Mutex::new(Vec::new());
+            let results: Mutex<Vec<(u64, Result<Vec<Decoded>>)>> = Mutex::new(Vec::new());
             std::thread::scope(|s| {
                 for _ in 0..REFRESH_PARALLELISM.min(pages as usize - 1) {
                     s.spawn(|| loop {
@@ -696,7 +853,7 @@ impl Vault {
                         if page >= pages {
                             break;
                         }
-                        let result = self.api.list_files(page * PAGE_SIZE, Some(PAGE_SIZE)).map(|records| records.into_iter().map(|r| Self::decode_record(&wrapping_key, r)).collect::<Vec<_>>());
+                        let result = self.api.list_files(page * PAGE_SIZE, Some(PAGE_SIZE)).map(|records| records.into_iter().map(|r| Self::decode_record(&wrapping_key, r, strict)).collect::<Vec<_>>());
                         let failed = result.is_err();
                         lock_plain(&results).push((page, result));
                         if failed {
@@ -712,7 +869,7 @@ impl Vault {
                 last_page_full = entries.len() as u64 == PAGE_SIZE;
                 offset += entries.len() as u64;
                 for e in entries {
-                    fresh.insert(e);
+                    add(&mut fresh, e);
                 }
                 if !last_page_full {
                     break;
@@ -724,14 +881,78 @@ impl Vault {
             let page = self.api.list_files(offset, Some(PAGE_SIZE))?;
             let got = page.len() as u64;
             for record in page {
-                fresh.insert(Self::decode_record(&wrapping_key, record));
+                add(&mut fresh, Self::decode_record(&wrapping_key, record, strict));
             }
             last_page_full = got >= PAGE_SIZE;
             offset += got;
         }
 
         *write_lock(&self.index) = fresh;
+        *write_lock(&self.quarantined) = quarantined;
         Ok(())
+    }
+
+    pub fn legacy_entries(&self) -> Vec<Entry> {
+        read_lock(&self.index).entries.values().filter(|e| e.is_legacy()).map(|e| (**e).clone()).collect()
+    }
+
+    pub fn quarantined_count(&self) -> usize {
+        read_lock(&self.quarantined).len()
+    }
+
+    pub fn admit_quarantined(&self) {
+        let items = std::mem::take(&mut *write_lock(&self.quarantined));
+        let mut index = write_lock(&self.index);
+        for q in items {
+            let entry = match aead::decrypt_metadata(&q.file_key, &q.record.encrypted_metadata, &q.record.metadata_iv) {
+                Ok(meta) => Entry::new(Self::scrub(q.record), meta, Some(q.file_key)),
+                Err(_) => Entry::unreadable(Self::scrub(q.record), Some(q.file_key)),
+            };
+            index.insert(entry);
+        }
+    }
+
+    pub fn plaintext_to_scratch(&self, id: &str) -> Result<(Arc<Mutex<Scratch>>, u64)> {
+        let mut scratch = self.pool.new_scratch();
+        let n = self.stream_plaintext(id, &mut ScratchWriter::new(&mut scratch))?;
+        Ok((Arc::new(Mutex::new(scratch)), n))
+    }
+
+    pub fn verify_record(&self, id: &str) -> Result<()> {
+        let entry = self.entry(id).context("record vanished")?;
+        if !entry.readable || entry.content.is_empty() {
+            bail!("record could not be decrypted");
+        }
+        if entry.is_folder() {
+            let ct = self.api.download_content(id)?;
+            let pt = aead::decrypt_content_owned(&entry.content, &entry.record.content_iv, ct, &entry.meta)?;
+            if !pt.is_empty() {
+                bail!("folder has content");
+            }
+            return Ok(());
+        }
+        let n = self.stream_decrypted(&entry, &mut io::sink())?;
+        if let Some(size) = entry.meta.size {
+            if n != size {
+                bail!("record did not read back completely");
+            }
+        }
+        Ok(())
+    }
+
+    pub fn parent_of(&self, id: &str) -> Option<Option<String>> {
+        read_lock(&self.index).parent_of(id)
+    }
+
+    pub fn parent_ref(&self, folder_id: Option<&str>) -> Result<Option<ParentRef>> {
+        let Some(id) = folder_id else { return Ok(None) };
+        let index = read_lock(&self.index);
+        let entry = index.entries.get(id).context("that folder isn't in the vault (refresh and try again)")?;
+        if !entry.is_folder() {
+            bail!("not a folder");
+        }
+        let node_ref = entry.node_ref.clone().context("that folder couldn't be decrypted")?;
+        Ok(Some(ParentRef { id: id.to_string(), node_ref }))
     }
 
     pub fn get(&self, id: &str) -> Option<Entry> {
@@ -836,11 +1057,20 @@ impl Vault {
         })
     }
 
-    pub fn create_file_streaming<'a, F>(&self, name: &str, mime: &str, size: u64, parent_id: Option<&str>, mut factory: F) -> Result<Entry>
+    pub fn create_file_streaming<'a, F>(&self, name: &str, mime: &str, size: u64, parent_id: Option<&str>, factory: F) -> Result<Entry>
+    where
+        F: FnMut() -> io::Result<Box<dyn Read + 'a>>,
+    {
+        self.create_file_streaming_ext(name, mime, size, parent_id, None, factory)
+    }
+
+    pub fn create_file_streaming_ext<'a, F>(&self, name: &str, mime: &str, size: u64, parent_id: Option<&str>, from: Option<&str>, mut factory: F) -> Result<Entry>
     where
         F: FnMut() -> io::Result<Box<dyn Read + 'a>>,
     {
         let wrapping_key = self.wrapping_key();
+        let parent = self.parent_ref(parent_id)?;
+        let parent = parent.as_ref();
 
         if size < STREAM_THRESHOLD {
             let mut buf = Zeroizing::new(Vec::with_capacity(size as usize));
@@ -850,7 +1080,7 @@ impl Vault {
                 bail!("the file changed while it was being uploaded (expected {size} bytes, read {})", buf.len());
             }
             drop(reader);
-            let payload = aead::encrypt_file(&wrapping_key, name, mime, &buf, parent_id)?;
+            let payload = aead::encrypt_file_ext(&wrapping_key, name, mime, &buf, parent, from)?;
             let record = self.api.upload_file(&payload, None, None).context("upload failed")?;
             drop(payload);
             let id = record.id.clone();
@@ -862,7 +1092,7 @@ impl Vault {
         }
 
         if size > CHUNK_SIZE {
-            let plan = chunked::plan_chunked_upload(&wrapping_key, name, mime, size, parent_id)?;
+            let plan = chunked::plan_chunked_upload(&wrapping_key, name, mime, size, parent, from)?;
             let record = self
                 .api
                 .upload_in_parts(
@@ -870,7 +1100,7 @@ impl Vault {
                     plan.body_len(),
                     || {
                         let src = factory()?;
-                        let body: Box<dyn Read + 'a> = Box::new(ChunkedEncryptReader::new(src, &plan.file_key, &plan.prefix, size));
+                        let body: Box<dyn Read + 'a> = Box::new(ChunkedEncryptReader::new(src, &plan.content_key, &plan.prefix, size));
                         Ok(body)
                     },
                     None,
@@ -882,7 +1112,7 @@ impl Vault {
             return self.get(&id).context("upload succeeded but the new entry vanished (likely deleted concurrently)");
         }
 
-        let plan = aead::plan_stream_upload(&wrapping_key, name, mime, size, parent_id)?;
+        let plan = aead::plan_stream_upload(&wrapping_key, name, mime, size, parent, from)?;
         let record = self
             .api
             .upload_stream(
@@ -890,7 +1120,7 @@ impl Vault {
                 plan.body_len(),
                 || {
                     let src = factory()?;
-                    let enc = GcmEncryptReader::new(src, &plan.file_key, &plan.iv, size, plan.padded_len).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:#}")))?;
+                    let enc = GcmEncryptReader::with_aad(src, &plan.content_key.key, &plan.iv, plan.content_key.single_aad(), size, plan.padded_len).map_err(|e| io::Error::new(io::ErrorKind::Other, format!("{e:#}")))?;
                     let body: Box<dyn Read + 'a> = Box::new(enc);
                     Ok(body)
                 },
@@ -904,8 +1134,13 @@ impl Vault {
     }
 
     pub fn create_folder(&self, name: &str, parent_id: Option<&str>) -> Result<Entry> {
+        self.create_folder_ext(name, parent_id, None)
+    }
+
+    pub fn create_folder_ext(&self, name: &str, parent_id: Option<&str>, from: Option<&str>) -> Result<Entry> {
         let wrapping_key = self.wrapping_key();
-        let payload = aead::encrypt_folder(&wrapping_key, name, parent_id)?;
+        let parent = self.parent_ref(parent_id)?;
+        let payload = aead::encrypt_folder_ext(&wrapping_key, name, parent.as_ref(), from)?;
         let record = self.api.upload_file(&payload, None, None).context("folder creation failed")?;
         let id = record.id.clone();
         self.ingest_record(record);
@@ -914,13 +1149,7 @@ impl Vault {
 
     pub fn delete_one(&self, id: &str) -> Result<()> {
         self.api.delete_file(id, None)?;
-        {
-            let mut index = write_lock(&self.index);
-            if let Some(entry) = index.entries.remove(id) {
-                let parent = entry.parent_id().map(|s| s.to_string());
-                Self::index_remove(&mut index, id, parent.as_deref(), entry.name());
-            }
-        }
+        write_lock(&self.index).remove(id);
         lock_cache(&self.content_cache).remove(id);
         lock_large(&self.large_cache).remove(id);
         Ok(())
@@ -932,17 +1161,22 @@ impl Vault {
     }
 
     fn stream_decrypted(&self, entry: &Entry, w: &mut dyn Write) -> Result<u64> {
-        if entry.file_key.is_empty() {
+        if entry.content.is_empty() {
             bail!("\"{}\" could not be decrypted (wrong vault password, or a corrupted item)", entry.name());
         }
         let iv = aead::from_base64(&entry.record.content_iv)?;
         if let Some(chunk_size) = entry.meta.chunk_size {
             let true_size = entry.meta.unpadded_size.context("chunked file without a size in its metadata")?;
             let (body, _len) = self.api.open_blob(&entry.record.id)?;
-            return Ok(chunked::decrypt_chunked(body, &entry.file_key, &iv, chunk_size, true_size, w)?);
+            return Ok(chunked::decrypt_chunked(body, &entry.content, &iv, chunk_size, true_size, w)?);
         }
         let (body, _len) = self.api.open_blob(&entry.record.id)?;
-        let mut dec = GcmDecryptReader::new(body, &entry.file_key, &iv)?;
+        let mut dec = GcmDecryptReader::with_aad(body, &entry.content.key, &iv, entry.content.single_aad())?;
+        if entry.content.format == FileFormat::V2 {
+            let written = stream_v2_single(&mut dec, &entry.meta, w)?;
+            entry.learn_size(written);
+            return Ok(written);
+        }
         let limit = entry.meta.unpadded_size.unwrap_or(u64::MAX);
 
         let written = if entry.meta.compressed {
@@ -980,7 +1214,7 @@ impl Vault {
     }
 
     fn open_chunked(&self, entry: &Entry, chunk_size: u64) -> Result<Arc<LargeFile>> {
-        if entry.file_key.is_empty() {
+        if entry.content.is_empty() {
             bail!("\"{}\" could not be decrypted (wrong vault password, or a corrupted item)", entry.name());
         }
         if !(chunked::MIN_CHUNK..=chunked::MAX_CHUNK).contains(&chunk_size) {
@@ -999,7 +1233,7 @@ impl Vault {
             backing: Backing::Chunked(ChunkedSource {
                 api: Arc::clone(&self.api),
                 id: entry.record.id.clone(),
-                file_key: entry.file_key.clone(),
+                content: entry.content.clone(),
                 prefix,
                 chunk_size,
                 count,
@@ -1112,7 +1346,10 @@ impl Vault {
             || lock_cache(&self.content_cache).get(id),
             || {
                 let ciphertext = self.api.download_content(id)?;
-                let bytes = aead::decrypt_content_owned(&entry.file_key, &entry.record.content_iv, ciphertext, entry.meta.compressed, entry.meta.unpadded_size)?;
+                if entry.content.is_empty() {
+                    bail!("\"{}\" could not be decrypted (wrong vault password, or a corrupted item)", entry.name());
+                }
+                let bytes = aead::decrypt_content_owned(&entry.content, &entry.record.content_iv, ciphertext, &entry.meta)?;
                 entry.learn_size(bytes.len() as u64);
                 let shared = Arc::new(Zeroizing::new(bytes));
                 lock_cache(&self.content_cache).insert(id.to_string(), Arc::clone(&shared));
@@ -1164,52 +1401,74 @@ impl Vault {
         F: FnMut() -> io::Result<Box<dyn Read + 'a>>,
     {
         let old = self.get(id).context("unknown file")?;
-        let new_entry = self.create_file_streaming(old.name(), &old.meta.mime, size, old.parent_id(), factory)?;
+        let parent = match self.parent_of(id) {
+            Some(Some(p)) if p == UNRESOLVED_PARENT => bail!("this file's folder couldn't be verified, so it can't be saved there"),
+            Some(p) => p,
+            None => bail!("unknown file"),
+        };
+        let new_entry = self.create_file_streaming(old.name(), &old.meta.mime, size, parent.as_deref(), factory)?;
         self.delete_one(id)?;
         Ok(new_entry)
     }
 
     pub fn rename_or_move(&self, id: &str, new_name: Option<&str>, new_parent_id: Option<Option<&str>>) -> Result<Entry> {
         let old = self.get(id).context("unknown file")?;
+        let old_key = old.file_key.clone().with_context(|| format!("\"{}\" could not be decrypted, so it can't be moved", old.name()))?;
+        let new_key = old_key.rebind();
         let mut new_meta = old.meta.clone();
         if let Some(name) = new_name {
             new_meta.name = name.to_string();
         }
-        if let Some(parent) = new_parent_id {
-            new_meta.parent_id = parent.map(|s| s.to_string());
+        let target = match new_parent_id {
+            Some(p) => p.map(|s| s.to_string()),
+            None => match self.parent_of(id) {
+                Some(Some(p)) if p == UNRESOLVED_PARENT => bail!("this item's folder couldn't be verified; move it to a folder explicitly"),
+                Some(p) => p,
+                None => old.meta.parent_id.clone(),
+            },
+        };
+        if new_key.is_v2() {
+            let parent = self.parent_ref(target.as_deref())?;
+            new_meta.set_parent(parent.as_ref());
+        } else {
+            new_meta.parent_id = target;
+            new_meta.pref = None;
         }
 
         if old.is_folder() {
-            let new_folder = self.reupload_with_metadata(&old, &new_meta)?;
-            let child_ids: Vec<String> = read_lock(&self.index).children_by_parent.get(id).cloned().unwrap_or_default();
-            for child_id in child_ids {
+            let new_folder = self.reupload_with_metadata(&old, &new_key, &new_meta)?;
+            let legacy_children: Vec<String> = {
+                let index = read_lock(&self.index);
+                index.children_by_parent.get(id).map(|v| v.iter().filter(|c| index.entries.get(*c).map(|e| !e.is_v2()).unwrap_or(true)).cloned().collect()).unwrap_or_default()
+            };
+            for child_id in legacy_children {
                 self.rename_or_move(&child_id, None, Some(Some(new_folder.record.id.as_str())))?;
             }
             self.delete_one(id)?;
-            Ok(new_folder)
+            Ok(self.get(&new_folder.record.id).unwrap_or(new_folder))
         } else {
-            let new_file = self.reupload_with_metadata(&old, &new_meta)?;
+            let new_file = self.reupload_with_metadata(&old, &new_key, &new_meta)?;
             self.delete_one(id)?;
             Ok(new_file)
         }
     }
 
-    fn reupload_with_metadata(&self, old: &Entry, new_meta: &FileMeta) -> Result<Entry> {
-        let (encrypted_metadata, metadata_iv) = aead::reencrypt_metadata(&old.file_key, new_meta)?;
-        let header = EncryptedHeader {
-            content_iv: old.record.content_iv.clone(),
-            encrypted_metadata,
-            metadata_iv,
-            wrapped_file_key: old.record.wrapped_file_key.clone(),
-            wrap_iv: old.record.wrap_iv.clone(),
+    fn reupload_with_metadata(&self, old: &Entry, new_key: &FileKey, new_meta: &FileMeta) -> Result<Entry> {
+        let (encrypted_metadata, metadata_iv) = aead::encrypt_metadata(new_key, new_meta)?;
+        let (wrapped_file_key, wrap_iv) = if new_key.is_v2() {
+            aead::wrap_file_key(&self.wrapping_key(), new_key)?
+        } else {
+            (old.record.wrapped_file_key.clone(), old.record.wrap_iv.clone())
         };
+        let header = EncryptedHeader { content_iv: old.record.content_iv.clone(), encrypted_metadata, metadata_iv, wrapped_file_key, wrap_iv };
 
         let record = if old.is_folder() {
+            let ciphertext = self.api.download_content(&old.record.id)?;
             self.api.upload_stream(
                 &header,
-                0,
+                ciphertext.len() as u64,
                 || {
-                    let r: Box<dyn Read> = Box::new(io::empty());
+                    let r: Box<dyn Read + '_> = Box::new(io::Cursor::new(&ciphertext[..]));
                     Ok(r)
                 },
                 None,
@@ -1268,19 +1527,78 @@ impl Vault {
 
     pub fn rotate_password(&self, new_vault_id: &str, new_wrapping_key_raw: &[u8]) -> Result<u64> {
         let entries = self.all_entries();
-        let mut rewraps = Vec::with_capacity(entries.len());
+        let quarantined = read_lock(&self.quarantined).clone();
+        let mut rewraps = Vec::with_capacity(entries.len() + quarantined.len());
         for entry in &entries {
-            if entry.file_key.is_empty() {
+            let Some(key) = &entry.file_key else {
                 bail!("\"{}\" isn't fully loaded yet — refresh and try again.", entry.name());
-            }
-            let wrap = aead::aes_gcm_encrypt(new_wrapping_key_raw, &entry.file_key)?;
-            rewraps.push(RewrapEntry { file_id: entry.record.id.clone(), wrapped_file_key: aead::to_base64(&wrap.ciphertext), wrap_iv: aead::to_base64(&wrap.iv) });
+            };
+            let (wrapped_file_key, wrap_iv) = aead::wrap_file_key(new_wrapping_key_raw, key)?;
+            rewraps.push(RewrapEntry { file_id: entry.record.id.clone(), wrapped_file_key, wrap_iv });
+        }
+        for q in &quarantined {
+            let (wrapped_file_key, wrap_iv) = aead::wrap_file_key(new_wrapping_key_raw, &q.file_key)?;
+            rewraps.push(RewrapEntry { file_id: q.record.id.clone(), wrapped_file_key, wrap_iv });
         }
 
         let result = self.api.rotate_vault(new_vault_id, &rewraps)?;
         self.api.set_vault_id(Some(new_vault_id.to_string()));
         *write_lock(&self.wrapping_key_raw) = Zeroizing::new(new_wrapping_key_raw.to_vec());
         Ok(result.files_moved)
+    }
+}
+
+fn stream_v2_single(dec: &mut dyn Read, meta: &FileMeta, w: &mut dyn Write) -> Result<u64> {
+    let corrupt = || io::Error::new(io::ErrorKind::InvalidData, "File is corrupt (padding)");
+    let unpadded = meta.unpadded_size.context("Corrupt file metadata (unpaddedSize)")?;
+    let mut counted = CountingReader { inner: dec, count: 0 };
+    let written = {
+        let mut body = io::BufReader::new((&mut counted).take(unpadded));
+        let written = if meta.compressed {
+            let size = meta.size.context("Corrupt file metadata (size)")?;
+            let mut gz = flate2::bufread::GzDecoder::new(&mut body);
+            let n = copy_in_blocks(&mut (&mut gz).take(size.saturating_add(1)), w)?;
+            if n != size {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "File is corrupt (decompressed size mismatch)").into());
+            }
+            n
+        } else {
+            copy_in_blocks(&mut body, w)?
+        };
+        if io::copy(&mut body, &mut io::sink())? != 0 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "File is corrupt (decompressed size mismatch)").into());
+        }
+        written
+    };
+    if counted.count != unpadded {
+        return Err(corrupt().into());
+    }
+    let mut buf = Zeroizing::new(vec![0u8; 256 * 1024]);
+    loop {
+        let n = chunked::read_full(&mut counted, &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if buf[..n].iter().any(|&b| b != 0) {
+            return Err(corrupt().into());
+        }
+    }
+    if counted.count != aead::padded_size(unpadded) {
+        return Err(corrupt().into());
+    }
+    Ok(written)
+}
+
+struct CountingReader<'a> {
+    inner: &'a mut dyn Read,
+    count: u64,
+}
+
+impl Read for CountingReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.count += n as u64;
+        Ok(n)
     }
 }
 

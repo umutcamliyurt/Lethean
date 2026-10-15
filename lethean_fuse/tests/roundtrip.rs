@@ -65,16 +65,20 @@ fn unlock_vault_is_deterministic_for_same_inputs() {
 fn file_envelope_round_trip() {
     let wrapping_key = aead::generate_aes_key_raw();
     let contents = b"the quick brown fox jumps over the lazy dog".repeat(500);
-    let payload = aead::encrypt_file(&wrapping_key, "fox.txt", "text/plain", &contents, Some("parent-123")).unwrap();
+    let parent = lethean_fuse_lib::crypto::format::ParentRef { id: "parent-123".to_string(), node_ref: "AAAAAAAAAAAAAAAAAAAAAA".to_string() };
+    let payload = aead::encrypt_file(&wrapping_key, "fox.txt", "text/plain", &contents, Some(&parent)).unwrap();
 
     let file_key = aead::unwrap_file_key(&wrapping_key, &payload.wrapped_file_key, &payload.wrap_iv).unwrap();
     let meta = aead::decrypt_metadata(&file_key, &payload.encrypted_metadata, &payload.metadata_iv).unwrap();
     assert_eq!(meta.name, "fox.txt");
     assert_eq!(meta.mime, "text/plain");
     assert_eq!(meta.parent_id.as_deref(), Some("parent-123"));
+    assert_eq!(meta.pref.as_deref(), Some("AAAAAAAAAAAAAAAAAAAAAA"));
+    assert_eq!(meta.size, Some(contents.len() as u64));
     assert!(!meta.is_folder);
+    assert!(file_key.is_v2());
 
-    let decrypted = aead::decrypt_content(&file_key, &payload.content_iv, &payload.ciphertext, meta.compressed, meta.unpadded_size).unwrap();
+    let decrypted = aead::decrypt_content(&file_key.content_key(), &payload.content_iv, &payload.ciphertext, &meta).unwrap();
     assert_eq!(decrypted, contents);
 }
 
@@ -98,7 +102,8 @@ fn tampered_ciphertext_fails_to_decrypt() {
 
     let mut tampered = payload.ciphertext.clone();
     tampered[0] ^= 0xFF;
-    assert!(aead::decrypt_content(&file_key, &payload.content_iv, &tampered, false, Some(5)).is_err());
+    let meta = aead::decrypt_metadata(&file_key, &payload.encrypted_metadata, &payload.metadata_iv).unwrap();
+    assert!(aead::decrypt_content(&file_key.content_key(), &payload.content_iv, &tampered, &meta).is_err());
 }
 
 #[test]

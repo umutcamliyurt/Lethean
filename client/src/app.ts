@@ -4,3 +4,4 @@ import './lightbox.js';
 import './editor.js';
 import './auth.js';
 import './upload.js';
+import './upgrade.js';

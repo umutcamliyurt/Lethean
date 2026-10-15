@@ -3,11 +3,13 @@
   interface Job {
     url: string;
     headers: Record<string, string>;
-    fileKeyRaw: Uint8Array;
+    contentKeyRaw: Uint8Array;
+    format: number;
     contentIv: string;
     compressed: boolean;
     unpaddedSize: number | null;
     chunkSize: number | null;
+    size: number | null;
     filename: string;
     port: MessagePort;
     expires: number;
@@ -28,16 +30,70 @@
   const ROUTE = '__download/';
   const JOB_TTL_MS = 60_000;
   const GCM_TAG = 16;
+  const FORMAT_LEGACY = 1;
+  const FORMAT_V2 = 2;
+  const enc = new TextEncoder();
+  const AAD_CONTENT_V2 = enc.encode('lethean|content|v2');
+  const AAD_CHUNK_V2 = enc.encode('lethean|chunk|v2|');
+
+  const CHUNK_SIZE_V2 = 32 * 1024 * 1024;
+  const PADDING_BUCKETS = [16, 64, 256, 1024, 4096, 16384, 65536, 262144, 1048576].map((k) => k * 1024);
+  const PADDING_STEP_BEYOND_MAX = 256 * 1024 * 1024;
+  function paddedSize(n: number): number {
+    for (const b of PADDING_BUCKETS) if (n <= b) return b;
+    return Math.ceil(n / PADDING_STEP_BEYOND_MAX) * PADDING_STEP_BEYOND_MAX;
+  }
+  const isSize = (v: unknown): v is number => typeof v === 'number' && Number.isSafeInteger(v) && v >= 0;
+  function assertZero(bytes: Uint8Array, from: number): void {
+    for (let i = from; i < bytes.length; i++) if (bytes[i] !== 0) throw new Error('File is corrupt (padding)');
+  }
+
+  function chunkAad(format: number, index: number, isLast: boolean): Uint8Array {
+    const head = format === FORMAT_V2 ? AAD_CHUNK_V2 : new Uint8Array(0);
+    const aad = new Uint8Array(head.length + 5);
+    aad.set(head, 0);
+    new DataView(aad.buffer).setUint32(head.length, index, false);
+    aad[head.length + 4] = isLast ? 1 : 0;
+    return aad;
+  }
   const jobs = new Map<string, Job>();
 
   scope.addEventListener('install', (e) => e.waitUntil(scope.skipWaiting()));
 
+  const TOKEN_RE = /^[0-9a-f]{32}$/;
+  let purgeTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function purgeExpired(): void {
+    const now = Date.now();
+    for (const [t, j] of jobs) if (j.expires <= now) jobs.delete(t);
+    if (purgeTimer) { clearTimeout(purgeTimer); purgeTimer = null; }
+    if (jobs.size) purgeTimer = setTimeout(purgeExpired, JOB_TTL_MS);
+  }
+
   scope.addEventListener('message', (e) => {
     const msg = e.data as { type?: string; token?: string; job?: Omit<Job, 'port' | 'expires'> };
-    if (msg?.type !== 'prepare' || !msg.token || !msg.job || !e.ports[0]) return;
-    const now = Date.now();
-    for (const [t, j] of jobs) if (j.expires < now) jobs.delete(t);
-    jobs.set(msg.token, { ...msg.job, port: e.ports[0], expires: now + JOB_TTL_MS });
+    if (msg?.type === 'cancel') {
+      if (typeof msg.token === 'string') jobs.delete(msg.token);
+      purgeExpired();
+      return;
+    }
+    if (msg?.type === 'clear') {
+      jobs.clear();
+      purgeExpired();
+      return;
+    }
+    if (msg?.type !== 'prepare' || typeof msg.token !== 'string' || !TOKEN_RE.test(msg.token) || !msg.job || !e.ports[0]) return;
+    if (msg.job.format !== FORMAT_LEGACY && msg.job.format !== FORMAT_V2) return;
+    if (!(msg.job.contentKeyRaw instanceof Uint8Array) || msg.job.contentKeyRaw.length !== 32) return;
+    if (msg.job.unpaddedSize != null && !isSize(msg.job.unpaddedSize)) return;
+    if (msg.job.chunkSize != null && (!isSize(msg.job.chunkSize) || msg.job.chunkSize === 0)) return;
+    if (msg.job.format === FORMAT_V2) {
+      if (!isSize(msg.job.size) || !isSize(msg.job.unpaddedSize)) return;
+      if (msg.job.chunkSize != null && (msg.job.chunkSize !== CHUNK_SIZE_V2 || msg.job.compressed || msg.job.unpaddedSize !== msg.job.size)) return;
+      if (msg.job.chunkSize == null && !msg.job.compressed && msg.job.unpaddedSize !== msg.job.size) return;
+    }
+    jobs.set(msg.token, { ...msg.job, port: e.ports[0], expires: Date.now() + JOB_TTL_MS });
+    purgeExpired();
     e.ports[0].postMessage({ type: 'ready' });
   });
 
@@ -49,8 +105,16 @@
     const job = jobs.get(token);
     if (!job) return;
     jobs.delete(token);
-    e.respondWith(serve(job));
+    if (job.expires <= Date.now()) return;
+    e.respondWith(serve(job).catch((err) => {
+      job.port.postMessage({ type: 'error', message: (err as Error)?.message || 'Download failed' });
+      return new Response(null, { status: 500 });
+    }));
   });
+
+  function wellFormed(s: string): string {
+    return String(s).replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '�');
+  }
 
   async function serve(job: Job): Promise<Response> {
     const { port } = job;
@@ -69,7 +133,7 @@
       return new Response(null, { status: res.status || 502 });
     }
 
-    const key = await crypto.subtle.importKey('raw', job.fileKeyRaw as unknown as BufferSource, 'AES-GCM', false, ['decrypt']);
+    const key = await crypto.subtle.importKey('raw', job.contentKeyRaw as unknown as BufferSource, 'AES-GCM', false, ['decrypt']);
     const plaintext = res.body.pipeThrough(job.chunkSize ? chunkedDecryptor(job, key) : wholeFileDecryptor(job, key));
 
     const reader = plaintext.getReader();
@@ -90,15 +154,17 @@
       },
     });
 
-    const ascii = job.filename.replace(/[^\x20-\x7e]|["\\]/g, '_');
+    const filename = wellFormed(job.filename || 'download');
+    const ascii = filename.replace(/[^\x20-\x7e]|["\\]/g, '_');
     const headers = new Headers({
       'Content-Type': 'application/octet-stream',
-      'Content-Disposition': `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(job.filename)}`,
+      'Content-Disposition': `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
       'Content-Security-Policy': "default-src 'none'; sandbox",
       'X-Content-Type-Options': 'nosniff',
       'Cache-Control': 'no-store',
     });
-    if (!job.compressed && job.unpaddedSize != null) headers.set('Content-Length', String(job.unpaddedSize));
+    if (job.format === FORMAT_V2 && job.size != null) headers.set('Content-Length', String(job.size));
+    else if (!job.compressed && job.unpaddedSize != null) headers.set('Content-Length', String(job.unpaddedSize));
     return new Response(body, { headers });
   }
 
@@ -121,17 +187,17 @@
       const iv = new Uint8Array(12);
       iv.set(prefix, 0);
       new DataView(iv.buffer).setUint32(8, index, false);
-      const aad = new Uint8Array(5);
-      new DataView(aad.buffer).setUint32(0, index, false);
-      aad[4] = index === count - 1 ? 1 : 0;
+      const aad = chunkAad(job.format, index, index === count - 1);
       let plain: Uint8Array;
       try {
         plain = new Uint8Array(await crypto.subtle.decrypt(
-          { name: 'AES-GCM', iv, additionalData: aad, tagLength: 128 }, key, buf as unknown as BufferSource));
+          { name: 'AES-GCM', iv, additionalData: aad as unknown as BufferSource, tagLength: 128 }, key, buf as unknown as BufferSource));
       } catch {
         throw new Error('File is corrupt or has been tampered with');
       }
-      controller.enqueue(plain.subarray(0, Math.min(chunkSize, total - index * chunkSize)));
+      const take = Math.min(chunkSize, total - index * chunkSize);
+      if (job.format === FORMAT_V2) assertZero(plain, take);
+      controller.enqueue(plain.subarray(0, take));
       index++;
       buf = new Uint8Array(sealedSize);
       filled = 0;
@@ -163,10 +229,36 @@
         parts.length = 0;
         let plain: Uint8Array;
         try {
-          plain = new Uint8Array(await crypto.subtle.decrypt(
-            { name: 'AES-GCM', iv: fromBase64(job.contentIv) as unknown as BufferSource, tagLength: 128 }, key, ct as unknown as BufferSource));
+          const params: AesGcmParams = { name: 'AES-GCM', iv: fromBase64(job.contentIv) as unknown as BufferSource, tagLength: 128 };
+          if (job.format === FORMAT_V2) params.additionalData = AAD_CONTENT_V2 as unknown as BufferSource;
+          plain = new Uint8Array(await crypto.subtle.decrypt(params, key, ct as unknown as BufferSource));
         } catch {
           throw new Error('File is corrupt or has been tampered with');
+        }
+        if (job.format === FORMAT_V2) {
+          const n = job.unpaddedSize!;
+          if (plain.length !== paddedSize(n)) throw new Error('File is corrupt (padding)');
+          assertZero(plain, n);
+          plain = plain.subarray(0, n);
+          if (job.compressed) {
+            const limit = job.size!;
+            const reader = new Blob([plain as unknown as BlobPart]).stream().pipeThrough(new DecompressionStream('gzip')).getReader();
+            let total = 0;
+            for (;;) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              total += value.length;
+              if (total > limit) {
+                await reader.cancel().catch(() => {});
+                throw new Error('File is corrupt (decompressed size mismatch)');
+              }
+              controller.enqueue(value);
+            }
+            if (total !== limit) throw new Error('File is corrupt (decompressed size mismatch)');
+            return;
+          }
+          controller.enqueue(plain);
+          return;
         }
         if (job.unpaddedSize != null && job.unpaddedSize <= plain.length) plain = plain.subarray(0, job.unpaddedSize);
         if (job.compressed) {

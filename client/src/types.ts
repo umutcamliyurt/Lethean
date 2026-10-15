@@ -9,6 +9,9 @@ export interface FileMeta {
   chunkSize?: number;
   isFolder?: boolean;
   parentId?: string | null;
+  size?: number;
+  pref?: string;
+  from?: string;
 }
 
 export interface FileRecord {

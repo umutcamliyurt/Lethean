@@ -2,16 +2,20 @@
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command as OsCommand;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+static DURESS_SESSION: AtomicBool = AtomicBool::new(false);
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use zeroize::Zeroize;
 
 use lethean_fuse_lib::api::{self, ApiClient};
-use lethean_fuse_lib::config::{Config, ConfigDuressCache};
+use lethean_fuse_lib::config::{self as cfg, Config, ConfigDuressCache};
 use lethean_fuse_lib::crypto::kdf;
 use lethean_fuse_lib::duress;
 use lethean_fuse_lib::fuse_fs;
+use lethean_fuse_lib::upgrade;
 use lethean_fuse_lib::vault::Vault;
 
 #[derive(Parser)]
@@ -48,6 +52,10 @@ enum Command {
     Usage,
     Tree,
     RotatePassword,
+    Upgrade {
+        #[arg(long)]
+        include_hidden: bool,
+    },
     Share {
         file_id: String,
         #[arg(long)]
@@ -154,7 +162,7 @@ fn unlock_session(cli: &Cli, config: &Config) -> Result<Vault> {
     }
 
     let api = ApiClient::new(server)?;
-    let _ = duress::check_and_signal(&api, access_token.as_deref(), &password, &ConfigDuressCache);
+    let duress_matched = duress::check_and_signal(&api, access_token.as_deref(), &password, &ConfigDuressCache);
 
     let unlocked = kdf::unlock_vault(&password, access_token.as_deref(), cli.kdf_version)?;
     password.zeroize();
@@ -164,9 +172,27 @@ fn unlock_session(cli: &Cli, config: &Config) -> Result<Vault> {
     api.set_access_token(access_token.clone());
 
     let vault = Vault::new(api, unlocked.wrapping_key_raw);
+    DURESS_SESSION.store(duress_matched, Ordering::Relaxed);
+    let track_legacy = !duress_matched;
+    if track_legacy && cfg::is_vault_legacy_free(&vault_id) {
+        vault.set_strict(true);
+    }
     eprintln!("Fetching file index…");
     vault.refresh_all().context("could not list vault files (wrong password/access token, or server unreachable?)")?;
     eprintln!("Loaded {} item(s).", vault.entry_count());
+    if track_legacy {
+        let legacy = vault.legacy_entries().len();
+        let hidden = vault.quarantined_count();
+        if !vault.is_strict() && legacy == 0 && hidden == 0 {
+            cfg::mark_vault_legacy_free(&vault_id);
+            vault.set_strict(true);
+        }
+        if hidden > 0 {
+            eprintln!("Note: {hidden} outdated item(s) were hidden because this vault has already been upgraded. They may be old copies restored by the server, or files uploaded by an outdated app. Run `lethean-fuse upgrade --include-hidden` to keep them.");
+        } else if legacy > 0 {
+            eprintln!("Note: {legacy} item(s) use an older, weaker format. Run `lethean-fuse upgrade` to re-encrypt them.");
+        }
+    }
     if duress::reconcile(&vault.api, &vault_id, access_token.as_deref(), &ConfigDuressCache) {
         eprintln!("Note: duress codes now sync across your devices. A code set only on this device before the update still works here; run `lethean-fuse duress set` to make one code work everywhere.");
     }
@@ -177,6 +203,7 @@ fn cmd_config(action: ConfigAction) -> Result<()> {
     let mut config = Config::load()?;
     match action {
         ConfigAction::SetServer { url } => {
+            api::check_server_url(&url)?;
             config.server_url = Some(url.trim_end_matches('/').to_string());
             config.save()?;
             println!("Saved server URL.");
@@ -326,11 +353,57 @@ fn cmd_rotate_password(cli: &Cli, config: &Config) -> Result<()> {
         bail!("new password must be different from the current one");
     }
 
+    let was_legacy_free = cfg::is_vault_legacy_free(&unlocked.vault_id);
     let files_moved = vault.rotate_password(&new_unlocked.vault_id, &new_unlocked.wrapping_key_raw)?;
+    if was_legacy_free {
+        cfg::mark_vault_legacy_free(&new_unlocked.vault_id);
+    }
     new_unlocked.wrapping_key_raw.zeroize();
     println!("Password changed. {files_moved} file(s) re-wrapped under the new key.");
     println!("(Remember: the vault password itself is never stored anywhere, only you know it.)");
     vault.close();
+    Ok(())
+}
+
+fn cmd_upgrade(cli: &Cli, config: &Config, include_hidden: bool) -> Result<()> {
+    let vault = unlock_session(cli, config)?;
+    let hidden = vault.quarantined_count();
+    if include_hidden && hidden > 0 {
+        vault.admit_quarantined();
+    }
+    let legacy = vault.legacy_entries().len();
+    if legacy == 0 {
+        println!("Everything in this vault already uses the current format.");
+        if hidden > 0 && !include_hidden {
+            println!("{hidden} hidden outdated item(s) were left as they are (pass --include-hidden to upgrade them).");
+        }
+        vault.close();
+        return Ok(());
+    }
+    eprintln!("Upgrading {legacy} item(s). Each is re-encrypted, uploaded, and checked before its old copy is deleted. Share links to upgraded items will stop working.");
+    let report = upgrade::upgrade_legacy_items(&vault, |done, total, name| {
+        if !name.is_empty() {
+            eprintln!("[{}/{}] {name}", (done + 1).min(total), total);
+        }
+    })?;
+    println!("Upgraded {} item(s).", report.upgraded);
+    for (name, err) in &report.failed {
+        eprintln!("- couldn't upgrade \"{name}\": {err}");
+    }
+    if report.folders_kept > 0 {
+        eprintln!("{} old folder(s) were kept because something inside couldn't be upgraded.", report.folders_kept);
+    }
+    let vault_id = vault.api.vault_id();
+    vault.refresh_all()?;
+    if !DURESS_SESSION.load(Ordering::Relaxed) && vault.legacy_entries().is_empty() && vault.quarantined_count() == 0 {
+        if let Some(id) = vault_id {
+            cfg::mark_vault_legacy_free(&id);
+        }
+    }
+    vault.close();
+    if !report.failed.is_empty() {
+        bail!("{} item(s) couldn't be upgraded; run `lethean-fuse upgrade` again to retry (nothing was deleted without a verified replacement)", report.failed.len());
+    }
     Ok(())
 }
 
@@ -456,6 +529,7 @@ fn main() -> Result<()> {
         Command::Usage => cmd_usage(&cli, &config),
         Command::Tree => cmd_tree(&cli, &config),
         Command::RotatePassword => cmd_rotate_password(&cli, &config),
+        Command::Upgrade { include_hidden } => cmd_upgrade(&cli, &config, include_hidden),
         Command::Share { ref file_id, max_downloads, expires_in_seconds, allow_delete } => cmd_share(&cli, &config, file_id.clone(), max_downloads, expires_in_seconds, allow_delete),
         Command::Unshare { ref file_id } => cmd_unshare(&cli, &config, file_id.clone()),
         Command::Duress { ref action } => cmd_duress(&cli, &config, action.clone()),

@@ -75,12 +75,16 @@ export function looksLikePdf(bytes: Uint8Array): boolean {
 }
 
 export function decryptedSize(record: FileRecord | undefined | null, meta: FileMeta | undefined | null): number {
+  if (typeof meta?.size === 'number') return meta.size;
   if (typeof meta?.unpaddedSize === 'number') return meta.unpaddedSize;
-  return record?.size ?? 0;
+  const size = Number(record?.size ?? 0);
+  return Number.isFinite(size) && size >= 0 ? size : 0;
 }
 
-export function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`;
+export function formatBytes(input: number): string {
+  let n = Number(input);
+  if (!Number.isFinite(n) || n < 0) n = 0;
+  if (n < 1024) return `${Math.round(n)} B`;
   const units = ['KB', 'MB', 'GB', 'TB'];
   let i = -1;
   do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);

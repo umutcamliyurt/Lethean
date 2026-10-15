@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::crypto::format::ParentRef;
+
 pub const FOLDER_MIME: &str = "application/x-lethean-folder";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -17,30 +19,66 @@ pub struct FileMeta {
     pub parent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chunk_size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
 }
 
 impl FileMeta {
-    pub fn new_file(name: String, mime: String, compressed: bool, unpadded_size: u64, parent_id: Option<String>) -> Self {
-        Self {
+    pub fn new_file(name: String, mime: String, compressed: bool, unpadded_size: u64, parent: Option<&ParentRef>) -> Self {
+        let mut meta = Self {
             name,
             mime,
             compressed,
             unpadded_size: Some(unpadded_size),
             is_folder: false,
-            parent_id,
+            parent_id: None,
             chunk_size: None,
-        }
+            size: None,
+            pref: None,
+            from: None,
+        };
+        meta.set_parent(parent);
+        meta
     }
 
-    pub fn new_folder(name: String, parent_id: Option<String>) -> Self {
-        Self {
+    pub fn new_folder(name: String, parent: Option<&ParentRef>) -> Self {
+        let mut meta = Self {
             name,
             mime: FOLDER_MIME.to_string(),
             compressed: false,
             unpadded_size: None,
             is_folder: true,
-            parent_id,
+            parent_id: None,
             chunk_size: None,
+            size: None,
+            pref: None,
+            from: None,
+        };
+        meta.set_parent(parent);
+        meta
+    }
+
+    pub fn set_parent(&mut self, parent: Option<&ParentRef>) {
+        self.parent_id = parent.map(|p| p.id.clone());
+        self.pref = parent.map(|p| p.node_ref.clone());
+    }
+
+    pub fn unreadable() -> Self {
+        Self {
+            name: "Unreadable item".to_string(),
+            mime: "application/octet-stream".to_string(),
+            compressed: false,
+            unpadded_size: None,
+            is_folder: false,
+            parent_id: None,
+            chunk_size: None,
+            size: None,
+            pref: None,
+            from: None,
         }
     }
 }

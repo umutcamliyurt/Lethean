@@ -85,6 +85,11 @@ export function setStoredTheme(id: string): void {
   localStorage.setItem(LS_THEME_KEY, id);
 }
 
+export interface VaultMarkers {
+  confirmed: string;
+  legacyFree: string;
+}
+
 function loadConfirmedMarkers(): string[] {
   try {
     const raw = localStorage.getItem(LS_CONFIRMED_MARKERS_KEY);
@@ -97,16 +102,34 @@ function loadConfirmedMarkers(): string[] {
   return [];
 }
 
-export function isVaultConfirmed(marker: string): boolean {
-  return loadConfirmedMarkers().includes(marker);
-}
-
-export function markVaultConfirmed(marker: string): void {
-  const markers = loadConfirmedMarkers();
-  if (markers.includes(marker)) return;
-  markers.push(marker);
+function saveConfirmedMarkers(markers: string[]): void {
   while (markers.length > MAX_CONFIRMED_MARKERS) markers.shift();
   localStorage.setItem(LS_CONFIRMED_MARKERS_KEY, JSON.stringify(markers));
+}
+
+export function isVaultConfirmed(m: VaultMarkers): boolean {
+  const markers = loadConfirmedMarkers();
+  return markers.includes(m.confirmed) || markers.includes(m.legacyFree);
+}
+
+export function markVaultConfirmed(m: VaultMarkers): void {
+  const markers = loadConfirmedMarkers();
+  if (markers.includes(m.confirmed) || markers.includes(m.legacyFree)) return;
+  markers.push(m.confirmed);
+  saveConfirmedMarkers(markers);
+}
+
+export function isVaultLegacyFree(m: VaultMarkers): boolean {
+  return loadConfirmedMarkers().includes(m.legacyFree);
+}
+
+export function markVaultLegacyFree(m: VaultMarkers): void {
+  const markers = loadConfirmedMarkers();
+  if (markers.includes(m.legacyFree)) return;
+  const i = markers.indexOf(m.confirmed);
+  if (i >= 0) markers[i] = m.legacyFree;
+  else markers.push(m.legacyFree);
+  saveConfirmedMarkers(markers);
 }
 
 export function forgetThisDevice(): void {

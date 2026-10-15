@@ -1,6 +1,7 @@
 import './theme.js';
 import { getShareRecord, shareBlobRequest, deleteSharedFile } from './api.js';
-import { fromBase64, decryptMetadata } from './crypto-encrypt-core.js';
+import { fileKeyFromShareParams, decryptMetadata } from './crypto-encrypt-core.js';
+import type { FileKey } from './crypto-encrypt-core.js';
 import { downloadDecrypted } from './save-stream.js';
 import type { FileMeta, ShareRecord } from './types.js';
 
@@ -82,31 +83,44 @@ function decodeIfStillEncoded(value: string): string {
   }
 }
 
-function parseFragment(): { token: string | null; keyB64: string | null; deleteToken: string | null } {
+interface ShareFragment {
+  token: string | null;
+  keyB64: string | null;
+  version: string | null;
+  bindingB64: string | null;
+  deleteToken: string | null;
+}
+
+function parseFragment(): ShareFragment {
   const raw = window.location.hash.replace(/^#/, '');
   const params = new URLSearchParams(raw);
-  const token = params.get('t');
-  const keyB64 = params.get('k');
-  const deleteToken = params.get('d');
+  const get = (name: string): string | null => {
+    const value = params.get(name);
+    return value !== null ? decodeIfStillEncoded(value) : null;
+  };
   return {
-    token: token !== null ? decodeIfStillEncoded(token) : null,
-    keyB64: keyB64 !== null ? decodeIfStillEncoded(keyB64) : null,
-    deleteToken: deleteToken !== null ? decodeIfStillEncoded(deleteToken) : null,
+    token: get('t'),
+    keyB64: get('k'),
+    version: get('v'),
+    bindingB64: get('b'),
+    deleteToken: get('d'),
   };
 }
 
 async function init(): Promise<void> {
-  const { token, keyB64, deleteToken } = parseFragment();
+  const { token, keyB64, version, bindingB64, deleteToken } = parseFragment();
   if (!token || !keyB64) {
     showFailure("This link is missing information it needs and can't be used.");
     return;
   }
 
-  let fileKeyRaw: Uint8Array;
+  let fileKey: FileKey;
   try {
-    fileKeyRaw = fromBase64(keyB64);
-  } catch {
-    showFailure('This link is malformed.');
+    fileKey = fileKeyFromShareParams(keyB64, version, bindingB64);
+  } catch (err) {
+    showFailure((err as Error).message === 'This share link needs a newer version of the app'
+      ? 'This link needs a newer version of this app.'
+      : 'This link is malformed.');
     return;
   }
 
@@ -114,7 +128,7 @@ async function init(): Promise<void> {
   let meta: FileMeta;
   try {
     record = await getShareRecord(token);
-    meta = await decryptMetadata(fileKeyRaw, record.encrypted_metadata, record.metadata_iv);
+    meta = await decryptMetadata(fileKey, record.encrypted_metadata, record.metadata_iv);
   } catch {
     showFailure('This link is invalid, has expired, or has nothing left to offer.');
     return;
@@ -123,7 +137,8 @@ async function init(): Promise<void> {
   statusEl.classList.add('hidden');
   bodyEl.classList.remove('hidden');
   filenameEl.textContent = meta.name;
-  const sizeLabel = typeof meta.unpaddedSize === 'number' ? formatBytes(meta.unpaddedSize) : '';
+  const trueSize = typeof meta.size === 'number' ? meta.size : meta.unpaddedSize;
+  const sizeLabel = typeof trueSize === 'number' ? formatBytes(trueSize) : '';
 
   const downloadsRemaining = () => record.max_downloads - record.downloads_used;
 
@@ -152,7 +167,7 @@ async function init(): Promise<void> {
     try {
       const saved = await downloadDecrypted({
         request: shareBlobRequest(token),
-        fileKeyRaw,
+        fileKey,
         contentIv: record.content_iv,
         meta,
       });

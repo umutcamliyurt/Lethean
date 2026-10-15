@@ -6,14 +6,15 @@ import {
   selectToggleBtn, selectionBarEl, selectionCountEl, selectionSelectAllBtn,
   selectionDownloadBtn, selectionMoveBtn, selectionDeleteBtn, selectionCancelBtn,
 } from './dom.js';
-import { fileKeyCache, metaCache, objectUrlCache, getWrappingKeyRaw } from './state.js';
+import { fileKeyCache, metaCache, objectUrlCache, getWrappingKeyRaw, getCurrentVaultId } from './state.js';
 import { acquireThumbnail, releaseThumbnail, dropThumbnail, clearThumbnails } from './thumbnails.js';
-import { getStoredViewMode, setStoredViewMode } from './storage.js';
+import { getStoredViewMode, setStoredViewMode, isVaultLegacyFree, markVaultLegacyFree } from './storage.js';
 import { fileKind, fileTypeLabel, formatBytes, decryptedSize, icon, showToast, isCoarsePointerDevice } from './utils.js';
 import { openTile, downloadAndSave } from './lightbox.js';
 import { shareFile } from './share.js';
 import { openMovePicker } from './move.js';
 import type { FileMeta, FileRecord, UsageResponse, ViewMode } from './types.js';
+import { rememberFileKey, forgetFileKey, effectiveParentId, parentRefFor } from './tree.js';
 
 let viewMode: ViewMode = getStoredViewMode();
 
@@ -178,7 +179,7 @@ async function deleteIds(ids: string[]): Promise<void> {
       await api.deleteFile(id);
       if (objectUrlCache.has(id)) { URL.revokeObjectURL(objectUrlCache.get(id)!); objectUrlCache.delete(id); }
       dropThumbnail(id);
-      fileKeyCache.delete(id);
+      forgetFileKey(id);
       metaCache.delete(id);
     } catch {
       failed++;
@@ -214,24 +215,32 @@ function isDescendantOf(id: string, ancestorId: string): boolean {
 }
 
 async function moveOneRecord(oldId: string, newParentId: string | null): Promise<string> {
-  const fileKeyRaw = fileKeyCache.get(oldId);
+  const oldFileKey = fileKeyCache.get(oldId);
   const meta = metaCache.get(oldId);
   const record = records.find((r) => r.id === oldId);
-  if (!fileKeyRaw || !meta || !record) {
+  const wrappingKeyRaw = getWrappingKeyRaw();
+  if (!oldFileKey || !meta || !record || !wrappingKeyRaw) {
     throw new Error(`"${meta?.name ?? oldId}" isn't fully loaded yet — wait for the gallery to finish loading and try again.`);
   }
 
   const { stream } = await api.openDownloadStream(oldId);
   const ciphertextBlob = await C.streamToBlob(stream);
-  const updatedMeta: FileMeta = { ...meta, parentId: newParentId };
-  const { encryptedMetadata, metadataIv } = await C.encryptMetadata(fileKeyRaw, updatedMeta);
+  const { parentId: _oldParentId, pref: _oldPref, ...rest } = meta;
+  const updatedMeta: FileMeta = oldFileKey.format === C.FILE_FORMAT_V2
+    ? { ...rest, ...C.parentFields(parentRefFor(newParentId)) }
+    : { ...rest, parentId: newParentId };
+
+  const fileKey = C.rebindFileKey(oldFileKey);
+  const { encryptedMetadata, metadataIv } = await C.encryptMetadata(fileKey, updatedMeta);
+  const wrap = fileKey === oldFileKey
+    ? { wrappedFileKey: record.wrapped_file_key, wrapIv: record.wrap_iv }
+    : await C.wrapFileKey(wrappingKeyRaw, fileKey);
 
   const fields = {
     contentIv: record.content_iv,
     encryptedMetadata,
     metadataIv,
-    wrappedFileKey: record.wrapped_file_key,
-    wrapIv: record.wrap_iv,
+    ...wrap,
   };
   const newRecord = await api.uploadFile(
     ciphertextBlob.size <= api.SINGLE_UPLOAD_MAX_BYTES
@@ -243,10 +252,10 @@ async function moveOneRecord(oldId: string, newParentId: string | null): Promise
 
   if (objectUrlCache.has(oldId)) { URL.revokeObjectURL(objectUrlCache.get(oldId)!); objectUrlCache.delete(oldId); }
   dropThumbnail(oldId);
-  fileKeyCache.delete(oldId);
+  forgetFileKey(oldId);
   metaCache.delete(oldId);
-  fileKeyCache.set(newRecord.id, fileKeyRaw);
   metaCache.set(newRecord.id, updatedMeta);
+  await rememberFileKey(newRecord.id, fileKey);
   records = records.filter((r) => r.id !== oldId);
   records.push(newRecord);
 
@@ -311,8 +320,7 @@ export function getCurrentFolderId(): string | null {
 }
 
 function parentIdOf(recordId: string): string | null {
-  const meta = metaCache.get(recordId);
-  return (meta?.parentId as string | null | undefined) ?? null;
+  return effectiveParentId(recordId);
 }
 
 export function navigateToFolder(folderId: string | null): void {
@@ -330,6 +338,10 @@ export function getRecords(): FileRecord[] {
 
 export function resetRecords(): void {
   records = [];
+  quarantined = [];
+  strictMode = false;
+  legacyFreeMarker = null;
+  legacyNoticeShown = false;
   currentFolderId = null;
 }
 
@@ -352,8 +364,13 @@ export function clearRenderedGrid(): void {
 
 export async function refreshGallery(): Promise<void> {
   records = [];
+  quarantined = [];
   pageOffset = 0;
   hasMorePages = true;
+  loadFailed = false;
+  const vaultId = getCurrentVaultId();
+  legacyFreeMarker = vaultId ? await C.deriveVaultMarkers(vaultId) : null;
+  strictMode = legacyFreeMarker !== null && isVaultLegacyFree(legacyFreeMarker);
   try {
     const usage = await api.getUsage();
     updateUsagePill(usage);
@@ -362,14 +379,102 @@ export async function refreshGallery(): Promise<void> {
   }
   renderCurrentView();
   await loadAllPages();
+  settleLegacyState();
+}
+
+let quarantined: FileRecord[] = [];
+let loadFailed = false;
+let strictMode = false;
+let legacyFreeMarker: { confirmed: string; legacyFree: string } | null = null;
+let legacyNoticeShown = false;
+
+function settleLegacyState(): void {
+  if (loadFailed || !legacyFreeMarker) return;
+  const legacyCount = legacyRecords().length;
+  if (!strictMode && legacyCount === 0 && quarantined.length === 0) {
+    markVaultLegacyFree(legacyFreeMarker);
+    strictMode = true;
+  }
+  if (legacyNoticeShown) return;
+  if (quarantined.length) {
+    legacyNoticeShown = true;
+    showToast(`${quarantined.length} outdated item${quarantined.length === 1 ? ' was' : 's were'} hidden because this vault has already been upgraded. Review in Settings \u2192 Upgrade Vault.`, 'error');
+  } else if (legacyCount) {
+    legacyNoticeShown = true;
+    showToast(`${legacyCount} item${legacyCount === 1 ? ' uses' : 's use'} an older, weaker format. Upgrade in Settings \u2192 Upgrade Vault.`);
+  }
+}
+
+export function recheckLegacyState(): void {
+  settleLegacyState();
+}
+
+export function isStrictMode(): boolean {
+  return strictMode;
+}
+
+export function isFullyLoaded(): boolean {
+  return !hasMorePages && !loadFailed && !isLoadingPage;
+}
+
+export function legacyRecords(): FileRecord[] {
+  return records.filter((r) => fileKeyCache.get(r.id)?.format === C.FILE_FORMAT_LEGACY);
+}
+
+export function getQuarantined(): FileRecord[] {
+  return quarantined.slice();
+}
+
+export function getRecordsForRotation(): FileRecord[] {
+  return records.concat(quarantined);
+}
+
+export async function admitQuarantined(): Promise<void> {
+  const admitted: FileRecord[] = [];
+  for (const record of quarantined) {
+    const fileKey = fileKeyCache.get(record.id);
+    if (!fileKey) continue;
+    try {
+      metaCache.set(record.id, await C.decryptMetadata(fileKey, record.encrypted_metadata, record.metadata_iv));
+    } catch {
+      metaCache.set(record.id, { name: 'Unreadable item', mime: 'application/octet-stream' });
+    }
+    admitted.push(record);
+  }
+  quarantined = quarantined.filter((r) => !admitted.includes(r));
+  records = records.concat(admitted);
+  renderCurrentView();
+}
+
+export async function ensureFullyLoaded(): Promise<boolean> {
+  while (isLoadingPage) await new Promise((r) => setTimeout(r, 50));
+  if (loadFailed) await refreshGallery();
+  else if (hasMorePages) await loadAllPages();
+  return !hasMorePages && !loadFailed;
+}
+
+export async function relocateRecord(id: string, newParentId: string | null): Promise<string> {
+  const newId = await moveOneRecord(id, newParentId);
+  const legacyChildren = records.filter((r) => fileKeyCache.get(r.id)?.format === C.FILE_FORMAT_LEGACY && parentIdOf(r.id) === id);
+  for (const child of legacyChildren) await relocateRecord(child.id, newId);
+  return newId;
+}
+
+export async function deleteRecord(id: string): Promise<void> {
+  await api.deleteFile(id);
+  removeRecordLocally(id);
+}
+
+export function rerender(): void {
+  renderCurrentView();
 }
 
 export async function addUploadedRecord(record: FileRecord): Promise<void> {
   if (!fileKeyCache.has(record.id)) {
     try {
-      const fileKeyRaw = await C.unwrapFileKey(getWrappingKeyRaw()!, record.wrapped_file_key, record.wrap_iv);
-      fileKeyCache.set(record.id, fileKeyRaw);
-      const meta = await C.decryptMetadata(fileKeyRaw, record.encrypted_metadata, record.metadata_iv);
+      const fileKey = await C.unwrapFileKey(getWrappingKeyRaw()!, record.wrapped_file_key, record.wrap_iv);
+      await rememberFileKey(record.id, fileKey);
+      const meta = await C.decryptMetadata(fileKey, record.encrypted_metadata, record.metadata_iv);
       metaCache.set(record.id, meta);
     } catch {
       metaCache.set(record.id, { name: 'Unreadable item', mime: 'application/octet-stream' });
@@ -442,23 +547,34 @@ async function loadNextPage(): Promise<void> {
   gridSentinel.textContent = 'Loading\u2026';
   try {
     const page = await api.listFiles({ offset: pageOffset, limit: PAGE_SIZE });
-    const known = new Set(records.map((r) => r.id));
-    const fresh = page.filter((r) => !known.has(r.id));
+    const known = new Set(records.map((r) => r.id).concat(quarantined.map((r) => r.id)));
+    const listed = page.filter((r) => !known.has(r.id));
 
-    if (page.length < PAGE_SIZE || fresh.length === 0) hasMorePages = false;
+    if (page.length < PAGE_SIZE || listed.length === 0) hasMorePages = false;
     pageOffset += page.length || PAGE_SIZE;
 
-    await Promise.all(fresh.map(async (record) => {
-      if (fileKeyCache.has(record.id)) return;
+    const refused = new Set<string>();
+    await Promise.all(listed.map(async (record) => {
+      let fileKey = fileKeyCache.get(record.id);
       try {
-        const fileKeyRaw = await C.unwrapFileKey(getWrappingKeyRaw()!, record.wrapped_file_key, record.wrap_iv);
-        fileKeyCache.set(record.id, fileKeyRaw);
-        const meta = await C.decryptMetadata(fileKeyRaw, record.encrypted_metadata, record.metadata_iv);
-        metaCache.set(record.id, meta);
+        if (!fileKey) {
+          fileKey = await C.unwrapFileKey(getWrappingKeyRaw()!, record.wrapped_file_key, record.wrap_iv);
+          await rememberFileKey(record.id, fileKey);
+        }
+        if (strictMode && fileKey.format === C.FILE_FORMAT_LEGACY) {
+          metaCache.delete(record.id);
+          refused.add(record.id);
+          return;
+        }
+        if (!metaCache.has(record.id)) {
+          metaCache.set(record.id, await C.decryptMetadata(fileKey, record.encrypted_metadata, record.metadata_iv));
+        }
       } catch {
         metaCache.set(record.id, { name: 'Unreadable item', mime: 'application/octet-stream' });
       }
     }));
+    quarantined = quarantined.concat(listed.filter((r) => refused.has(r.id)));
+    const fresh = listed.filter((r) => !refused.has(r.id));
 
     const isFirstPage = records.length === 0;
     records = records.concat(fresh);
@@ -471,6 +587,7 @@ async function loadNextPage(): Promise<void> {
   } catch (err) {
     showToast((err as Error).message, 'error');
     hasMorePages = false;
+    loadFailed = true;
   } finally {
     isLoadingPage = false;
     gridSentinel.classList.toggle('hidden', !hasMorePages);
@@ -892,18 +1009,18 @@ function openItemContextMenu(e: MouseEvent, record: FileRecord, anchor: HTMLElem
 }
 
 export async function getDecryptedBytes(record: FileRecord, signal?: AbortSignal): Promise<Uint8Array> {
-  const fileKeyRaw = fileKeyCache.get(record.id)!;
+  const fileKey = fileKeyCache.get(record.id)!;
   const ciphertext = await api.downloadContent(record.id, undefined, signal);
   signal?.throwIfAborted();
   const meta = metaCache.get(record.id)!;
-  return C.decryptContent(fileKeyRaw, record.content_iv, ciphertext, meta.compressed, meta.unpaddedSize ?? null, meta.chunkSize ?? null);
+  return C.decryptContent(fileKey, record.content_iv, ciphertext, meta);
 }
 
 export async function getDecryptedBlob(record: FileRecord, signal?: AbortSignal): Promise<Blob> {
-  const fileKeyRaw = fileKeyCache.get(record.id)!;
+  const fileKey = fileKeyCache.get(record.id)!;
   const meta = metaCache.get(record.id)!;
   const { stream } = await api.openDownloadStream(record.id, undefined, signal);
-  return C.streamToBlob(C.decryptToStream(fileKeyRaw, record.content_iv, stream, meta), meta.mime);
+  return C.streamToBlob(C.decryptToStream(fileKey, record.content_iv, stream, meta), meta.mime);
 }
 
 export async function getDecryptedUrl(record: FileRecord, signal?: AbortSignal): Promise<string> {
@@ -941,7 +1058,7 @@ export async function createFolder(name: string): Promise<void> {
   const wrappingKeyRaw = getWrappingKeyRaw();
   if (!wrappingKeyRaw) return;
   try {
-    const payload = await C.encryptFolder(wrappingKeyRaw, trimmed, currentFolderId);
+    const payload = await C.encryptFolder(wrappingKeyRaw, trimmed, parentRefFor(currentFolderId));
     await api.uploadFile(payload);
     await refreshGallery();
     showToast('Folder created.');
@@ -953,7 +1070,7 @@ export async function createFolder(name: string): Promise<void> {
 export function removeRecordLocally(fileId: string): void {
   if (objectUrlCache.has(fileId)) { URL.revokeObjectURL(objectUrlCache.get(fileId)!); objectUrlCache.delete(fileId); }
   dropThumbnail(fileId);
-  fileKeyCache.delete(fileId);
+  forgetFileKey(fileId);
   metaCache.delete(fileId);
   records = records.filter((r) => r.id !== fileId);
   renderCurrentView();
@@ -977,7 +1094,7 @@ export async function handleDelete(fileId: string): Promise<boolean> {
       await api.deleteFile(id);
       if (objectUrlCache.has(id)) { URL.revokeObjectURL(objectUrlCache.get(id)!); objectUrlCache.delete(id); }
       dropThumbnail(id);
-      fileKeyCache.delete(id);
+      forgetFileKey(id);
       metaCache.delete(id);
     }
     const removed = new Set(idsToDelete);

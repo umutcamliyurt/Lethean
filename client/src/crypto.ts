@@ -24,7 +24,15 @@ export {
   decryptMetadata,
   encryptMetadata,
   unwrapFileKey,
+  wrapFileKey,
+  rebindFileKey,
+  parentFields,
+  nodeRef,
+  toContentKey,
+  FILE_FORMAT_LEGACY,
+  FILE_FORMAT_V2,
 } from './crypto-encrypt-core.js';
+export type { FileKey, FileFormat } from './crypto-encrypt-core.js';
 
 interface Argon2Params {
   parallelism: number;
@@ -42,7 +50,9 @@ export const CURRENT_KDF_VERSION = 2;
 export const DEFAULT_LEGACY_KDF_VERSION = 1;
 
 function resolveKdfParams(kdfVersion: number): Argon2Params {
-  const params = KDF_PARAMS[kdfVersion];
+  const params = Number.isSafeInteger(kdfVersion) && Object.prototype.hasOwnProperty.call(KDF_PARAMS, kdfVersion)
+    ? KDF_PARAMS[kdfVersion]
+    : undefined;
   if (!params) throw new Error(`Unknown KDF version: ${kdfVersion}. This vault may need a client update.`);
   return params;
 }
@@ -99,6 +109,15 @@ export async function deriveWrappingKey(masterKeyBytes: Uint8Array): Promise<Uin
 export async function deriveConfirmMarker(vaultId: string): Promise<string> {
   const bytes = await crypto.subtle.digest('SHA-256', asBufferSource(utf8('e2ee-vault|confirmed-marker|v1|' + vaultId)));
   return toHex(new Uint8Array(bytes));
+}
+
+export async function deriveLegacyFreeMarker(vaultId: string): Promise<string> {
+  const bytes = await crypto.subtle.digest('SHA-256', asBufferSource(utf8('e2ee-vault|legacy-free-marker|v1|' + vaultId)));
+  return toHex(new Uint8Array(bytes));
+}
+
+export async function deriveVaultMarkers(vaultId: string): Promise<{ confirmed: string; legacyFree: string }> {
+  return { confirmed: await deriveConfirmMarker(vaultId), legacyFree: await deriveLegacyFreeMarker(vaultId) };
 }
 
 export async function unlockVault(

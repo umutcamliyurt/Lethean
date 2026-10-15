@@ -1,9 +1,9 @@
 import type {
   ChunkedFilePayload, DuressConfig, EncryptedFilePayload, FileRecord, ProgressCallback, UsageResponse, ShareCreateResponse, ShareRecord,
 } from './types.js';
-import { isTauri, resolveBaseUrl } from './platform.js';
+import { isTauri, resolveBaseUrl, isLocalDevPage } from './platform.js';
 
-const isLocalDev = window.location.port === '5500';
+const isLocalDev = isLocalDevPage();
 const BASE_URL = resolveBaseUrl();
 
 if (!isLocalDev && !isTauri() && window.isSecureContext !== true) {
@@ -187,6 +187,7 @@ export async function uploadFile(
   const totalBytes = payload.totalSize;
 
   let received = new Set<number>();
+  if (payload.uploadId && !isSafeUploadId(payload.uploadId)) payload.uploadId = undefined;
   if (payload.uploadId) {
     try {
       const st = await sendXhr({ method: 'GET', url: `${BASE_URL}/files/uploads/${payload.uploadId}`, ...common });
@@ -220,7 +221,9 @@ export async function uploadFile(
 
       return uploadSingleRequest(payload, onProgress, common);
     }
-    payload.uploadId = (JSON.parse(init.responseText) as { upload_id: string }).upload_id;
+    const uploadId = (JSON.parse(init.responseText) as { upload_id: unknown }).upload_id;
+    if (!isSafeUploadId(uploadId)) throw new Error('Server returned an invalid upload id');
+    payload.uploadId = uploadId;
   }
 
   let doneBytes = 0;
@@ -299,8 +302,12 @@ export function ciphertextBlobAsParts(
 
 export const SINGLE_UPLOAD_MAX_BYTES = SINGLE_REQUEST_MAX_BYTES;
 
+function isSafeUploadId(id: unknown): id is string {
+  return typeof id === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(id);
+}
+
 export async function abortUpload(uploadId: string): Promise<void> {
-  if (!/^[A-Za-z0-9_-]{1,128}$/.test(uploadId)) return;
+  if (!isSafeUploadId(uploadId)) return;
   try {
     await privateFetch(`${BASE_URL}/files/uploads/${uploadId}`, { method: 'DELETE', headers: authHeaders(), credentials: 'omit' });
   } catch {

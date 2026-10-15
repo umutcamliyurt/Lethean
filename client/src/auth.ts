@@ -16,7 +16,9 @@ import {
   getStoredKdfVersion, setStoredKdfVersion,
   forgetThisDevice,
 } from './storage.js';
-import { isTauri, openExternal } from './platform.js';
+import { isTauri, openExternal, isAllowedServerUrl } from './platform.js';
+import { clearDownloadWorkerJobs } from './save-stream.js';
+import { clearFileKeys } from './tree.js';
 import { rotateVaultPassword, rotateVaultAccessToken } from './vault-rotate.js';
 import { THEMES, getTheme, applyTheme } from './theme.js';
 import type { ThemeDef } from './theme.js';
@@ -38,9 +40,17 @@ accessTokenInput.addEventListener('change', () => prefetchDuress(accessTokenInpu
 if (isTauri()) {
   serverUrlField.classList.remove('hidden');
   serverUrlInput.value = getStoredServerUrl();
+  if (serverUrlInput.value && !isAllowedServerUrl(serverUrlInput.value)) {
+    setTimeout(() => showToast('The saved server URL is not HTTPS and will not be used. Enter an https:// URL.', 'error'), 0);
+  }
   serverUrlInput.addEventListener('change', () => {
     const next = serverUrlInput.value.trim();
     if (next === getStoredServerUrl()) return;
+    if (next && !isAllowedServerUrl(next)) {
+      showToast('The server URL must start with https:// (plain http is only allowed for localhost).', 'error');
+      serverUrlInput.value = getStoredServerUrl();
+      return;
+    }
     setStoredServerUrl(next);
     showToast('Server URL saved. Reloading…');
     setTimeout(() => window.location.reload(), 600);
@@ -84,7 +94,7 @@ interface PendingConfirmation {
   vaultId: string;
   wrappingKeyRaw: Uint8Array;
   password: string;
-  marker: string;
+  marker: { confirmed: string; legacyFree: string };
 }
 
 let pendingConfirmation: PendingConfirmation | null = null;
@@ -125,7 +135,7 @@ authForm.addEventListener('submit', async (e) => {
       const existing = await resolveExistingVault(password, accessToken);
       if (existing) {
         await checkDuressAndMaybeWipe(password);
-        markVaultConfirmed(await C.deriveConfirmMarker(existing.vaultId));
+        markVaultConfirmed(await C.deriveVaultMarkers(existing.vaultId));
         markSetupComplete();
         setStoredKdfVersion(existing.kdfVersion);
         isFirstRun = false;
@@ -144,7 +154,7 @@ authForm.addEventListener('submit', async (e) => {
       const kdfVersion = C.CURRENT_KDF_VERSION;
       const { vaultId, wrappingKeyRaw: wk } = await C.unlockVault(password, accessToken, kdfVersion);
       await checkDuressAndMaybeWipe(password);
-      markVaultConfirmed(await C.deriveConfirmMarker(vaultId));
+      markVaultConfirmed(await C.deriveVaultMarkers(vaultId));
       markSetupComplete();
       setStoredKdfVersion(kdfVersion);
       isFirstRun = false;
@@ -169,13 +179,13 @@ authForm.addEventListener('submit', async (e) => {
     setAuthStatus('Deriving key…', { spinning: true });
     const { vaultId, wrappingKeyRaw: wk } = await C.unlockVault(password, accessToken, kdfVersion);
     await checkDuressAndMaybeWipe(password);
-    const marker = await C.deriveConfirmMarker(vaultId);
+    const marker = await C.deriveVaultMarkers(vaultId);
 
     if (!isVaultConfirmed(marker)) {
       setAuthStatus('Checking for an existing vault…', { spinning: true });
       const existing = await resolveExistingVault(password, accessToken);
       if (existing) {
-        markVaultConfirmed(await C.deriveConfirmMarker(existing.vaultId));
+        markVaultConfirmed(await C.deriveVaultMarkers(existing.vaultId));
         setStoredKdfVersion(existing.kdfVersion);
         await finishUnlock(existing.vaultId, existing.wrappingKeyRaw);
         return;
@@ -251,7 +261,7 @@ async function finishUnlock(vaultId: string, wk: Uint8Array): Promise<void> {
 }
 
 async function enterApp(): Promise<void> {
-  fileKeyCache.clear();
+  clearFileKeys();
   metaCache.clear();
   clearRenderedGrid();
 
@@ -268,9 +278,11 @@ async function enterApp(): Promise<void> {
 }
 
 function leaveApp(): void {
+  closeLightbox();
+  void clearDownloadWorkerJobs();
   setWrappingKeyRaw(null);
   setCurrentVaultId(null);
-  fileKeyCache.clear();
+  clearFileKeys();
   metaCache.clear();
   clearRenderedGrid();
   resetRecords();
@@ -460,7 +472,7 @@ function openChangePasswordPanel(): void {
       setCurrentVaultId(result.vaultId);
       api.setVaultId(result.vaultId);
       setStoredKdfVersion(result.kdfVersion);
-      markVaultConfirmed(await C.deriveConfirmMarker(result.vaultId));
+      markVaultConfirmed(await C.deriveVaultMarkers(result.vaultId));
 
       closeLightbox();
       showToast(`Password changed (${result.filesMoved} item${result.filesMoved === 1 ? '' : 's'} moved). Reloading your files…`);
@@ -568,7 +580,7 @@ function openTokenPanel(): void {
       setStoredAccessToken(newToken);
       api.setAccessToken(newToken);
       accessTokenInput.value = newToken;
-      markVaultConfirmed(await C.deriveConfirmMarker(result.vaultId));
+      markVaultConfirmed(await C.deriveVaultMarkers(result.vaultId));
       try {
         await moveDuressToToken(duressBlob, result.vaultId, newToken);
       } catch {
@@ -674,7 +686,7 @@ function openDuressPanel(): void {
       showToast("Couldn't save the Duress Code. Nothing was changed. " + (err as Error).message, 'error');
       return;
     }
-    markVaultConfirmed(await C.deriveConfirmMarker(pinVaultId));
+    markVaultConfirmed(await C.deriveVaultMarkers(pinVaultId));
     showToast(scope === 'all-devices'
       ? 'Duress Code saved. It now works on all your devices.'
       : "Duress Code saved on this device. This server doesn't sync it yet; it will spread to your other devices once the server is updated.");

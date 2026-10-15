@@ -17,7 +17,7 @@ content, file name, or any key capable of independent decryption.
 | 3a | Vault ID | Master key | HKDF-SHA256, label `vault-id` | Sent to server (bearer credential) |
 | 3b | Wrapping key | Master key | HKDF-SHA256, label `wrap` | Client-side only, never transmitted |
 | 4 | Per-file key | Random (CSPRNG) | Generated fresh per file/folder | Wrapped under 3b before leaving client |
-| 5 | File content / metadata | Per-file key | AES-256-GCM | Encrypted under 4, stored server-side |
+| 5 | File content / metadata | Per-file key | AES-256-GCM; format 2 uses HKDF sub-keys (§4.1) | Encrypted under 4, stored server-side |
 
 Each row's output is the next row's input except row 4, which is
 independent randomness rather than a derivation; it is only *protected*
@@ -66,10 +66,10 @@ AES-256-GCM, used uniformly for key-wrapping, metadata, and content:
   small-file content, duress blobs) uses a fresh CSPRNG nonce. Chunked
   content (§6) uses a per-file random prefix plus a chunk counter, so
   nonces never repeat across chunks or files.
-- No AAD for single-message encryption; binding of ciphertext to record
-  is structural: a ciphertext is only ever decrypted with the key resolved
-  for its own record. Chunked content binds each chunk's position and
-  "last chunk" flag as AAD (§6).
+- AAD: format-2 metadata, content and chunks each carry a distinct label
+  (§4.1). Chunks also bind their position and "last chunk" flag (§6).
+  Wrapped keys, duress blobs and legacy-format metadata and single-message
+  content use no AAD.
 - Decryption failures (bad key, tampering, truncation) return one generic
   error, denying an attacker a distinguishing oracle.
 
@@ -94,6 +94,67 @@ Rationale for per-file keys over direct use of the wrapping key:
    only; content and metadata, which dominate storage, are untouched (§8).
 2. **Blast-radius containment**: no single key decrypts more than one
    file; the wrapping key never touches content directly.
+
+### 4.1 File formats
+
+New items use **format 2**. The wrapped plaintext is
+`"LTH2" || file_key (32) || binding (16)`, where `binding` is random per
+record revision (§9). The file key itself never encrypts anything:
+
+| Use | Key | AAD |
+|---|---|---|
+| Metadata | `HKDF(file_key, "lethean\|file-metadata\|v2")` | `"lethean\|metadata\|v2\|" \|\| binding` |
+| Content | `HKDF(file_key, "lethean\|file-content\|v2")` | `"lethean\|content\|v2"`, or the chunk AAD (§6) |
+| Node reference | first 16 bytes of `HKDF(file_key, "lethean\|node-ref\|v2")` | n/a |
+
+HKDF is HKDF-SHA256 with an empty salt. Metadata and content therefore
+can't be substituted for each other, or paired with another record's or
+revision's wrap.
+
+**Format selection.** The format comes only from the unwrapped plaintext,
+which the wrapping key authenticates: 32 bytes is legacy, 52 bytes
+starting with `"LTH2"` is format 2, anything else is rejected. Share
+links carry it in the fragment (§10). Nothing is ever encrypted under a
+format-2 key's raw bytes or with keys derived from a legacy key, so
+reading a file in the other format fails authentication.
+
+**Folders.** A format-2 item names its parent folder by the folder's node
+reference (`pref`), not only by its server-assigned record ID, and
+clients resolve its location from `pref`. If no folder matches, the item
+is hidden rather than misplaced.
+
+**Canonical form.** Clients reject format-2 data they wouldn't write:
+
+- metadata failing the schema (field types, `size` = true size,
+  `chunkSize` exactly 32 MiB, `pref` present exactly when `parentId` is)
+- padding that isn't the exact bucket or isn't zero-filled
+- compressed content that doesn't inflate to exactly `size` (inflation
+  stops at `size`)
+
+**Legacy (format 1).** The wrapped plaintext is the bare file key, which
+encrypts metadata and content directly. A server can serve a legacy
+file's metadata as its content, and can move legacy items between folders
+by changing record IDs. Clients that predate format 2 reject format-2
+keys and show those items as unreadable.
+
+### 4.2 Upgrading legacy items
+
+"Upgrade Vault" (or `lethean-fuse upgrade`) re-encrypts each legacy item under a new format-2 key.
+Folders are recreated parent-first. Each file is uploaded, then
+downloaded and fully decrypted before its legacy copy is deleted. Old
+folders are deleted last, once empty. Each replacement records the legacy
+item's node reference as `from`, so an interrupted upgrade resumes
+without duplicates, and items still pointing at an old folder resolve to
+its replacement. Legacy items keep their current folder arrangement.
+
+**Strict mode.** A device that has listed a vault completely with no
+legacy items marks it *legacy-free* and refuses legacy records for it from
+then on. Refused records are hidden unless the user includes them in an
+upgrade, and are still re-wrapped on rotation (§8), which carries the
+mark over to the new vault ID. The mark replaces the vault's existing
+local "confirmed" marker with a differently labelled hash, so the
+device's marker list doesn't reveal which vaults were opened on it. The
+FUSE client stores only these marks, and none for a duress unlock.
 
 ## 5. Size-hiding: padding and compression
 
@@ -126,20 +187,23 @@ chunk size, the content is chunked; otherwise it is a single message.
 Folders and existing files keep their original format; clients must read
 both.
 
+Below, "content key" is the file key (legacy) or the derived content key
+(format 2, §4.1).
+
 **Single message** (files of 32 MiB or less, and every file written
 before chunking existed). The padded, optionally compressed content is
-one AES-256-GCM message under the file key with a fresh random nonce,
+one AES-256-GCM message under the content key with a fresh random nonce,
 stored as the record's content IV.
 
 **Chunked** (files larger than 32 MiB). The padded content is split into
 `n = max(1, ceil(true_size / 32 MiB))` chunks of exactly 32 MiB. Each
-chunk `i` is sealed independently under the file key:
+chunk `i` is sealed independently under the content key:
 
 - **Nonce:** `prefix || uint32_be(i)`, where `prefix` is 8 random bytes
   chosen once per file and stored (base64) as the record's content IV.
   This allows up to 2³² chunks per file with no nonce repetition.
 - **AAD:** `uint32_be(i) || last`, where `last` is `0x01` for chunk
-  `n − 1` and `0x00` otherwise.
+  `n − 1` and `0x00` otherwise. Format 2 prefixes `"lethean|chunk|v2|"`.
 - **Stored ciphertext:** the concatenation of all sealed chunks, each
   32 MiB + 16-byte tag.
 
@@ -172,7 +236,9 @@ Binary fields in JSON/form payloads (IVs, wrapped keys, encrypted
 metadata, duress blobs) are base64. The vault ID is hex (used directly as
 a bearer token). Raw content ciphertext is transmitted as a binary blob to
 avoid base64 overhead on large payloads. The content IV is 12 bytes for
-single-message files and an 8-byte nonce prefix for chunked files.
+single-message files and an 8-byte nonce prefix for chunked files. The
+desktop and mobile apps require an HTTPS server URL (HTTP only for
+loopback).
 
 ## 8. Password rotation
 
@@ -182,7 +248,8 @@ single-message files and an 8-byte nonce prefix for chunked files.
    under the current KDF version (opportunistically upgrading legacy
    vaults).
 3. Verify the new vault ID differs from the old one.
-4. Re-wrap each unchanged file key under the new wrapping key.
+4. Re-wrap each unchanged file key under the new wrapping key, in its
+   existing format and binding.
 5. Submit all new wrapped-key/IV pairs in one atomic operation that also
    swaps the account to the new vault ID. The vault's duress registration
    (§12) moves with it.
@@ -198,9 +265,10 @@ token; the blob itself does not depend on the token or vault ID.
 
 ## 9. Rename / move
 
-Only metadata changes (name and/or parent folder); the file key is
-unchanged. Metadata is re-encrypted under the same key; content
-ciphertext, its IV, and the wrapped file key are carried over unmodified.
+Only metadata changes (name and/or parent folder); the file key, content
+ciphertext and its IV are unchanged. For format 2, the key is re-wrapped
+with a fresh binding and the metadata re-sealed to it, so the previous
+revision's metadata no longer authenticates. Legacy items keep their wrap.
 
 ## 10. Sharing
 
@@ -214,6 +282,10 @@ recipient's page fetches ciphertext by token and decrypts locally using
 the key from the fragment; the server enforces the access constraints but
 never handles plaintext or key material.
 
+For format-2 files the fragment also carries `v=2` and the binding `b`.
+The recipient takes the format from `v` alone: no `v` means legacy, and
+any other value is rejected.
+
 The link, fragment included, is therefore the decryption capability
 itself, not merely an access handle. Its confidentiality is the sole
 control on the shared file.
@@ -222,12 +294,13 @@ control on the shared file.
 
 To keep large files out of memory, web clients may decrypt in a
 same-origin service worker (for downloads) or a dedicated worker (for
-thumbnails) instead of the page. Only the single file's key, its content
-IV, and the request needed to fetch its ciphertext are handed over; the
-wrapping key and master key never reach these workers. A service worker
-job is single-use: it is removed from the worker's job table when its
-download starts and is held only by that download until it ends, and an
-unclaimed job expires after 60 seconds. Plaintext is passed straight to
+thumbnails) instead of the page. Only the file's content key (§6), its
+format, its content IV, and the request needed to fetch its ciphertext
+are handed over; the wrapping key and master key never reach these
+workers, nor does a format-2 file key. A service worker job is single-use: it is removed from the
+worker's job table when its download starts and is held only by that
+download until it ends. An unclaimed job is purged after 60 seconds, and
+the page cancels it once it's no longer needed; locking clears all jobs. Plaintext is passed straight to
 the browser's download manager or downscaled in place; it is never stored
 by the worker.
 
@@ -312,7 +385,7 @@ Clients keep key material and plaintext in memory only while it is
 needed. The master key is a transient intermediate; per-file keys,
 metadata, cached plaintext and the wrapping key are dropped when the
 vault is locked, and keys handed to workers are dropped when their job
-ends (§11). The web and app clients run in JavaScript, which can't
+ends (§11). Locking also closes open previews. The web and app clients run in JavaScript, which can't
 guarantee that memory is overwritten, so this limits how long secrets are
 reachable rather than erasing them. It does not change the protocol's
 guarantees.
@@ -322,9 +395,11 @@ guarantees.
 | Scenario | Exposure |
 |---|---|
 | Passive server compromise (stored data) | Opaque IDs, padded AES-256-GCM ciphertext, wrapped keys, duress blobs and shred-secret hashes. No plaintext, names, directory structure, wrapping key, or master key. Decryption still requires the password. |
-| Active server compromise, desktop/mobile apps | The apps' code ships with them and every secret stays on the device, so the server learns nothing beyond the stored data above. Altered, swapped or truncated ciphertext fails authentication instead of being shown, and the server can't forge a duress blob that matches the user's duress password. |
+| Active server compromise, desktop/mobile apps | The apps' code ships with them and every secret stays on the device, so the server learns nothing beyond the stored data above. Altered, swapped or truncated ciphertext fails authentication instead of being shown, and the server can't forge a duress blob that matches the user's duress password. For legacy items not yet upgraded, the server can serve metadata as content and move items between folders (§4.1). |
+| Format downgrade | Reading a file in the other format fails authentication; the format comes only from the authenticated wrap or the share link (§4.1). |
+| Legacy items reintroduced | Devices that have seen a vault legacy-free refuse legacy records for it (§4.2). Other devices accept them until they see the vault legacy-free. |
 | Active server compromise, web app and share page | The server delivers the JavaScript, so it can serve code that captures passwords and keys, including the key in a share link's fragment. Not defended. |
-| Server availability | Any compromised server can refuse service, withhold or delete files, show deleted files again, skip a requested wipe, or replace duress blobs with random ones so the duress password stops wiping. None of this reveals plaintext. |
+| Server availability | Any compromised server can refuse service, withhold or delete files, show deleted files (or a whole earlier revision) again, skip a requested wipe, or replace duress blobs with random ones so the duress password stops wiping. None of this reveals plaintext. |
 | Traffic analysis | Size bucket only, not exact length: up to 64 MiB for small files, to the nearest 32 MiB for larger ones. |
 | Nonce reuse | Precluded structurally: fresh random nonce per single-message encryption; per-file random prefix plus counter for chunks. A chunk is only ever re-encrypted from identical input (§6). |
 | Chunk tampering | Reordering, dropping, duplicating, truncating, or appending chunks fails authentication (position and last-chunk flag are AAD). |

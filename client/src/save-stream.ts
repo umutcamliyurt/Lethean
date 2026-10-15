@@ -1,5 +1,6 @@
 
-import { decryptToStream } from './crypto-encrypt-core.js';
+import { decryptToStream, contentKeyRaw } from './crypto-encrypt-core.js';
+import type { FileKey } from './crypto-encrypt-core.js';
 import type { FileMeta } from './types.js';
 
 export interface BlobRequest {
@@ -9,9 +10,9 @@ export interface BlobRequest {
 
 export interface EncryptedDownload {
   request: BlobRequest;
-  fileKeyRaw: Uint8Array;
+  fileKey: FileKey;
   contentIv: string;
-  meta: Pick<FileMeta, 'name' | 'mime' | 'compressed' | 'unpaddedSize' | 'chunkSize'>;
+  meta: Pick<FileMeta, 'name' | 'mime' | 'compressed' | 'unpaddedSize' | 'chunkSize' | 'size'>;
 }
 
 interface TauriApis {
@@ -63,7 +64,23 @@ async function activeDownloadWorker(): Promise<{ sw: ServiceWorker; scope: strin
 
 type WorkerOutcome = 'done' | 'cancelled' | 'not-intercepted';
 
-function downloadViaWorker(worker: { sw: ServiceWorker; scope: string }, d: EncryptedDownload): Promise<WorkerOutcome> {
+function safePathSegment(name: unknown): string {
+  const wellFormed = String(name ?? '').replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '�');
+  const encoded = encodeURIComponent(wellFormed).replace(/\./g, '%2E');
+  return encoded || 'download';
+}
+
+export async function clearDownloadWorkerJobs(): Promise<void> {
+  try {
+    const reg = await within(registration, 1_000, null);
+    reg?.active?.postMessage({ type: 'clear' });
+  } catch {
+  }
+}
+
+async function downloadViaWorker(worker: { sw: ServiceWorker; scope: string }, d: EncryptedDownload): Promise<WorkerOutcome> {
+  const workerKey = await contentKeyRaw(d.fileKey);
+  const format = d.fileKey.format;
   return new Promise((resolve, reject) => {
     const token = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, '0')).join('');
     const { port1, port2 } = new MessageChannel();
@@ -74,6 +91,7 @@ function downloadViaWorker(worker: { sw: ServiceWorker; scope: string }, d: Encr
     function settle(fn: () => void): void {
       clearTimeout(notIntercepted);
       clearInterval(keepalive);
+      try { worker.sw.postMessage({ type: 'cancel', token }); } catch {  }
       port1.onmessage = null;
       port1.close();
       setTimeout(() => frame?.remove(), 30_000);
@@ -85,7 +103,7 @@ function downloadViaWorker(worker: { sw: ServiceWorker; scope: string }, d: Encr
         case 'ready': {
           frame = document.createElement('iframe');
           frame.hidden = true;
-          frame.src = new URL(`__download/${token}/${encodeURIComponent(d.meta.name)}`, worker.scope).href;
+          frame.src = new URL(`__download/${token}/${safePathSegment(d.meta.name)}`, worker.scope).href;
           document.body.appendChild(frame);
           break;
         }
@@ -105,11 +123,13 @@ function downloadViaWorker(worker: { sw: ServiceWorker; scope: string }, d: Encr
       job: {
         url: d.request.url,
         headers: d.request.headers,
-        fileKeyRaw: d.fileKeyRaw,
+        contentKeyRaw: workerKey,
+        format,
         contentIv: d.contentIv,
         compressed: !!d.meta.compressed,
         unpaddedSize: d.meta.unpaddedSize ?? null,
         chunkSize: d.meta.chunkSize ?? null,
+        size: d.meta.size ?? null,
         filename: d.meta.name,
       },
     }, [port2]);
@@ -123,7 +143,7 @@ async function openPlaintext(d: EncryptedDownload): Promise<ReadableStream<Uint8
     try { detail = ((await res.json()) as { detail?: string }).detail ?? detail; } catch {  }
     throw new Error(detail || `HTTP ${res.status}`);
   }
-  return decryptToStream(d.fileKeyRaw, d.contentIv, res.body, d.meta);
+  return decryptToStream(d.fileKey, d.contentIv, res.body, d.meta);
 }
 
 async function saveWithTauri(
@@ -158,7 +178,7 @@ async function saveViaBlob(d: EncryptedDownload): Promise<boolean> {
     if (done) break;
     parts.push(new Blob([value as unknown as BlobPart]));
   }
-  const url = URL.createObjectURL(new Blob(parts, { type: d.meta.mime || 'application/octet-stream' }));
+  const url = URL.createObjectURL(new Blob(parts, { type: 'application/octet-stream' }));
   const a = document.createElement('a');
   a.href = url;
   a.download = d.meta.name;

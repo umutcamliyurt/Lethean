@@ -1,6 +1,6 @@
 
 import { fileBlobRequest, openDownloadStream } from './api.js';
-import { decryptToStream, streamToBlob } from './crypto-encrypt-core.js';
+import { decryptToStream, streamToBlob, toContentKey } from './crypto-encrypt-core.js';
 import { fileKeyCache } from './state.js';
 import { makeThumbnail } from './thumbnail-core.js';
 import type { FileMeta, FileRecord } from './types.js';
@@ -35,8 +35,9 @@ export async function acquireThumbnail(record: FileRecord, meta: FileMeta, still
 
   let job = inflight.get(id);
   if (!job) {
-    job = schedule(() => (stillWanted() ? generate(record, meta) : Promise.resolve(null)))
-      .then((blob) => (blob ? store(id, blob) : null))
+    const generation = cacheGeneration;
+    job = schedule(() => (stillWanted() && generation === cacheGeneration ? generate(record, meta) : Promise.resolve(null)))
+      .then((blob) => (blob && generation === cacheGeneration ? store(id, blob) : null))
       .catch(() => { failed.add(id); return null; })
       .finally(() => inflight.delete(id));
     inflight.set(id, job);
@@ -62,7 +63,11 @@ export function dropThumbnail(id: string): void {
   URL.revokeObjectURL(entry.url);
 }
 
+let cacheGeneration = 0;
+
 export function clearThumbnails(): void {
+  cacheGeneration++;
+  inflight.clear();
   for (const entry of cache.values()) URL.revokeObjectURL(entry.url);
   cache.clear();
   cacheBytes = 0;
@@ -146,8 +151,9 @@ async function generate(record: FileRecord, meta: FileMeta): Promise<Blob | null
   return makeThumbnail(image, THUMB_TARGET, (w, h) => Object.assign(document.createElement('canvas'), { width: w, height: h }));
 }
 
-function runInWorker(worker: Worker, record: FileRecord, meta: FileMeta): Promise<Blob | 'unsupported'> {
+async function runInWorker(worker: Worker, record: FileRecord, meta: FileMeta): Promise<Blob | 'unsupported'> {
   const id = nextJobId++;
+  const contentKey = await toContentKey(fileKeyCache.get(record.id)!);
   return new Promise((resolve, reject) => {
     const onMessage = (e: MessageEvent<{ id: number; ok: boolean; thumb?: Blob; error?: string; unsupported?: boolean }>) => {
       if (e.data.id !== id) return;
@@ -167,9 +173,9 @@ function runInWorker(worker: Worker, record: FileRecord, meta: FileMeta): Promis
     worker.postMessage({
       id,
       request: fileBlobRequest(record.id),
-      fileKeyRaw: fileKeyCache.get(record.id)!,
+      contentKey,
       contentIv: record.content_iv,
-      meta: { mime: meta.mime, compressed: meta.compressed, unpaddedSize: meta.unpaddedSize, chunkSize: meta.chunkSize },
+      meta: { mime: meta.mime, compressed: meta.compressed, unpaddedSize: meta.unpaddedSize, chunkSize: meta.chunkSize, size: meta.size },
       target: THUMB_TARGET,
     });
   });

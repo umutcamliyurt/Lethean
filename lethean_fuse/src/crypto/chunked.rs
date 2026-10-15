@@ -4,9 +4,10 @@ use std::io::{self, Read, Write};
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use anyhow::{bail, Result};
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
-use crate::crypto::aead::{aes_gcm_encrypt, pad_metadata_bytes, random_bytes, to_base64};
+use crate::crypto::aead::{encrypt_metadata, random_bytes, to_base64, wrap_file_key};
+use crate::crypto::format::{ContentKey, FileFormat, FileKey, ParentRef, AAD_CHUNK_V2};
 use crate::crypto::gcm_stream::{GcmDecryptReader, AUTH_FAILED};
 use crate::types::{EncryptedHeader, FileMeta};
 
@@ -44,29 +45,39 @@ pub fn nonce_for(prefix: &[u8], index: u64) -> io::Result<[u8; 12]> {
     Ok(n)
 }
 
-pub fn aad_for(index: u64, last: bool) -> [u8; 5] {
-    let mut a = [0u8; 5];
-    a[..4].copy_from_slice(&(index as u32).to_be_bytes());
-    a[4] = last as u8;
+pub fn aad_for(format: FileFormat, index: u64, last: bool) -> Vec<u8> {
+    let mut a = Vec::with_capacity(AAD_CHUNK_V2.len() + 5);
+    if format == FileFormat::V2 {
+        a.extend_from_slice(AAD_CHUNK_V2);
+    }
+    a.extend_from_slice(&(index as u32).to_be_bytes());
+    a.push(last as u8);
     a
 }
 
-pub fn seal_chunk(key: &[u8], prefix: &[u8], index: u64, last: bool, buf: &mut Vec<u8>) -> io::Result<()> {
+pub fn seal_chunk(key: &[u8], format: FileFormat, prefix: &[u8], index: u64, last: bool, buf: &mut Vec<u8>) -> io::Result<()> {
     let c = cipher(key).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
     let nonce = nonce_for(prefix, index)?;
-    c.encrypt_in_place(Nonce::from_slice(&nonce), &aad_for(index, last), buf)
+    c.encrypt_in_place(Nonce::from_slice(&nonce), &aad_for(format, index, last), buf)
         .map_err(|_| io::Error::new(io::ErrorKind::Other, "AES-GCM encryption failed"))
 }
 
-pub fn open_chunk(key: &[u8], prefix: &[u8], index: u64, last: bool, buf: &mut Vec<u8>) -> io::Result<()> {
+pub fn open_chunk(key: &[u8], format: FileFormat, prefix: &[u8], index: u64, last: bool, buf: &mut Vec<u8>) -> io::Result<()> {
     let c = cipher(key).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
     let nonce = nonce_for(prefix, index)?;
-    c.decrypt_in_place(Nonce::from_slice(&nonce), &aad_for(index, last), buf)
+    c.decrypt_in_place(Nonce::from_slice(&nonce), &aad_for(format, index, last), buf)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, AUTH_FAILED))
 }
 
+pub fn check_filler(format: FileFormat, filler: &[u8]) -> io::Result<()> {
+    if format == FileFormat::V2 && filler.iter().any(|&b| b != 0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "File is corrupt (padding)"));
+    }
+    Ok(())
+}
+
 pub struct ChunkedUploadPlan {
-    pub file_key: Zeroizing<Vec<u8>>,
+    pub content_key: ContentKey,
     pub prefix: Vec<u8>,
     pub plain_len: u64,
     pub header: EncryptedHeader,
@@ -78,28 +89,25 @@ impl ChunkedUploadPlan {
     }
 }
 
-pub fn plan_chunked_upload(wrapping_key_raw: &[u8], name: &str, mime: &str, plain_size: u64, parent_id: Option<&str>) -> Result<ChunkedUploadPlan> {
-    let file_key = Zeroizing::new(random_bytes(32));
+pub fn plan_chunked_upload(wrapping_key_raw: &[u8], name: &str, mime: &str, plain_size: u64, parent: Option<&ParentRef>, from: Option<&str>) -> Result<ChunkedUploadPlan> {
+    if chunk_count(plain_size, CHUNK_SIZE) > u32::MAX as u64 {
+        bail!("File is too large");
+    }
+    let file_key = FileKey::new_v2();
     let prefix = random_bytes(PREFIX_LEN);
 
-    let mut meta = FileMeta::new_file(name.to_string(), mime.to_string(), false, plain_size, parent_id.map(|s| s.to_string()));
+    let mime = if mime.is_empty() || mime.encode_utf16().count() > 255 { "application/octet-stream" } else { mime };
+    let name = if name.is_empty() { "Untitled" } else { name };
+    let mut meta = FileMeta::new_file(name.to_string(), mime.to_string(), false, plain_size, parent);
     meta.chunk_size = Some(CHUNK_SIZE);
-    let mut metadata_json = serde_json::to_vec(&meta)?;
-    let mut metadata_bytes = pad_metadata_bytes(&metadata_json);
-    metadata_json.zeroize();
-    let meta_enc = aes_gcm_encrypt(&file_key, &metadata_bytes)?;
-    metadata_bytes.zeroize();
-    let key_wrap = aes_gcm_encrypt(wrapping_key_raw, &file_key)?;
+    meta.size = Some(plain_size);
+    meta.from = from.map(|s| s.to_string());
+    let (encrypted_metadata, metadata_iv) = encrypt_metadata(&file_key, &meta)?;
+    let (wrapped_file_key, wrap_iv) = wrap_file_key(wrapping_key_raw, &file_key)?;
 
     Ok(ChunkedUploadPlan {
-        header: EncryptedHeader {
-            content_iv: to_base64(&prefix),
-            encrypted_metadata: to_base64(&meta_enc.ciphertext),
-            metadata_iv: to_base64(&meta_enc.iv),
-            wrapped_file_key: to_base64(&key_wrap.ciphertext),
-            wrap_iv: to_base64(&key_wrap.iv),
-        },
-        file_key,
+        header: EncryptedHeader { content_iv: to_base64(&prefix), encrypted_metadata, metadata_iv, wrapped_file_key, wrap_iv },
+        content_key: file_key.content_key(),
         prefix,
         plain_len: plain_size,
     })
@@ -108,6 +116,7 @@ pub fn plan_chunked_upload(wrapping_key_raw: &[u8], name: &str, mime: &str, plai
 pub struct ChunkedEncryptReader<R: Read> {
     source: R,
     key: Zeroizing<Vec<u8>>,
+    format: FileFormat,
     prefix: Vec<u8>,
     plain_len: u64,
     count: u64,
@@ -117,8 +126,8 @@ pub struct ChunkedEncryptReader<R: Read> {
 }
 
 impl<R: Read> ChunkedEncryptReader<R> {
-    pub fn new(source: R, key: &[u8], prefix: &[u8], plain_len: u64) -> Self {
-        Self { source, key: Zeroizing::new(key.to_vec()), prefix: prefix.to_vec(), plain_len, count: chunk_count(plain_len, CHUNK_SIZE), index: 0, buf: Zeroizing::new(Vec::new()), pos: 0 }
+    pub fn new(source: R, key: &ContentKey, prefix: &[u8], plain_len: u64) -> Self {
+        Self { source, key: key.key.clone(), format: key.format, prefix: prefix.to_vec(), plain_len, count: chunk_count(plain_len, CHUNK_SIZE), index: 0, buf: Zeroizing::new(Vec::new()), pos: 0 }
     }
 
     fn next_chunk(&mut self) -> io::Result<()> {
@@ -138,7 +147,7 @@ impl<R: Read> ChunkedEncryptReader<R> {
             }
         }
         let last = self.index == self.count - 1;
-        seal_chunk(&self.key, &self.prefix, self.index, last, &mut self.buf)?;
+        seal_chunk(&self.key, self.format, &self.prefix, self.index, last, &mut self.buf)?;
         self.index += 1;
         self.pos = 0;
         Ok(())
@@ -176,7 +185,8 @@ pub fn read_full(r: &mut impl Read, buf: &mut [u8]) -> io::Result<usize> {
     Ok(filled)
 }
 
-pub fn decrypt_chunked<R: Read>(mut source: R, key: &[u8], prefix: &[u8], chunk_size: u64, true_size: u64, w: &mut dyn Write) -> io::Result<u64> {
+pub fn decrypt_chunked<R: Read>(mut source: R, ck: &ContentKey, prefix: &[u8], chunk_size: u64, true_size: u64, w: &mut dyn Write) -> io::Result<u64> {
+    let key: &[u8] = &ck.key;
     if !(MIN_CHUNK..=MAX_CHUNK).contains(&chunk_size) {
         return Err(io::Error::new(io::ErrorKind::InvalidData, format!("unsupported chunk size {chunk_size}")));
     }
@@ -186,7 +196,7 @@ pub fn decrypt_chunked<R: Read>(mut source: R, key: &[u8], prefix: &[u8], chunk_
     let mut written = 0u64;
     for index in 0..count {
         let nonce = nonce_for(prefix, index)?;
-        let aad = aad_for(index, index == count - 1);
+        let aad = aad_for(ck.format, index, index == count - 1);
         let mut dec = GcmDecryptReader::with_aad((&mut source).take(sealed), key, &nonce, &aad).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
         let take = (true_size - written).min(chunk_size);
         let mut got = 0u64;
@@ -199,6 +209,7 @@ pub fn decrypt_chunked<R: Read>(mut source: R, key: &[u8], prefix: &[u8], chunk_
             if keep > 0 {
                 w.write_all(&buf[..keep])?;
             }
+            check_filler(ck.format, &buf[keep..n])?;
             got += n as u64;
         }
         if got != chunk_size {
@@ -224,6 +235,10 @@ mod tests {
     use std::io::Cursor;
 
     const KEY: [u8; 32] = [3u8; 32];
+
+    fn ck(format: FileFormat) -> ContentKey {
+        ContentKey { key: Zeroizing::new(KEY.to_vec()), format }
+    }
     const PREFIX: [u8; 8] = [5u8; 8];
     const SMALL: u64 = 4096;
 
@@ -234,7 +249,7 @@ mod tests {
             let s = (i * chunk) as usize;
             let mut b = plain[s.min(plain.len())..((i + 1) * chunk).min(plain.len() as u64) as usize].to_vec();
             b.resize(chunk as usize, 0);
-            seal_chunk(&KEY, &PREFIX, i, i == n - 1, &mut b).unwrap();
+            seal_chunk(&KEY, FileFormat::Legacy, &PREFIX, i, i == n - 1, &mut b).unwrap();
             out.extend_from_slice(&b);
         }
         out
@@ -242,7 +257,7 @@ mod tests {
 
     fn open_all(ct: &[u8], chunk: u64, size: u64) -> io::Result<Vec<u8>> {
         let mut out = Vec::new();
-        decrypt_chunked(Cursor::new(ct), &KEY, &PREFIX, chunk, size, &mut out)?;
+        decrypt_chunked(Cursor::new(ct), &ck(FileFormat::Legacy), &PREFIX, chunk, size, &mut out)?;
         Ok(out)
     }
 
@@ -278,27 +293,38 @@ mod tests {
         let plain: Vec<u8> = (0..size).map(|i| (i % 253) as u8).collect();
         let read = || {
             let mut out = Vec::new();
-            ChunkedEncryptReader::new(Cursor::new(&plain), &KEY, &PREFIX, size).read_to_end(&mut out).unwrap();
+            ChunkedEncryptReader::new(Cursor::new(&plain), &ck(FileFormat::V2), &PREFIX, size).read_to_end(&mut out).unwrap();
             out
         };
         let a = read();
         assert_eq!(a.len() as u64, sealed_len(size, CHUNK_SIZE));
         assert_eq!(a, read(), "retries must reproduce identical ciphertext");
         let mut back = Vec::new();
-        decrypt_chunked(Cursor::new(&a), &KEY, &PREFIX, CHUNK_SIZE, size, &mut back).unwrap();
+        decrypt_chunked(Cursor::new(&a), &ck(FileFormat::V2), &PREFIX, CHUNK_SIZE, size, &mut back).unwrap();
         assert!(back == plain);
+        assert!(decrypt_chunked(Cursor::new(&a), &ck(FileFormat::Legacy), &PREFIX, CHUNK_SIZE, size, &mut Vec::new()).is_err(), "v2 chunks must not open as legacy");
     }
 
     #[test]
     fn a_short_source_is_an_error() {
-        let mut r = ChunkedEncryptReader::new(Cursor::new(vec![1u8; 10]), &KEY, &PREFIX, 100);
+        let mut r = ChunkedEncryptReader::new(Cursor::new(vec![1u8; 10]), &ck(FileFormat::V2), &PREFIX, 100);
         assert_eq!(r.read_to_end(&mut Vec::new()).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn v2_filler_must_be_zero() {
+        let size = 100u64;
+        let mut chunk = vec![0u8; SMALL as usize];
+        chunk[size as usize..].fill(0);
+        chunk[SMALL as usize - 1] = 7;
+        seal_chunk(&KEY, FileFormat::V2, &PREFIX, 0, true, &mut chunk).unwrap();
+        assert!(decrypt_chunked(Cursor::new(&chunk), &ck(FileFormat::V2), &PREFIX, SMALL, size, &mut Vec::new()).is_err());
     }
 
     #[test]
     fn hostile_chunk_sizes_are_refused() {
         for cs in [0u64, 1, MAX_CHUNK + 1, u64::MAX] {
-            assert!(decrypt_chunked(Cursor::new(Vec::<u8>::new()), &KEY, &PREFIX, cs, 10, &mut Vec::new()).is_err());
+            assert!(decrypt_chunked(Cursor::new(Vec::<u8>::new()), &ck(FileFormat::Legacy), &PREFIX, cs, 10, &mut Vec::new()).is_err());
         }
     }
 }

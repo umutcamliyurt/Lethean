@@ -1,4 +1,5 @@
 import type { EncryptedFilePayload } from './types.js';
+import type { ParentRef, NewRecordOptions } from './crypto-encrypt-core.js';
 
 const POOL_SIZE = Math.min(6, Math.max(1, (navigator.hardwareConcurrency || 2) - 1));
 
@@ -12,8 +13,8 @@ type EncryptFailure = { id: number; ok: false; error: string };
 type WorkerResponse = EncryptSuccess | EncryptFailure;
 
 type DispatchPayload =
-  | { kind: 'file'; wrappingKeyRaw: Uint8Array; file: File; parentId: string | null }
-  | { kind: 'folder'; wrappingKeyRaw: Uint8Array; name: string; parentId: string | null };
+  | { kind: 'file'; wrappingKeyRaw: Uint8Array; file: File; parent: ParentRef | null; opts?: NewRecordOptions }
+  | { kind: 'folder'; wrappingKeyRaw: Uint8Array; name: string; parent: ParentRef | null; opts?: NewRecordOptions };
 
 class EncryptWorkerPool {
   private idle: Worker[] = [];
@@ -77,12 +78,12 @@ class EncryptWorkerPool {
     });
   }
 
-  encryptFile(wrappingKeyRaw: Uint8Array, file: File, parentId: string | null): Promise<EncryptedFilePayload> {
-    return this.dispatch({ kind: 'file', wrappingKeyRaw, file, parentId });
+  encryptFile(wrappingKeyRaw: Uint8Array, file: File, parent: ParentRef | null, opts?: NewRecordOptions): Promise<EncryptedFilePayload> {
+    return this.dispatch({ kind: 'file', wrappingKeyRaw, file, parent, opts });
   }
 
-  encryptFolder(wrappingKeyRaw: Uint8Array, name: string, parentId: string | null): Promise<EncryptedFilePayload> {
-    return this.dispatch({ kind: 'folder', wrappingKeyRaw, name, parentId });
+  encryptFolder(wrappingKeyRaw: Uint8Array, name: string, parent: ParentRef | null): Promise<EncryptedFilePayload> {
+    return this.dispatch({ kind: 'folder', wrappingKeyRaw, name, parent });
   }
 }
 

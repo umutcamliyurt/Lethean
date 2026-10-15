@@ -1,4 +1,5 @@
 import type { FileMeta } from './types.js';
+import type { FileKey } from './crypto-encrypt-core.js';
 
 let wrappingKeyRaw: Uint8Array | null = null;
 let currentVaultId: string | null = null;
@@ -17,6 +18,6 @@ export function setCurrentVaultId(value: string | null): void {
   currentVaultId = value;
 }
 
-export const fileKeyCache: Map<string, Uint8Array> = new Map();
+export const fileKeyCache: Map<string, FileKey> = new Map();
 export const metaCache: Map<string, FileMeta> = new Map();
 export const objectUrlCache: Map<string, string> = new Map();

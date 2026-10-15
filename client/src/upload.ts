@@ -6,6 +6,7 @@ import { getWrappingKeyRaw } from './state.js';
 import { icon, showToast } from './utils.js';
 import type { ChunkedFilePayload, EncryptedFilePayload } from './types.js';
 import { addUploadedRecord, getCurrentFolderId, createFolder } from './gallery.js';
+import { parentRefFor } from './tree.js';
 
 chooseFilesBtn.addEventListener('click', () => fileInput.click());
 depositSlot.addEventListener('click', (e) => {
@@ -237,9 +238,10 @@ async function uploadOneWithinBudget(file: File, rowItem: UploadRowItem, reserva
 
   statusEl.textContent = 'Encrypting\u2026';
   try {
+    const parent = parentRefFor(getCurrentFolderId());
     encrypted = isChunkedUpload(file)
-      ? await prepareChunkedFile(getWrappingKeyRaw()!, file, getCurrentFolderId())
-      : await encryptPool.encryptFile(getWrappingKeyRaw()!, file, getCurrentFolderId());
+      ? await prepareChunkedFile(getWrappingKeyRaw()!, file, parent)
+      : await encryptPool.encryptFile(getWrappingKeyRaw()!, file, parent);
     reservation.shrinkTo(uploadWorkingSet(file));
   } catch (err) {
     row.classList.add('error');

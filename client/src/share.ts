@@ -2,7 +2,8 @@ import * as api from './api.js';
 import { lightbox } from './dom.js';
 import { closeLightbox, releaseLightboxPreview } from './lightbox.js';
 import { fileKeyCache, metaCache } from './state.js';
-import { toBase64 } from './crypto-encrypt-core.js';
+import { shareParamsForFileKey } from './crypto-encrypt-core.js';
+import type { FileKey } from './crypto-encrypt-core.js';
 import { icon, escapeHtml, showToast } from './utils.js';
 import { isTauri, resolveBaseUrl } from './platform.js';
 import type { FileRecord } from './types.js';
@@ -69,9 +70,9 @@ function shareBase(): string {
   return `${window.location.origin}${basePath}`;
 }
 
-function buildShareUrl(shareToken: string, fileKeyRaw: Uint8Array, deleteToken?: string | null): string {
-  const keyB64 = toBase64(fileKeyRaw);
-  const parts = [`t=${encodeURIComponent(shareToken)}`, `k=${encodeURIComponent(keyB64)}`];
+function buildShareUrl(shareToken: string, fileKey: FileKey, deleteToken?: string | null): string {
+  const parts = [`t=${encodeURIComponent(shareToken)}`];
+  for (const [name, value] of shareParamsForFileKey(fileKey)) parts.push(`${name}=${encodeURIComponent(value)}`);
   if (deleteToken) parts.push(`d=${encodeURIComponent(deleteToken)}`);
   return `${shareBase()}share.html#${parts.join('&')}`;
 }
@@ -184,8 +185,8 @@ async function createAndShowLink(
   name: string,
   options: { maxDownloads: number; expiresInSeconds: number | null; allowDelete: boolean }
 ): Promise<void> {
-  const fileKeyRaw = fileKeyCache.get(record.id);
-  if (!fileKeyRaw) {
+  const fileKey = fileKeyCache.get(record.id);
+  if (!fileKey) {
     closeShareModal();
     showToast("Can't share this item yet \u2014 still loading.", 'error');
     return;
@@ -199,8 +200,11 @@ async function createAndShowLink(
   `);
 
   try {
-    const { shareToken, deleteToken, maxDownloads: confirmedMax } = await api.createFileShare(record.id, options);
-    const url = buildShareUrl(shareToken, fileKeyRaw, options.allowDelete ? deleteToken : null);
+    const { shareToken, deleteToken, maxDownloads: rawConfirmedMax } = await api.createFileShare(record.id, options);
+    const confirmedMax = typeof rawConfirmedMax === 'number' && Number.isSafeInteger(rawConfirmedMax) && rawConfirmedMax > 0
+      ? rawConfirmedMax
+      : options.maxDownloads;
+    const url = buildShareUrl(shareToken, fileKey, options.allowDelete ? deleteToken : null);
     renderShareLink(url, name, confirmedMax, options.expiresInSeconds, Boolean(options.allowDelete && deleteToken));
   } catch (err) {
     closeShareModal();
@@ -233,11 +237,11 @@ function renderShareLink(
       <div class="share-summary">
         <div class="share-summary-item">
           <span class="label">Downloads</span>
-          <span class="value">${maxDownloads === 1 ? 'Once' : `Up to ${maxDownloads}`}</span>
+          <span class="value">${maxDownloads === 1 ? 'Once' : `Up to ${escapeHtml(maxDownloads)}`}</span>
         </div>
         <div class="share-summary-item">
           <span class="label">Expires</span>
-          <span class="value">${expiryValueLabel(expiresInSeconds)}</span>
+          <span class="value">${escapeHtml(expiryValueLabel(expiresInSeconds))}</span>
         </div>
         <div class="share-summary-item">
           <span class="label">Deletable</span>

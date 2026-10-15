@@ -134,10 +134,14 @@ pub struct GcmEncryptReader<R: Read> {
 
 impl<R: Read> GcmEncryptReader<R> {
     pub fn new(source: R, key: &[u8], iv: &[u8], plain_len: u64, padded_len: u64) -> Result<Self> {
+        Self::with_aad(source, key, iv, &[], plain_len, padded_len)
+    }
+
+    pub fn with_aad(source: R, key: &[u8], iv: &[u8], aad: &[u8], plain_len: u64, padded_len: u64) -> Result<Self> {
         if padded_len < plain_len {
             bail!("padded length is smaller than the plaintext");
         }
-        Ok(Self { source, state: Some(GcmState::new(key, iv)?), plain_len, padded_len, consumed: 0, out: Vec::new(), out_pos: 0, tag: None, tag_pos: 0 })
+        Ok(Self { source, state: Some(GcmState::new_with_aad(key, iv, aad)?), plain_len, padded_len, consumed: 0, out: Vec::new(), out_pos: 0, tag: None, tag_pos: 0 })
     }
 
     pub fn encrypted_len(padded_len: u64) -> u64 {
@@ -325,33 +329,32 @@ impl<R: Read> Drop for GcmEncryptReader<R> {
 #[cfg(test)]
 mod aad_tests {
     use super::*;
-    use crate::crypto::chunked::{open_chunk, seal_chunk};
+    use crate::crypto::chunked::{aad_for, open_chunk, seal_chunk};
+    use crate::crypto::format::FileFormat;
 
     #[test]
     fn streaming_decrypt_with_aad_matches_the_chunked_format_and_rejects_tampering() {
         let key = [7u8; 32];
         let prefix = [9u8; 8];
-        for (len, index, last) in [(0usize, 0u64, true), (1, 3, false), (70_001, 5, true), (200_000, 0, false)] {
+        for (len, index, last, format) in [(0usize, 0u64, true, FileFormat::Legacy), (1, 3, false, FileFormat::V2), (70_001, 5, true, FileFormat::Legacy), (200_000, 0, false, FileFormat::V2)] {
             let plain: Vec<u8> = (0..len).map(|i| (i * 31 % 251) as u8).collect();
             let mut sealed = plain.clone();
-            seal_chunk(&key, &prefix, index, last, &mut sealed).unwrap();
+            seal_chunk(&key, format, &prefix, index, last, &mut sealed).unwrap();
 
             let mut nonce = [0u8; 12];
             nonce[..8].copy_from_slice(&prefix);
             nonce[8..].copy_from_slice(&(index as u32).to_be_bytes());
-            let mut aad = [0u8; 5];
-            aad[..4].copy_from_slice(&(index as u32).to_be_bytes());
-            aad[4] = last as u8;
+            let aad = aad_for(format, index, last);
 
             let mut out = Vec::new();
             GcmDecryptReader::with_aad(io::Cursor::new(&sealed), &key, &nonce, &aad).unwrap().read_to_end(&mut out).unwrap();
             assert_eq!(out, plain);
             let mut via_crate = sealed.clone();
-            open_chunk(&key, &prefix, index, last, &mut via_crate).unwrap();
+            open_chunk(&key, format, &prefix, index, last, &mut via_crate).unwrap();
             assert_eq!(via_crate, plain);
 
-            let mut wrong_aad = aad;
-            wrong_aad[4] ^= 1;
+            let mut wrong_aad = aad.clone();
+            *wrong_aad.last_mut().unwrap() ^= 1;
             assert!(GcmDecryptReader::with_aad(io::Cursor::new(&sealed), &key, &nonce, &wrong_aad).unwrap().read_to_end(&mut Vec::new()).is_err());
             if len > 0 {
                 let mut bad = sealed.clone();

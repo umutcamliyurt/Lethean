@@ -5,4 +5,5 @@ pub mod duress;
 pub mod fuse_fs;
 pub mod scratch;
 pub mod types;
+pub mod upgrade;
 pub mod vault;

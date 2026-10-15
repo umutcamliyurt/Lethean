@@ -45,12 +45,17 @@ fn perf_bench() {
             .create_file_streaming(name, "application/octet-stream", BIG, None, || Ok(Box::new(PatternReader::new(BIG, Arc::clone(&started))) as Box<dyn Read>))
             .expect("upload big");
     }
-    let small_dir = inject_payload(&server, aead::encrypt_folder(&key, "small", None).unwrap());
+    let folder = |name: &str| {
+        let payload = aead::encrypt_folder(&key, name, None).unwrap();
+        let node_ref = aead::unwrap_file_key(&key, &payload.wrapped_file_key, &payload.wrap_iv).unwrap().node_ref();
+        lethean_fuse_lib::crypto::format::ParentRef { id: inject_payload(&server, payload), node_ref }
+    };
+    let small_dir = folder("small");
     for i in 0..SMALL_FILES {
         let body: Vec<u8> = (0..4096 + (i % 13) * 100).map(|_| rand::random::<u8>()).collect();
         inject_payload(&server, aead::encrypt_file(&key, &format!("f{i:05}.txt"), "application/octet-stream", &body, Some(&small_dir)).unwrap());
     }
-    let many_dir = inject_payload(&server, aead::encrypt_folder(&key, "many", None).unwrap());
+    let many_dir = folder("many");
     for i in 0..MANY_FILES {
         inject_payload(&server, aead::encrypt_file(&key, &format!("entry-{i:06}.dat"), "application/octet-stream", b"x", Some(&many_dir)).unwrap());
     }

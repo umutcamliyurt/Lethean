@@ -26,10 +26,37 @@ declare global {
   }
 }
 
+const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+export function isLoopbackHost(hostname: string): boolean {
+  return LOOPBACK_HOSTS.has(hostname.toLowerCase());
+}
+
+export function isLocalDevPage(): boolean {
+  return typeof window !== 'undefined'
+    && window.location.port === '5500'
+    && isLoopbackHost(window.location.hostname);
+}
+
+export function isAllowedServerUrl(raw: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (url.username || url.password || url.search || url.hash) return false;
+  if (url.protocol === 'https:') return true;
+  return url.protocol === 'http:' && isLoopbackHost(url.hostname);
+}
+
 export function resolveBaseUrl(): string {
   if (typeof window === 'undefined') return '';
-  if (window.location.port === '5500') return 'http://localhost:8000';
-  if (isTauri()) return getStoredServerUrl();
+  if (isLocalDevPage()) return 'http://localhost:8000';
+  if (isTauri()) {
+    const stored = getStoredServerUrl();
+    return stored && isAllowedServerUrl(stored) ? stored : '';
+  }
   return '';
 }
 

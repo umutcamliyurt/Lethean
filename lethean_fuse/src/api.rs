@@ -70,6 +70,42 @@ impl std::fmt::Display for HttpError {
 
 impl std::error::Error for HttpError {}
 
+pub fn check_server_url(url: &str) -> Result<()> {
+    let lower = url.trim().to_ascii_lowercase();
+    let (scheme, rest) = lower.split_once("://").ok_or_else(|| anyhow!("the server URL must start with https://"))?;
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.is_empty() || authority.contains('@') || rest.contains('?') || rest.contains('#') {
+        bail!("the server URL must be a plain https:// address");
+    }
+    match scheme {
+        "https" => Ok(()),
+        "http" => {
+            let host = if authority.starts_with('[') { authority.split(']').next().map(|h| format!("{h}]")).unwrap_or_default() } else { authority.split(':').next().unwrap_or("").to_string() };
+            if matches!(host.as_str(), "localhost" | "127.0.0.1" | "[::1]") {
+                Ok(())
+            } else {
+                bail!("the server URL must start with https:// (plain http is only allowed for localhost)")
+            }
+        }
+        _ => bail!("the server URL must start with https://"),
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::check_server_url;
+
+    #[test]
+    fn only_https_or_loopback_http() {
+        for ok in ["https://vault.example.com", "https://vault.example.com:8443/", "http://localhost:8000", "http://127.0.0.1:0", "http://[::1]:8000"] {
+            assert!(check_server_url(ok).is_ok(), "{ok}");
+        }
+        for bad in ["http://vault.example.com", "http://192.168.1.5:8000", "ftp://x", "vault.example.com", "https://user:pw@x.com", "http://localhost.evil.com", "http://127.0.0.1.evil.com"] {
+            assert!(check_server_url(bad).is_err(), "{bad}");
+        }
+    }
+}
+
 pub fn is_missing_endpoint(e: &anyhow::Error) -> bool {
     e.chain().any(|c| c.downcast_ref::<HttpError>().map(|h| h.status == 404 || h.status == 405).unwrap_or(false))
 }
@@ -216,6 +252,7 @@ use retry::AttemptError;
 
 impl ApiClient {
     pub fn new(base_url: String) -> Result<Self> {
+        check_server_url(&base_url)?;
         Ok(Self {
             base_url: base_url.trim_end_matches('/').to_string(),
             agent: build_agent(Some(Duration::from_secs(180))),

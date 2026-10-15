@@ -2,9 +2,10 @@ import { showLightbox, closeLightbox } from './lightbox.js';
 import { metaCache } from './state.js';
 import { icon, showToast } from './utils.js';
 import type { FileRecord } from './types.js';
+import { effectiveParentId } from './tree.js';
 
 function parentIdOf(id: string): string | null {
-  return (metaCache.get(id)?.parentId as string | null | undefined) ?? null;
+  return effectiveParentId(id);
 }
 
 function isDescendantOrSelf(candidateId: string, ancestorId: string): boolean {

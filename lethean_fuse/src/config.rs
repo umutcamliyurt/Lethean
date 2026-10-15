@@ -17,6 +17,33 @@ pub struct Config {
     pub duress_synced: bool,
     #[serde(default)]
     pub duress_conflict_noticed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub legacy_free_markers: Vec<String>,
+}
+
+const MAX_LEGACY_FREE_MARKERS: usize = 50;
+
+pub fn legacy_free_marker(vault_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(format!("e2ee-vault|legacy-free-marker|v1|{vault_id}").as_bytes()))
+}
+
+pub fn is_vault_legacy_free(vault_id: &str) -> bool {
+    let marker = legacy_free_marker(vault_id);
+    Config::load().map(|c| c.legacy_free_markers.contains(&marker)).unwrap_or(false)
+}
+
+pub fn mark_vault_legacy_free(vault_id: &str) {
+    let marker = legacy_free_marker(vault_id);
+    let Ok(mut c) = Config::load() else { return };
+    if c.legacy_free_markers.contains(&marker) {
+        return;
+    }
+    c.legacy_free_markers.push(marker);
+    while c.legacy_free_markers.len() > MAX_LEGACY_FREE_MARKERS {
+        c.legacy_free_markers.remove(0);
+    }
+    let _ = c.save();
 }
 
 impl Drop for Config {

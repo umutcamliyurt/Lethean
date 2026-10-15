@@ -27,6 +27,7 @@ pub struct Server {
     pub range_gets: Arc<AtomicUsize>,
     pub full_gets: Arc<AtomicUsize>,
     pub bytes_served: Arc<AtomicUsize>,
+    pub rotation: Arc<Mutex<Option<String>>>,
 }
 
 pub struct ServerOpts {
@@ -75,10 +76,11 @@ pub fn start_server(opts: ServerOpts) -> Server {
     let range_gets = Arc::new(AtomicUsize::new(0));
     let full_gets = Arc::new(AtomicUsize::new(0));
     let bytes_served = Arc::new(AtomicUsize::new(0));
+    let rotation: Arc<Mutex<Option<String>>> = Arc::default();
     let failed_once = Arc::new(AtomicBool::new(false));
     let opts = Arc::new(opts);
 
-    let server = Server { addr, files: Arc::clone(&files), uploads_seen: Arc::clone(&uploads_seen), range_gets: Arc::clone(&range_gets), full_gets: Arc::clone(&full_gets), bytes_served: Arc::clone(&bytes_served) };
+    let server = Server { addr, files: Arc::clone(&files), uploads_seen: Arc::clone(&uploads_seen), range_gets: Arc::clone(&range_gets), full_gets: Arc::clone(&full_gets), bytes_served: Arc::clone(&bytes_served), rotation: Arc::clone(&rotation) };
 
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -89,6 +91,7 @@ pub fn start_server(opts: ServerOpts) -> Server {
             let range_gets = Arc::clone(&range_gets);
             let full_gets = Arc::clone(&full_gets);
             let bytes_served = Arc::clone(&bytes_served);
+            let rotation = Arc::clone(&rotation);
             let failed_once = Arc::clone(&failed_once);
             let opts = Arc::clone(&opts);
             thread::spawn(move || {
@@ -276,7 +279,23 @@ pub fn start_server(opts: ServerOpts) -> Server {
                         if respond(&mut writer, "200 OK", "", body.as_bytes()).is_err() {
                             return;
                         }
+                    } else if method == "POST" && path == "/vault/rotate" {
+                        let mut body = vec![0u8; content_length as usize];
+                        if reader.read_exact(&mut body).is_err() {
+                            return;
+                        }
+                        let text = String::from_utf8_lossy(&body).to_string();
+                        let n = text.matches("\"file_id\"").count();
+                        *rotation.lock().unwrap() = Some(text);
+                        let json = format!(r#"{{"files_moved":{n},"tokens_rebound":0}}"#);
+                        if respond(&mut writer, "200 OK", "", json.as_bytes()).is_err() {
+                            return;
+                        }
                     } else {
+                        if content_length > 0 && content_length < 1 << 20 {
+                            let mut sink = vec![0u8; content_length as usize];
+                            let _ = reader.read_exact(&mut sink);
+                        }
                         let _ = respond(&mut writer, "404 Not Found", "", b"");
                     }
                 }

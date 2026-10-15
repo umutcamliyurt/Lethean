@@ -1,13 +1,15 @@
 
 import { encryptFile, encryptFolder } from './crypto-encrypt-core.js';
 import type { EncryptedFilePayload } from './types.js';
+import type { ParentRef, NewRecordOptions } from './crypto-encrypt-core.js';
 
 interface EncryptFileRequest {
   id: number;
   kind: 'file';
   wrappingKeyRaw: Uint8Array;
   file: File;
-  parentId: string | null;
+  parent: ParentRef | null;
+  opts?: NewRecordOptions;
 }
 
 interface EncryptFolderRequest {
@@ -15,7 +17,8 @@ interface EncryptFolderRequest {
   kind: 'folder';
   wrappingKeyRaw: Uint8Array;
   name: string;
-  parentId: string | null;
+  parent: ParentRef | null;
+  opts?: NewRecordOptions;
 }
 
 type EncryptRequest = EncryptFileRequest | EncryptFolderRequest;
@@ -36,8 +39,8 @@ self.onmessage = async (event: MessageEvent<EncryptRequest>) => {
   const req = event.data;
   try {
     const result = req.kind === 'file'
-      ? await encryptFile(req.wrappingKeyRaw, req.file, req.parentId)
-      : await encryptFolder(req.wrappingKeyRaw, req.name, req.parentId);
+      ? await encryptFile(req.wrappingKeyRaw, req.file, req.parent, req.opts)
+      : await encryptFolder(req.wrappingKeyRaw, req.name, req.parent, req.opts);
 
     const ciphertext = result.ciphertext instanceof Blob
       ? result.ciphertext

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use common::*;
 use lethean_fuse_lib::crypto::aead;
-use lethean_fuse_lib::crypto::gcm_stream::{padme, GcmEncryptReader, STREAM_THRESHOLD};
+use lethean_fuse_lib::crypto::gcm_stream::{GcmEncryptReader, STREAM_THRESHOLD};
 
 const SIZE: u64 = 9 * 1024 * 1024 + 123;
 const MIB: u64 = 1024 * 1024;
@@ -34,8 +34,7 @@ fn large_upload_is_a_plain_single_blob_that_any_client_can_decrypt() {
         assert_eq!(files.len(), 1);
         (files[0].1.fields.clone(), files[0].1.blob.clone())
     };
-    assert_eq!(blob.len() as u64, padme(SIZE) + 16);
-    assert!((padme(SIZE) - SIZE) as f64 <= SIZE as f64 * 0.125);
+    assert_eq!(blob.len() as u64, aead::padded_size(SIZE) + 16);
 
     let file_key = aead::unwrap_file_key(&key, &fields["wrapped_file_key"], &fields["wrap_iv"]).unwrap();
     let meta = aead::decrypt_metadata(&file_key, &fields["encrypted_metadata"], &fields["metadata_iv"]).unwrap();
@@ -44,7 +43,9 @@ fn large_upload_is_a_plain_single_blob_that_any_client_can_decrypt() {
     assert_eq!(meta.name, "big.bin");
     let json = serde_json::to_string(&meta).unwrap();
     assert!(!json.to_lowercase().contains("chunk"), "metadata must not carry any non-standard field: {json}");
-    let plain = aead::decrypt_content(&file_key, &fields["content_iv"], &blob, meta.compressed, meta.unpadded_size).unwrap();
+    assert!(file_key.is_v2());
+    assert_eq!(meta.size, Some(SIZE));
+    let plain = aead::decrypt_content(&file_key.content_key(), &fields["content_iv"], &blob, &meta).unwrap();
     assert_eq!(plain.len() as u64, SIZE);
     assert_eq!(&plain[..1000], &expected(0, 1000)[..]);
     assert_eq!(&plain[plain.len() - 1000..], &expected(SIZE - 1000, 1000)[..]);
@@ -155,7 +156,7 @@ fn a_dropped_upload_is_retried_from_a_fresh_reader() {
     assert_eq!(started.load(Ordering::SeqCst), 2, "the body must be regenerated from the start for the retry");
     assert_eq!(server.uploads_seen.load(Ordering::SeqCst), 2);
     assert_eq!(server.files.lock().unwrap().len(), 1);
-    assert_eq!(server.files.lock().unwrap()[0].1.blob.len() as u64, padme(SIZE) + 16);
+    assert_eq!(server.files.lock().unwrap()[0].1.blob.len() as u64, aead::padded_size(SIZE) + 16);
 
     let reader = new_vault(server.addr, &key);
     reader.refresh_all().unwrap();
@@ -232,11 +233,11 @@ fn downloading_a_huge_file_stays_within_the_scratch_budget() {
     let server = start_server(ServerOpts { support_range: true, fail_first_upload: false, discard_blobs: true });
     let key = aead::generate_aes_key_raw();
 
-    let plan = aead::plan_stream_upload(&key, "huge.bin", "application/octet-stream", size, None).unwrap();
-    let (fk, iv, padded) = (plan.file_key.to_vec(), plan.iv.clone(), plan.padded_len);
+    let plan = aead::plan_stream_upload(&key, "huge.bin", "application/octet-stream", size, None, None).unwrap();
+    let (fk, iv, padded) = (plan.content_key.key.to_vec(), plan.iv.clone(), plan.padded_len);
     let gen: Generator = Arc::new(move || {
         let src = PatternReader::new(size, Arc::new(AtomicUsize::new(0)));
-        Box::new(GcmEncryptReader::new(src, &fk, &iv, size, padded).unwrap())
+        Box::new(GcmEncryptReader::with_aad(src, &fk, &iv, lethean_fuse_lib::crypto::format::AAD_CONTENT_V2, size, padded).unwrap())
     });
     let h = &plan.header;
     let id = inject_virtual(
@@ -389,11 +390,11 @@ fn downloading_a_huge_chunked_file_stays_within_the_scratch_budget() {
     let size = mib * MIB + 777;
     let server = start_server(ServerOpts { support_range: true, fail_first_upload: false, discard_blobs: true });
     let key = aead::generate_aes_key_raw();
-    let plan = plan_chunked_upload(&key, "huge.bin", "application/octet-stream", size, None).unwrap();
-    let (fk, prefix) = (plan.file_key.to_vec(), plan.prefix.clone());
+    let plan = plan_chunked_upload(&key, "huge.bin", "application/octet-stream", size, None, None).unwrap();
+    let (ck, prefix) = (plan.content_key.clone(), plan.prefix.clone());
     let gen: Generator = Arc::new(move || {
         let src = PatternReader::new(size, Arc::new(AtomicUsize::new(0)));
-        Box::new(ChunkedEncryptReader::new(src, &fk, &prefix, size))
+        Box::new(ChunkedEncryptReader::new(src, &ck, &prefix, size))
     });
     let h = &plan.header;
     let id = inject_virtual(

@@ -9,6 +9,7 @@ import { escapeHtml, showToast, icon } from './utils.js';
 import { getCurrentFolderId, addUploadedRecord, removeRecordLocally, getDecryptedBytes } from './gallery.js';
 import { showLightbox, closeLightbox } from './lightbox.js';
 import type { FileMeta, FileRecord } from './types.js';
+import { effectiveParentId, parentRefFor, UNRESOLVED_PARENT } from './tree.js';
 
 const MAX_NAME_LENGTH = 255;
 const DEFAULT_NEW_FILE_NAME = 'Untitled.md';
@@ -18,9 +19,6 @@ function sanitizeFileName(name: string): string {
   return trimmed || DEFAULT_NEW_FILE_NAME;
 }
 
-function parentIdOf(meta: FileMeta): string | null {
-  return (meta.parentId as string | null | undefined) ?? null;
-}
 
 export function isMarkdownFile(meta: FileMeta): boolean {
   return meta.mime === 'text/markdown' || /\.(md|markdown)$/i.test(meta.name);
@@ -431,8 +429,10 @@ function renderEditorPanel(opts: EditorPanelOptions): void {
 async function encryptAndUploadText(name: string, content: string, parentId: string | null): Promise<FileRecord> {
   const wrappingKeyRaw = getWrappingKeyRaw();
   if (!wrappingKeyRaw) throw new Error('Vault is locked.');
+  if (parentId === UNRESOLVED_PARENT) throw new Error("This file's folder couldn't be verified, so it can't be saved there.");
+  const parent = parentRefFor(parentId);
   const file = new File([content], name, { type: mimeForFileName(name) });
-  const payload = await encryptPool.encryptFile(wrappingKeyRaw, file, parentId);
+  const payload = await encryptPool.encryptFile(wrappingKeyRaw, file, parent);
   return api.uploadFile(payload);
 }
 
@@ -478,7 +478,7 @@ export function editTextFile(record: FileRecord, meta: FileMeta): void {
       content,
       saveLabel: 'Save',
       onSave: async (name, newContent) => {
-        const newRecord = await encryptAndUploadText(name, newContent, parentIdOf(meta));
+        const newRecord = await encryptAndUploadText(name, newContent, effectiveParentId(record.id));
         await addUploadedRecord(newRecord);
         try {
           await api.deleteFile(record.id);
