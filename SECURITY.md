@@ -2,51 +2,94 @@
 
 ## Supported Versions
 
-Security fixes are applied to the latest release on `main`. Please update before reporting.
+| Version | Supported |
+|---|---|
+| 3.1.x | Yes |
+| < 3.1 | No |
+
+Security fixes are released only for the latest release on `main`. Reproduce reported issues against the latest release before submitting.
 
 ## Reporting a Vulnerability
 
-Please do not open a public issue for security vulnerabilities. Report privately through either channel:
+Do not open public issues for security vulnerabilities. Report them privately through either channel:
 
-- **GitHub:** use "Report a vulnerability" under the repository's **Security** tab
-- **Email:** [9r39hhxp@addy.io](mailto:9r39hhxp@addy.io), with a subject starting `[Lethean Security]`
+- **GitHub:** use **Report a vulnerability** under the repository's **Security** tab
+- **Email:** [9r39hhxp@addy.io](mailto:9r39hhxp@addy.io), with a subject line beginning `[Lethean Security]`
 
-Include a description of the issue, steps to reproduce, the affected component and version, and its impact.
+A report should include:
 
-You can expect an acknowledgement within 7 days and an initial assessment within 14 days. Fixes are released as quickly as severity warrants, and reporters are credited unless they prefer otherwise. Please allow a reasonable window for a fix before public disclosure.
+- the affected component (server, web client, desktop or mobile app, FUSE client, or admin panel) and version
+- a description of the vulnerability and its impact
+- steps to reproduce, or a proof of concept
+- the attacker position assumed (for example: malicious server, holder of stored data, network observer, holder of an access token, or another local user)
+
+## Response Process
+
+| Stage | Target |
+|---|---|
+| Acknowledgement | within 7 days |
+| Initial assessment | within 14 days |
+| Fix | prioritized by severity |
+
+Reporters are credited unless they request otherwise. Allow a reasonable period for a fix to be released before public disclosure.
 
 ## Scope
 
-In scope:
+### Cryptography and confidentiality
 
-- Flaws in the cryptographic design or implementation described in [`CRYPTOGRAPHY.md`](CRYPTOGRAPHY.md)
-- Any way for the server, or an attacker with its stored data, to learn plaintext, passwords, keys, file names, directory structure, or exact file sizes
-- Authentication or authorization bypass, including access token and quota handling
-- Duress code or decoy vault behavior that is distinguishable from the normal unlock path, including through the synced duress settings, their write pattern, or the wipe request
-- Any way to learn whether a vault has a duress code, or which token of a pair is the decoy, from stored data alone, or to recover a vault ID or file keys from the duress settings
-- Any way to wipe a vault without its duress secret, or to change another vault's duress settings
-- Attacks on chunked files: reordering, dropping, truncating or splicing chunks without detection
-- Making a client read a format-2 file as legacy, accept non-canonical format-2 data, or place a format-2 item in the wrong folder
-- Data loss during a vault upgrade, or legacy records accepted by a device that has seen the vault legacy-free
-- Quota or authorization bypass through multi-part uploads, and access to another vault's upload sessions
-- Issues in the download service worker or thumbnail workers, such as serving one file's plaintext to another origin, or keys or credentials outliving the download they were given for
-- Admin panel and share link vulnerabilities
-- Injection, path traversal, or remote code execution in the server
-- Vulnerabilities in the web, desktop, mobile, or FUSE clients
-- Any way for a malicious or compromised server to learn passwords, keys or plaintext from desktop or mobile app users, or to get tampered data accepted by any client
+- Flaws in the design or implementation specified in [`CRYPTOGRAPHY.md`](CRYPTOGRAPHY.md)
+- Any way for the server, or an attacker holding its stored data, to learn plaintext, passwords, keys, file names, directory structure, or sizes more precisely than the padding buckets allow
+- Nonce reuse, or any condition under which a client re-encrypts a chunk from different input under the same key and nonce
 
-Out of scope, as documented in the [threat model](README.md#threat-model):
+### Integrity and format handling
 
-- A malicious server serving modified JavaScript to the web client or the share-link page, and a server denying service (withholding, deleting or restoring files, ignoring wipe requests)
-- A compromised client device, browser, or extension
+- Undetected reordering, removal, duplication, truncation or splicing of chunks
+- Causing a client to read a format-2 item as legacy, accept non-canonical format-2 data, or place a format-2 item in the wrong folder
+- Causing any client to present unauthenticated plaintext as a file's content
+- Data loss during a vault upgrade, or acceptance of legacy records by a device that has marked the vault legacy-free
+
+### Authentication and authorization
+
+- Authentication or authorization bypass, including access-token binding and quota enforcement
+- Quota or authorization bypass through multipart uploads, and access to another vault's upload sessions
+- Admin panel and share-link vulnerabilities
+
+### Duress code
+
+- Any observable difference between the duress path and a normal unlock, in synchronized duress settings, their write pattern, or the wipe requests
+- Determining from stored data alone whether a vault has a duress code, or which token of a pair is the decoy
+- Recovering a vault ID or file key from duress settings
+- Wiping a vault without its duress secret, or modifying another vault's duress settings
+
+### Clients
+
+- Vulnerabilities in the web, desktop, mobile or FUSE clients
+- Any way for a malicious or compromised server to obtain passwords, keys or plaintext from desktop, mobile or FUSE users, or to have tampered data accepted by any client
+- Script injection through file names, file content, Markdown, previews or server responses
+- Service-worker or worker issues, such as exposing one file's plaintext to another origin, or keys or credentials outliving the job they were issued for
+- Framing (clickjacking) of the web client
+- Path traversal or unsafe file names in downloads and native save dialogs
+- FUSE client: exposure of decrypted files, buffers or credentials to other unprivileged local users; data loss through file-system operations (rename, truncate, unlink); and server-controlled input that crashes the client or makes directories unreadable
+
+### Server
+
+- Injection, path traversal or remote code execution
+
+## Out of Scope
+
+These cases are documented in the [threat model](README.md#threat-model) and are not treated as vulnerabilities:
+
+- A malicious server serving modified JavaScript to the web client or the share-link page
+- Denial of service by the server: withholding, deleting or restoring files, or ignoring wipe requests
+- A compromised device, operating system, root account, browser or extension
 - Weak or reused passwords
-- Metadata visible by design: padded size buckets (including the 32 MiB steps of large files), record counts, access patterns, when duress settings are written, and whether the second token of a pair is in use
-- Offline guessing of a weak duress password by someone who holds your access token (the duress settings are readable with the token by design, so devices can fetch them before unlocking)
+- Metadata visible by design: padded size buckets (including the 32 MiB granularity of large files), record counts, access patterns, the timing of duress-settings writes, and whether the second token of a pair is in use
+- Offline guessing of a weak duress password by a holder of the access token (duress settings are readable with the token by design, so devices can fetch them before unlocking)
 - A compromised admin password
-- Anyone holding a complete share link, which is the decryption key for that file
-- Documented weaknesses of legacy-format items that haven't been upgraded yet
-- Volumetric denial of service, and third-party dependency issues with no exploitable path (report those upstream)
+- Any holder of a complete share link, which is the decryption capability for that file
+- Documented weaknesses of legacy-format items that have not yet been upgraded
+- Volumetric denial of service, and issues in third-party dependencies without an exploitable path in Lethean (report those upstream)
 
 ## Safe Harbor
 
-Good-faith research that follows this policy, avoids harm to other users' data, and is performed only against your own instance will not be met with legal action.
+Good-faith research that follows this policy, avoids harm to other users' data, and is performed only against instances you own or operate will not be met with legal action.
