@@ -22,7 +22,25 @@ interface TauriApis {
 
 const tauri = (): TauriApis | undefined => (window as unknown as { __TAURI__?: TauriApis }).__TAURI__;
 
-export async function downloadDecrypted(d: EncryptedDownload): Promise<boolean> {
+const MAX_DOWNLOAD_NAME_LENGTH = 255;
+
+export function safeDownloadName(name: unknown): string {
+  let clean = String(name ?? '')
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '')
+    .replace(/[\\/]+/g, '/');
+  clean = clean.slice(clean.lastIndexOf('/') + 1)
+    .replace(/[<>:"|?*]/g, '_')
+    .trim()
+    .replace(/[. ]+$/, '');
+  if (!clean || /^\.+$/.test(clean)) return 'download';
+  if (clean.length <= MAX_DOWNLOAD_NAME_LENGTH) return clean;
+  const dot = clean.lastIndexOf('.');
+  const ext = dot > 0 && clean.length - dot <= 16 ? clean.slice(dot) : '';
+  return clean.slice(0, MAX_DOWNLOAD_NAME_LENGTH - ext.length) + ext;
+}
+
+export async function downloadDecrypted(input: EncryptedDownload): Promise<boolean> {
+  const d: EncryptedDownload = { ...input, meta: { ...input.meta, name: safeDownloadName(input.meta.name) } };
   const t = tauri();
   if (t?.dialog && t.fs) return saveWithTauri(t.dialog, t.fs, d);
 

@@ -94,6 +94,7 @@ interface PendingConfirmation {
   vaultId: string;
   wrappingKeyRaw: Uint8Array;
   password: string;
+  accessToken: string;
   marker: { confirmed: string; legacyFree: string };
 }
 
@@ -164,6 +165,14 @@ authForm.addEventListener('submit', async (e) => {
       return;
     }
 
+    if (pendingConfirmation
+      && (password !== pendingConfirmation.password || accessToken !== pendingConfirmation.accessToken)) {
+      pendingConfirmation = null;
+      confirmField.classList.add('hidden');
+      passwordConfirmInput.required = false;
+      passwordConfirmInput.value = '';
+    }
+
     if (pendingConfirmation) {
       if (passwordConfirmInput.value !== pendingConfirmation.password) {
         setAuthStatus("Those don't match. Try entering your password again.", { error: true });
@@ -196,7 +205,7 @@ authForm.addEventListener('submit', async (e) => {
         setAuthStatus(errors[0] || 'Password is too weak.', { error: true });
         return;
       }
-      pendingConfirmation = { vaultId, wrappingKeyRaw: wk, password, marker };
+      pendingConfirmation = { vaultId, wrappingKeyRaw: wk, password, accessToken, marker };
       confirmField.classList.remove('hidden');
       passwordConfirmInput.required = true;
       passwordConfirmInput.focus();

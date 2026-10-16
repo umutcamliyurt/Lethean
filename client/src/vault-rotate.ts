@@ -2,7 +2,7 @@
 import * as api from './api.js';
 import * as C from './crypto.js';
 import { fileKeyCache, metaCache } from './state.js';
-import { getRecordsForRotation } from './gallery.js';
+import { getRecordsForRotation, ensureFullyLoaded } from './gallery.js';
 import { isVaultLegacyFree, markVaultLegacyFree } from './storage.js';
 import { wrapFileKey } from './crypto-encrypt-core.js';
 import type { RewrapEntry } from './api.js';
@@ -15,6 +15,9 @@ export interface RotationResult {
 }
 
 async function rewrapAllFilesTo(newWrap: Uint8Array): Promise<RewrapEntry[]> {
+  if (!(await ensureFullyLoaded())) {
+    throw new Error("Your vault didn't finish loading, so this can't be done safely right now. Try again in a moment.");
+  }
   const records = getRecordsForRotation();
   const rewraps: RewrapEntry[] = [];
 

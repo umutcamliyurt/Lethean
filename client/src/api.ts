@@ -10,6 +10,18 @@ if (!isLocalDev && !isTauri() && window.isSecureContext !== true) {
   throw new Error('This app must be served over HTTPS — refusing to run over an insecure connection.');
 }
 
+function isFramed(): boolean {
+  try {
+    return window.top !== window.self;
+  } catch {
+    return true;
+  }
+}
+if (isFramed()) {
+  document.documentElement.textContent = '';
+  throw new Error('Refusing to run inside a frame.');
+}
+
 let vaultId: string | null = null;
 let accessToken: string | null = null;
 

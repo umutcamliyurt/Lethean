@@ -1,4 +1,5 @@
 import { getStoredServerUrl } from './storage.js';
+import { safeDownloadName } from './save-stream.js';
 
 export function isTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -73,7 +74,8 @@ export async function openExternal(url: string): Promise<void> {
   window.open(url, '_blank', 'noopener,noreferrer');
 }
 
-export async function saveBytes(filename: string, mime: string, bytes: Uint8Array): Promise<void> {
+export async function saveBytes(rawFilename: string, mime: string, bytes: Uint8Array): Promise<void> {
+  const filename = safeDownloadName(rawFilename);
   const { dialog, fs } = window.__TAURI__ ?? {};
   if (dialog && fs) {
     try {

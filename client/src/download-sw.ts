@@ -178,6 +178,7 @@
     const sealedSize = chunkSize + GCM_TAG;
     const count = Math.max(1, Math.ceil(total / chunkSize));
     const prefix = fromBase64(job.contentIv);
+    if (prefix.length !== 8) throw new Error('Corrupt chunked file header');
     let buf = new Uint8Array(sealedSize);
     let filled = 0;
     let index = 0;

@@ -11,7 +11,7 @@ import { openPdfPreview } from './pdf-preview.js';
 import type { PdfPreviewHandle } from './pdf-preview.js';
 import type { FileMeta, FileRecord } from './types.js';
 import { isTauri } from './platform.js';
-import { downloadDecrypted } from './save-stream.js';
+import { downloadDecrypted, safeDownloadName } from './save-stream.js';
 
 let lightboxMediaList: FileRecord[] = [];
 let lightboxIndex = -1;
@@ -681,7 +681,7 @@ export async function downloadAndSave(record: FileRecord, meta: FileMeta, existi
     if (existingUrl && !isTauri()) {
       const a = document.createElement('a');
       a.href = existingUrl;
-      a.download = meta.name;
+      a.download = safeDownloadName(meta.name);
       a.click();
       return;
     }
