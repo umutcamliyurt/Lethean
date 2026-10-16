@@ -209,7 +209,7 @@ def _vault_usage(db: Session) -> dict[str, tuple[int, int]]:
     rows = (
         db.query(
             EncryptedFile.vault_id,
-            func.count(EncryptedFile.id),
+            func.count(),
             func.coalesce(func.sum(EncryptedFile.size), 0),
         )
         .group_by(EncryptedFile.vault_id)

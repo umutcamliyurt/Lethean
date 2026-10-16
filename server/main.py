@@ -15,12 +15,13 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 
 import anyio.to_thread
-from fastapi import FastAPI, Depends, Header, HTTPException, UploadFile, Form, BackgroundTasks, Request, Query
+from fastapi import FastAPI, Depends, Header, HTTPException, BackgroundTasks, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import delete as sa_delete, func
+from sqlalchemy import String, delete as sa_delete, func, select, type_coerce
+from starlette.datastructures import Headers, MutableHeaders
 from sqlalchemy.orm import Session
 
 from database import Base, SessionLocal, engine, get_db, run_migrations
@@ -157,16 +158,23 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-@app.middleware("http")
-async def rate_limit(request, call_next):
-    key = _client_ip(request)
+def _scope_client_ip(scope, headers: Headers) -> str:
+    if os.environ.get("TRUST_PROXY_HEADERS", "0") == "1":
+        forwarded = headers.get("x-forwarded-for")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+    client = scope.get("client")
+    return client[0] if client else "unknown"
+
+
+def _rate_limited(key: str) -> bool:
     now = time.monotonic()
     with _rate_limit_lock:
         hits = _rate_limit_hits[key]
         while hits and now - hits[0] > _RATE_LIMIT_WINDOW_SECONDS:
             hits.popleft()
         if len(hits) >= _RATE_LIMIT_MAX_REQUESTS:
-            return Response(status_code=429, content="Too many requests")
+            return True
         hits.append(now)
         _rate_limit_last_seen[key] = now
         if len(_rate_limit_last_seen) > _RATE_LIMIT_MAX_TRACKED_KEYS:
@@ -174,43 +182,58 @@ async def rate_limit(request, call_next):
             for k in stale:
                 _rate_limit_last_seen.pop(k, None)
                 _rate_limit_hits.pop(k, None)
-    return await call_next(request)
+    return False
 
 
-@app.middleware("http")
-async def limit_request_size(request, call_next):
-    content_length = request.headers.get("content-length")
-    if content_length is not None:
-        try:
-            length = int(content_length)
-        except ValueError:
-            return Response(status_code=400, content="Invalid Content-Length")
-        if length > _MAX_REQUEST_BYTES:
-            return Response(status_code=413, content="Request body too large")
-    return await call_next(request)
+_CSP = (
+    "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' blob: data:; media-src 'self' blob:; frame-src 'self' blob:; worker-src 'self'; "
+    "frame-ancestors 'none'; object-src 'none'; base-uri 'none'"
+)
 
 
-@app.middleware("http")
-async def add_security_headers(request, call_next):
-    response = await call_next(request)
-    response.headers.setdefault("X-Content-Type-Options", "nosniff")
-    response.headers.setdefault("X-Frame-Options", "DENY")
-    response.headers.setdefault("Referrer-Policy", "no-referrer")
-    response.headers.setdefault(
-        "Content-Security-Policy",
-        "default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; "
-        "style-src 'self' 'unsafe-inline'; "
-        "img-src 'self' blob: data:; media-src 'self' blob:; frame-src 'self' blob:; worker-src 'self'; "
-        "frame-ancestors 'none'; object-src 'none'; base-uri 'none'",
-    )
-    forwarded_proto = request.headers.get("x-forwarded-proto") if os.environ.get("TRUST_PROXY_HEADERS", "0") == "1" else None
-    is_https = request.url.scheme == "https" or forwarded_proto == "https"
-    if is_https:
-        response.headers.setdefault("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
-    return response
+class _EdgeMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = Headers(scope=scope)
+        forwarded_proto = headers.get("x-forwarded-proto") if os.environ.get("TRUST_PROXY_HEADERS", "0") == "1" else None
+        is_https = scope.get("scheme") == "https" or forwarded_proto == "https"
+
+        async def send_with_headers(message):
+            if message["type"] == "http.response.start":
+                h = MutableHeaders(scope=message)
+                h.setdefault("X-Content-Type-Options", "nosniff")
+                h.setdefault("X-Frame-Options", "DENY")
+                h.setdefault("Referrer-Policy", "no-referrer")
+                h.setdefault("Content-Security-Policy", _CSP)
+                if is_https:
+                    h.setdefault("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+            await send(message)
+
+        if _rate_limited(_scope_client_ip(scope, headers)):
+            await Response(status_code=429, content="Too many requests")(scope, receive, send_with_headers)
+            return
+        content_length = headers.get("content-length")
+        if content_length is not None:
+            try:
+                length = int(content_length)
+            except ValueError:
+                await Response(status_code=400, content="Invalid Content-Length")(scope, receive, send_with_headers)
+                return
+            if length > _MAX_REQUEST_BYTES:
+                await Response(status_code=413, content="Request body too large")(scope, receive, send_with_headers)
+                return
+        await self.app(scope, receive, send_with_headers)
 
 
-app.add_middleware(GZipMiddleware, minimum_size=1024)
+app.add_middleware(_EdgeMiddleware)
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=6)
 
 
 _LOCK_STRIPES = 256
@@ -305,20 +328,36 @@ def _finalize_upload(db: Session, record: EncryptedFile, path: str, size: int, v
         _release_reservation(vault_id, stream_limit)
 
 
+_UPLOAD_FIELD_LIMITS = {
+    "content_iv": _IV_MAX_LEN,
+    "encrypted_metadata": _ENCRYPTED_METADATA_MAX_LEN,
+    "metadata_iv": _IV_MAX_LEN,
+    "wrapped_file_key": _WRAPPED_KEY_MAX_LEN,
+    "wrap_iv": _IV_MAX_LEN,
+}
+
+
+def _multipart_boundary(content_type: str | None) -> bytes | None:
+    if not content_type:
+        return None
+    from multipart.multipart import parse_options_header
+
+    kind, options = parse_options_header(content_type)
+    if kind != b"multipart/form-data":
+        return None
+    boundary = options.get(b"boundary")
+    return boundary or None
+
+
 @app.post("/files", response_model=FileMetaResponse, status_code=201)
 async def upload_file(
     request: Request,
-    content_iv: str = Form(..., max_length=_IV_MAX_LEN),
-    encrypted_metadata: str = Form(..., max_length=_ENCRYPTED_METADATA_MAX_LEN),
-    metadata_iv: str = Form(..., max_length=_IV_MAX_LEN),
-    wrapped_file_key: str = Form(..., max_length=_WRAPPED_KEY_MAX_LEN),
-    wrap_iv: str = Form(..., max_length=_IV_MAX_LEN),
-    blob: UploadFile | None = None,
     db: Session = Depends(get_db),
     auth: UploadAuthorization = Depends(require_upload_authorization),
 ):
-    if blob is None:
-        raise HTTPException(status_code=400, detail="Missing file blob")
+    boundary = _multipart_boundary(request.headers.get("content-type"))
+    if boundary is None:
+        raise HTTPException(status_code=422, detail="Expected a multipart/form-data body")
 
     vault_id = auth.vault_id
 
@@ -332,21 +371,17 @@ async def upload_file(
 
     async with _upload_semaphore:
         record, stream_limit = await asyncio.to_thread(
-            _reserve_upload_slot,
-            db,
-            vault_id,
-            auth.quota_bytes,
-            declared_size,
-            encrypted_metadata,
-            metadata_iv,
-            content_iv,
-            wrapped_file_key,
-            wrap_iv,
+            _reserve_upload_slot, db, vault_id, auth.quota_bytes, declared_size, "", "", "", "", "",
         )
 
+        path = storage.path_for(vault_id, record.id)
         try:
-            path = storage.path_for(vault_id, record.id)
-            size = await storage.write_blob_streamed(path, blob, stream_limit, chunk_size=_READ_CHUNK)
+            fields, size = await storage.write_multipart_blob(
+                path, request.stream(), boundary, stream_limit, _UPLOAD_FIELD_LIMITS,
+            )
+        except storage.UploadFormError as exc:
+            _release_reservation(vault_id, stream_limit)
+            raise HTTPException(status_code=exc.status, detail=exc.detail)
         except ValueError as exc:
             _release_reservation(vault_id, stream_limit)
             if "stalled" in str(exc):
@@ -358,6 +393,15 @@ async def upload_file(
         except BaseException:
             _release_reservation(vault_id, stream_limit)
             raise
+
+        missing = [name for name in _UPLOAD_FIELD_LIMITS if name not in fields]
+        if missing:
+            storage.delete_blob(path)
+            _release_reservation(vault_id, stream_limit)
+            raise HTTPException(status_code=422, detail=f"Missing form field: {missing[0]}")
+
+        for name in _UPLOAD_FIELD_LIMITS:
+            setattr(record, name, fields[name])
 
         return await asyncio.to_thread(_finalize_upload, db, record, path, size, vault_id, stream_limit)
 
@@ -548,6 +592,37 @@ def abort_upload(upload_id: str, db: Session = Depends(get_db), vault_id: str = 
     return Response(status_code=204)
 
 
+_LIST_COLUMNS = (
+    EncryptedFile.id,
+    EncryptedFile.encrypted_metadata,
+    EncryptedFile.metadata_iv,
+    EncryptedFile.content_iv,
+    EncryptedFile.wrapped_file_key,
+    EncryptedFile.wrap_iv,
+    EncryptedFile.size,
+    type_coerce(EncryptedFile.created_at, String),
+)
+_LIST_KEYS = ("id", "encrypted_metadata", "metadata_iv", "content_iv", "wrapped_file_key", "wrap_iv", "size", "created_at")
+
+
+_STORED_DT_RE = re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d{6}$")
+
+
+def _iso_utc(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    text = (dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt).isoformat()
+    return text[:-6] + "Z" if text.endswith("+00:00") else text
+
+
+def _stored_to_iso(raw: str | None) -> str | None:
+    if raw is None:
+        return None
+    if _STORED_DT_RE.match(raw):
+        return (raw[:19] if raw.endswith(".000000") else raw).replace(" ", "T", 1) + "Z"
+    return _iso_utc(datetime.fromisoformat(raw))
+
+
 @app.get("/files", response_model=list[FileMetaResponse])
 def list_files(
     db: Session = Depends(get_db),
@@ -561,21 +636,28 @@ def list_files(
         raise HTTPException(status_code=400, detail="limit must be between 1 and 500")
 
     effective_limit = limit if limit is not None else _DEFAULT_LIST_LIMIT
+    order = (EncryptedFile.created_at.desc(), EncryptedFile.id.asc())
 
-    query = (
-        db.query(EncryptedFile)
-        .filter(EncryptedFile.vault_id == vault_id)
-        .order_by(EncryptedFile.created_at.desc(), EncryptedFile.id.asc())
+    page_ids = (
+        select(EncryptedFile.id)
+        .where(EncryptedFile.vault_id == vault_id)
+        .order_by(*order)
         .offset(offset)
         .limit(effective_limit)
+        .scalar_subquery()
     )
-    return query.all()
+    rows = db.execute(select(*_LIST_COLUMNS).where(EncryptedFile.id.in_(page_ids)).order_by(*order)).all()
+    body = [dict(zip(_LIST_KEYS, (*row[:7], _stored_to_iso(row[7])))) for row in rows]
+    return Response(
+        content=json.dumps(body, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8"),
+        media_type="application/json",
+    )
 
 
 @app.get("/usage", response_model=UsageResponse)
 def usage(db: Session = Depends(get_db), vault_id: str = Depends(get_vault_id)):
     file_count, total_bytes = (
-        db.query(func.count(EncryptedFile.id), func.coalesce(func.sum(EncryptedFile.size), 0))
+        db.query(func.count(), func.coalesce(func.sum(EncryptedFile.size), 0))
         .filter(EncryptedFile.vault_id == vault_id)
         .one()
     )
@@ -589,26 +671,60 @@ def get_file_meta(file_id: str, db: Session = Depends(get_db), vault_id: str = D
     return _get_owned_file(db, file_id, vault_id)
 
 
+_RANGE_RE = re.compile(r"^bytes=(\d*)-(\d*)$")
+
+
+def _parse_range(value: str | None, size: int) -> tuple[int, int] | None | bool:
+    if not value:
+        return None
+    m = _RANGE_RE.match(value.strip())
+    if not m or (not m.group(1) and not m.group(2)):
+        return None
+    if m.group(1):
+        start = int(m.group(1))
+        end = int(m.group(2)) if m.group(2) else size - 1
+        if start >= size or end < start:
+            return False
+        return start, min(end, size - 1)
+    suffix = int(m.group(2))
+    if suffix == 0 or size == 0:
+        return False
+    return max(0, size - suffix), size - 1
+
+
 @app.get("/files/{file_id}/blob")
-async def get_file_blob(file_id: str, db: Session = Depends(get_db), vault_id: str = Depends(get_vault_id)):
+async def get_file_blob(
+    file_id: str,
+    db: Session = Depends(get_db),
+    vault_id: str = Depends(get_vault_id),
+    range_header: str | None = Header(default=None, alias="Range"),
+):
     record = _get_owned_file(db, file_id, vault_id)
     storage_path = record.storage_path
     size = record.size
 
+    span = _parse_range(range_header, size)
+    if span is False:
+        return Response(status_code=416, headers={"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"})
+    start, end = span if span else (0, size - 1)
+    length = end - start + 1 if size else 0
+
     async def _bounded_stream():
         async with _download_semaphore:
-            async for chunk in storage.stream_blob(storage_path, chunk_size=_READ_CHUNK):
+            async for chunk in storage.stream_blob(storage_path, chunk_size=_READ_CHUNK, offset=start, length=length):
                 yield chunk
 
+    headers = {
+        "X-Content-Type-Options": "nosniff",
+        "Content-Disposition": "attachment",
+        "Content-Length": str(length),
+        "Content-Encoding": "identity",
+        "Accept-Ranges": "bytes",
+    }
+    if span:
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
     return StreamingResponse(
-        _bounded_stream(),
-        media_type="application/octet-stream",
-        headers={
-            "X-Content-Type-Options": "nosniff",
-            "Content-Disposition": "attachment",
-            "Content-Length": str(size),
-            "Content-Encoding": "identity",
-        },
+        _bounded_stream(), status_code=206 if span else 200, media_type="application/octet-stream", headers=headers
     )
 
 

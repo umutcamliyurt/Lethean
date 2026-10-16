@@ -19,6 +19,9 @@ def _set_sqlite_pragmas(dbapi_connection, connection_record):
     cursor.execute("PRAGMA synchronous=NORMAL")
     cursor.execute("PRAGMA busy_timeout=30000")
     cursor.execute("PRAGMA foreign_keys=ON")
+    cursor.execute("PRAGMA temp_store=MEMORY")
+    cursor.execute("PRAGMA cache_size=-65536")
+    cursor.execute("PRAGMA mmap_size=268435456")
     cursor.close()
 
 
@@ -28,19 +31,26 @@ Base = declarative_base()
 
 def run_migrations() -> None:
     inspector = inspect(engine)
-    if "share_tokens" not in inspector.get_table_names():
-        return
+    tables = inspector.get_table_names()
 
-    existing_columns = {c["name"] for c in inspector.get_columns("share_tokens")}
-    if "delete_token_hash" in existing_columns:
-        return
+    if "share_tokens" in tables:
+        existing_columns = {c["name"] for c in inspector.get_columns("share_tokens")}
+        if "delete_token_hash" not in existing_columns:
+            with engine.begin() as conn:
+                conn.execute(text("ALTER TABLE share_tokens ADD COLUMN delete_token_hash VARCHAR"))
+                conn.execute(text(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS ix_share_tokens_delete_token_hash "
+                    "ON share_tokens (delete_token_hash)"
+                ))
 
-    with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE share_tokens ADD COLUMN delete_token_hash VARCHAR"))
-        conn.execute(text(
-            "CREATE UNIQUE INDEX IF NOT EXISTS ix_share_tokens_delete_token_hash "
-            "ON share_tokens (delete_token_hash)"
-        ))
+    if "files" in tables:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE INDEX IF NOT EXISTS ix_files_vault_listing ON files (vault_id, created_at DESC, id)"
+            ))
+            conn.execute(text("CREATE INDEX IF NOT EXISTS ix_files_vault_size ON files (vault_id, size)"))
+            conn.execute(text("DROP INDEX IF EXISTS ix_files_vault_created"))
+            conn.execute(text("ANALYZE files"))
 
 
 def get_db():

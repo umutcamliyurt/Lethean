@@ -28,7 +28,8 @@ class EncryptedFile(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
 
 
-Index("ix_files_vault_created", EncryptedFile.vault_id, EncryptedFile.created_at, EncryptedFile.id)
+Index("ix_files_vault_listing", EncryptedFile.vault_id, EncryptedFile.created_at.desc(), EncryptedFile.id)
+Index("ix_files_vault_size", EncryptedFile.vault_id, EncryptedFile.size)
 
 
 class ShareToken(Base):

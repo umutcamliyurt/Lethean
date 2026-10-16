@@ -51,39 +51,9 @@ pip install -r requirements.txt
 uvicorn main:app
 ```
 
-The API and web client are served on port 8000. Production deployments must use HTTPS.
+The API and web client are served on port 8000. Production deployments must use HTTPS. Vaults are opened with operator-issued access tokens, created with `python manage_tokens.py create`.
 
-**Access tokens** are issued in identical pairs: one to sign in, one for the decoy vault. Each token binds to the first vault that uses it and carries a quota (10 GB by default). Tokens are stored as SHA-256 hashes.
-
-```bash
-python manage_tokens.py create --label alice --quota-gb 15
-python manage_tokens.py list
-python manage_tokens.py revoke <token-or-id>
-```
-
-**Reverse proxy.** No request carries more than 32 MiB of file data. Recommended nginx settings:
-
-```nginx
-client_max_body_size 99M;
-proxy_request_buffering off;
-proxy_read_timeout 300s;
-add_header Content-Security-Policy "frame-ancestors 'none'" always;
-```
-
-**Configuration**
-
-| Variable | Default | Description |
-|---|---|---|
-| `MAX_UPLOAD_BYTES` | 5 GiB | Maximum file size after padding |
-| `MAX_UPLOAD_PART_BYTES` | 64 MiB | Maximum upload part size |
-| `UPLOAD_SESSION_TTL_SECONDS` | `86400` | Lifetime of unfinished uploads |
-| `MAX_ACTIVE_UPLOAD_SESSIONS` | `32` | Unfinished uploads per vault |
-| `DEFAULT_QUOTA_GB` | `10` | Default token quota |
-| `RATE_LIMIT_PER_MINUTE` | `3000` | Requests per IP |
-| `DURESS_READS_PER_MINUTE` | `30` | Duress reads per token |
-| `SHRED_REQUESTS_PER_MINUTE` | `60` | Wipe requests per IP |
-
-**Admin panel.** Set `ADMIN_PASSWORD` (minimum 12 characters) to enable it on `127.0.0.1:8001`. Configure it with `ADMIN_HOST`, `ADMIN_PORT`, `ADMIN_SESSION_TTL`, `ADMIN_LOGIN_MAX_FAILS`, `ADMIN_LOGIN_LOCKOUT` and `TRUST_PROXY_HEADERS`. Do not expose the port publicly; use an SSH tunnel or an HTTPS proxy.
+See [`SERVER.md`](SERVER.md) for access tokens, the reverse proxy, all configuration variables, the admin panel and the data the server stores.
 
 ## Clients
 
