@@ -35,6 +35,33 @@ const CHUNK_READAHEAD: u64 = 3;
 
 const SIZE_UNKNOWN: u64 = u64::MAX;
 
+const FS_NAME_MAX: usize = 255;
+
+pub fn kernel_safe_name(name: &str) -> std::borrow::Cow<'_, str> {
+    let needs_fix = name.is_empty() || name == "." || name == ".." || name.len() > FS_NAME_MAX || name.contains(['/', '\0']);
+    if !needs_fix {
+        return std::borrow::Cow::Borrowed(name);
+    }
+    let mut out: String = name.chars().map(|c| match c {
+        '/' => '\u{2215}',
+        '\0' => '\u{FFFD}',
+        c => c,
+    }).collect();
+    if out.is_empty() {
+        out = "Untitled".to_string();
+    } else if out == "." || out == ".." {
+        out = out.replace('.', "\u{2024}");
+    }
+    if out.len() > FS_NAME_MAX {
+        let mut cut = FS_NAME_MAX;
+        while !out.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        out.truncate(cut);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 #[derive(Clone)]
 pub struct Entry {
     pub record: FileRecord,
@@ -43,6 +70,7 @@ pub struct Entry {
     pub content: ContentKey,
     pub node_ref: Option<String>,
     pub readable: bool,
+    fs_name: Arc<str>,
     learned_size: Arc<AtomicU64>,
 }
 
@@ -50,7 +78,12 @@ impl Entry {
     fn new(record: FileRecord, meta: FileMeta, file_key: Option<FileKey>) -> Self {
         let content = file_key.as_ref().map(|k| k.content_key()).unwrap_or(ContentKey { key: Zeroizing::new(Vec::new()), format: FileFormat::Legacy });
         let node_ref = file_key.as_ref().map(|k| k.node_ref());
-        Self { record, meta, file_key, content, node_ref, readable: true, learned_size: Arc::new(AtomicU64::new(SIZE_UNKNOWN)) }
+        let fs_name = Arc::from(kernel_safe_name(&meta.name).as_ref());
+        Self { record, meta, file_key, content, node_ref, readable: true, fs_name, learned_size: Arc::new(AtomicU64::new(SIZE_UNKNOWN)) }
+    }
+
+    pub fn fs_name(&self) -> &str {
+        &self.fs_name
     }
 
     fn unreadable(record: FileRecord, file_key: Option<FileKey>) -> Self {
@@ -183,14 +216,14 @@ impl VaultIndex {
     fn attach(&mut self, id: &str) {
         let Some(entry) = self.entries.get(id).cloned() else { return };
         let pk = self.resolve(&entry);
-        self.name_index.entry(pk.clone()).or_default().entry(entry.name().to_string()).or_insert_with(|| id.to_string());
+        self.name_index.entry(pk.clone()).or_default().entry(entry.fs_name().to_string()).or_insert_with(|| id.to_string());
         self.children_by_parent.entry(pk.clone()).or_default().push(id.to_string());
         self.placed.insert(id.to_string(), pk);
     }
 
     fn detach(&mut self, id: &str) {
         let Some(pk) = self.placed.remove(id) else { return };
-        let name = self.entries.get(id).map(|e| e.name().to_string()).unwrap_or_default();
+        let name = self.entries.get(id).map(|e| e.fs_name().to_string()).unwrap_or_default();
         if let Some(v) = self.children_by_parent.get_mut(&pk) {
             if let Some(pos) = v.iter().position(|x| x == id) {
                 v.swap_remove(pos);
@@ -201,7 +234,7 @@ impl VaultIndex {
             if let Some(m) = self.name_index.get_mut(&pk) {
                 m.remove(&name);
             }
-            let replacement = self.children_by_parent.get(&pk).and_then(|sibs| sibs.iter().find(|sid| self.entries.get(*sid).map(|e| e.name() == name).unwrap_or(false)).cloned());
+            let replacement = self.children_by_parent.get(&pk).and_then(|sibs| sibs.iter().find(|sid| self.entries.get(*sid).map(|e| e.fs_name() == name).unwrap_or(false)).cloned());
             if let Some(rid) = replacement {
                 self.name_index.entry(pk).or_default().insert(name, rid);
             }
@@ -403,7 +436,9 @@ struct ChunkedSource {
     chunk_size: u64,
     count: u64,
     sealed_total: u64,
-    scratch: Mutex<Scratch>,
+    scratches: Vec<Mutex<Option<Box<Scratch>>>>,
+    pool: Arc<ScratchPool>,
+    prefetched: Mutex<Vec<bool>>,
     states: Mutex<Vec<u8>>,
     changed: Condvar,
     resident: AtomicU64,
@@ -493,19 +528,22 @@ impl LargeFile {
                 let end_in_chunk = (offset + want as u64 - 1) % c.chunk_size;
                 if end_in_chunk >= c.chunk_size / 8 {
                     for next in last + 1..=(last + CHUNK_READAHEAD).min(c.count - 1) {
-                        if c.state(next) == CHUNK_MISSING {
+                        if c.try_claim(next) {
                             let me = Arc::clone(self);
-                            std::thread::spawn(move || {
+                            let spawned = std::thread::Builder::new().name("lethean-readahead".into()).spawn(move || {
                                 if let Backing::Chunked(c) = &me.backing {
-                                    if let Err(e) = c.ensure(next, me.len) {
+                                    if let Err(e) = c.load_claimed(next, me.len) {
                                         log::debug!("[lethean-cli] read-ahead of chunk {next} failed: {e}");
                                     }
                                 }
                             });
+                            if spawned.is_err() {
+                                c.release_claim(next);
+                            }
                         }
                     }
                 }
-                read_scratch(&c.scratch, offset, want)
+                c.read_resident(offset, want)
             }
         }
     }
@@ -521,7 +559,7 @@ impl LargeFile {
                 let first = offset / c.chunk_size;
                 let last = (offset + want as u64 - 1) / c.chunk_size;
                 if (first..=last).all(|i| c.state(i) == CHUNK_READY) {
-                    Some(read_scratch(&c.scratch, offset, want))
+                    Some(c.read_resident(offset, want))
                 } else {
                     None
                 }
@@ -546,8 +584,60 @@ impl Drop for LoadingReset<'_> {
 }
 
 impl ChunkedSource {
+    fn read_resident(&self, offset: u64, want: usize) -> io::Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(want);
+        let end = offset + want as u64;
+        let mut pos = offset;
+        while pos < end {
+            let index = pos / self.chunk_size;
+            let within = pos % self.chunk_size;
+            let n = (self.chunk_size - within).min(end - pos) as usize;
+            let slot = self.scratches.get(index as usize).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read past the last chunk"))?;
+            let mut guard = lock_plain(slot);
+            let scratch = guard.as_mut().ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "chunk is not loaded"))?;
+            let start = out.len();
+            out.resize(start + n, 0);
+            let mut got = 0;
+            while got < n {
+                let k = scratch.read_at(within + got as u64, &mut out[start + got..start + n])?;
+                if k == 0 {
+                    break;
+                }
+                got += k;
+            }
+            out.truncate(start + got);
+            if got < n {
+                break;
+            }
+            pos += n as u64;
+        }
+        Ok(out)
+    }
+
     fn state(&self, i: u64) -> u8 {
         lock_plain(&self.states).get(i as usize).copied().unwrap_or(CHUNK_READY)
+    }
+
+    fn try_claim(&self, i: u64) -> bool {
+        {
+            let mut tried = lock_plain(&self.prefetched);
+            match tried.get_mut(i as usize) {
+                Some(t) if !*t => *t = true,
+                _ => return false,
+            }
+        }
+        let mut st = lock_plain(&self.states);
+        match st.get_mut(i as usize) {
+            Some(s) if *s == CHUNK_MISSING => {
+                *s = CHUNK_LOADING;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn release_claim(&self, i: u64) {
+        drop(LoadingReset { src: self, index: i as usize, done: false });
     }
 
     fn ensure(&self, i: u64, file_len: u64) -> io::Result<()> {
@@ -565,6 +655,11 @@ impl ChunkedSource {
                 }
             }
         }
+        self.load_claimed(i, file_len)
+    }
+
+    fn load_claimed(&self, i: u64, file_len: u64) -> io::Result<()> {
+        let index = i as usize;
         let mut reset = LoadingReset { src: self, index, done: false };
         let take = (file_len - i * self.chunk_size).min(self.chunk_size);
         let _slot = self.slots.acquire();
@@ -599,25 +694,33 @@ impl ChunkedSource {
         let nonce = chunked::nonce_for(&self.prefix, i)?;
         let aad = chunked::aad_for(self.content.format, i, i == self.count - 1);
         let mut dec = GcmDecryptReader::with_aad(body, &self.content.key, &nonce, &aad).map_err(other_io)?;
-        let base = i * self.chunk_size;
-        let mut buf = Zeroizing::new(vec![0u8; 256 * 1024]);
-        let mut got = 0u64;
-        loop {
-            let n = chunked::read_full(&mut dec, &mut buf)?;
-            if n == 0 {
-                break;
+        let mut slot = lock_plain(&self.scratches[i as usize]);
+        let scratch = slot.get_or_insert_with(|| Box::new(self.pool.new_scratch()));
+        scratch.set_len(0)?;
+        let result = (|| -> io::Result<()> {
+            let mut buf = Zeroizing::new(vec![0u8; 256 * 1024]);
+            let mut got = 0u64;
+            loop {
+                let n = chunked::read_full(&mut dec, &mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                let keep = take.saturating_sub(got).min(n as u64) as usize;
+                if keep > 0 {
+                    scratch.write_at(got, &buf[..keep])?;
+                }
+                chunked::check_filler(self.content.format, &buf[keep..n])?;
+                got += n as u64;
             }
-            let keep = take.saturating_sub(got).min(n as u64) as usize;
-            if keep > 0 {
-                lock_plain(&self.scratch).write_at(base + got, &buf[..keep])?;
+            if got != self.chunk_size {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "chunk ended early"));
             }
-            chunked::check_filler(self.content.format, &buf[keep..n])?;
-            got += n as u64;
+            Ok(())
+        })();
+        if result.is_err() {
+            *slot = None;
         }
-        if got != self.chunk_size {
-            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "chunk ended early"));
-        }
-        Ok(())
+        result
     }
 }
 
@@ -1005,7 +1108,7 @@ impl Vault {
     pub fn list_children(&self, parent_id: Option<&str>) -> Vec<ChildInfo> {
         let index = read_lock(&self.index);
         let mut kids: Vec<ChildInfo> = match index.children_by_parent.get(parent_key(parent_id)) {
-            Some(ids) => ids.iter().filter_map(|id| index.entries.get(id).map(|e| ChildInfo { id: id.clone(), name: e.name().to_string(), is_folder: e.is_folder() })).collect(),
+            Some(ids) => ids.iter().filter_map(|id| index.entries.get(id).map(|e| ChildInfo { id: id.clone(), name: e.fs_name().to_string(), is_folder: e.is_folder() })).collect(),
             None => Vec::new(),
         };
         drop(index);
@@ -1226,8 +1329,7 @@ impl Vault {
             bail!("chunked file has a {}-byte nonce prefix, expected {}", prefix.len(), chunked::PREFIX_LEN);
         }
         let count = chunked::chunk_count(true_size, chunk_size);
-        let mut scratch = self.pool.new_scratch();
-        scratch.set_len(true_size)?;
+        let scratches = (0..count).map(|_| Mutex::new(None)).collect();
         Ok(Arc::new(LargeFile {
             len: true_size,
             backing: Backing::Chunked(ChunkedSource {
@@ -1238,7 +1340,9 @@ impl Vault {
                 chunk_size,
                 count,
                 sealed_total: chunked::sealed_len(true_size, chunk_size),
-                scratch: Mutex::new(scratch),
+                scratches,
+                pool: Arc::clone(&self.pool),
+                prefetched: Mutex::new(vec![false; count as usize]),
                 states: Mutex::new(vec![CHUNK_MISSING; count as usize]),
                 changed: Condvar::new(),
                 resident: AtomicU64::new(0),
@@ -1427,6 +1531,11 @@ impl Vault {
                 None => old.meta.parent_id.clone(),
             },
         };
+        if let (true, Some(t)) = (old.is_folder(), target.as_deref()) {
+            if t == id || self.descendant_ids(id).iter().any(|d| d == t) {
+                bail!("can't move a folder into itself");
+            }
+        }
         if new_key.is_v2() {
             let parent = self.parent_ref(target.as_deref())?;
             new_meta.set_parent(parent.as_ref());

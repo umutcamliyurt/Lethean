@@ -117,18 +117,26 @@ fn finish(label: &str, result: std::result::Result<ureq::Response, ureq::Error>)
             let status_text = resp.status_text().to_string();
             let body_text = resp.into_string().unwrap_or_default();
             let detail = serde_json::from_str::<ErrorDetailBody>(&body_text).ok().and_then(|b| b.detail).unwrap_or(status_text.clone());
-            Err(HttpError { status: code, message: format!("{label}: {detail} ({code})") }.into())
+            Err(HttpError { status: code, message: format!("{label}: {} ({code})", sanitize_server_text(&detail)) }.into())
         }
         Err(ureq::Error::Transport(t)) => Err(anyhow!("{label}: network error ({t})")),
     }
 }
 
+fn sanitize_server_text(s: &str) -> String {
+    const MAX_CHARS: usize = 300;
+    let mut out: String = s.chars().filter(|c| !c.is_control() && !matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')).take(MAX_CHARS + 1).collect();
+    if out.chars().count() > MAX_CHARS {
+        out = out.chars().take(MAX_CHARS).collect::<String>() + "…";
+    }
+    out
+}
+
+const MAX_PREALLOC: usize = 64 * 1024 * 1024;
+
 fn read_body_bytes(resp: ureq::Response) -> std::io::Result<Vec<u8>> {
-    let content_length = resp.header("Content-Length").and_then(|v| v.parse::<usize>().ok());
-    let mut out = match content_length {
-        Some(len) => Vec::with_capacity(len),
-        None => Vec::new(),
-    };
+    let content_length = resp.header("Content-Length").and_then(|v| v.trim().parse::<u64>().ok());
+    let mut out = Vec::with_capacity(content_length.map(|n| n.min(MAX_PREALLOC as u64) as usize).unwrap_or(0));
     resp.into_reader().read_to_end(&mut out)?;
     Ok(out)
 }
@@ -385,21 +393,44 @@ impl ApiClient {
 
         let result = (|| -> Result<FileRecord> {
             let mut body = make_body().map_err(|e| anyhow!("Upload failed: {e}"))?;
-            let mut part = Vec::with_capacity(part_size as usize);
-            for index in 0..part_count {
-                let len = if index == part_count - 1 { total_len - index * part_size } else { part_size };
-                part.clear();
-                part.resize(len as usize, 0);
-                body.read_exact(&mut part).map_err(|e| anyhow!("Upload failed: {e}"))?;
+            let put_part = |index: u64, part: &[u8]| -> Result<()> {
                 retry::run("Upload failed", || {
                     let mut req = self.with_auth(self.stream_agent.put(&self.url(&format!("/files/uploads/{upload_id}/parts/{index}"))), vault_id_override).set("Content-Type", "application/octet-stream");
                     if let Some(t) = &token {
                         req = req.set("X-Access-Token", t);
                     }
-                    req.send_bytes(&part).map_err(AttemptError::from)?;
+                    req.send_bytes(part).map_err(AttemptError::from)?;
                     Ok(())
-                })?;
-            }
+                })
+            };
+            std::thread::scope(|scope| -> Result<()> {
+                let mut in_flight: std::collections::VecDeque<std::thread::ScopedJoinHandle<'_, Result<()>>> = std::collections::VecDeque::new();
+                let join = |h: std::thread::ScopedJoinHandle<'_, Result<()>>| -> Result<()> { h.join().unwrap_or_else(|_| Err(anyhow!("Upload failed: internal error in an upload worker"))) };
+                let mut outcome = Ok(());
+                for index in 0..part_count {
+                    if in_flight.len() >= PARALLEL_PARTS {
+                        outcome = join(in_flight.pop_front().expect("non-empty"));
+                        if outcome.is_err() {
+                            break;
+                        }
+                    }
+                    let len = if index == part_count - 1 { total_len - index * part_size } else { part_size };
+                    let mut part = vec![0u8; len as usize];
+                    if let Err(e) = body.read_exact(&mut part) {
+                        outcome = Err(anyhow!("Upload failed: {e}"));
+                        break;
+                    }
+                    let put_part = &put_part;
+                    in_flight.push_back(scope.spawn(move || put_part(index, &part)));
+                }
+                for h in in_flight {
+                    let r = join(h);
+                    if outcome.is_ok() {
+                        outcome = r;
+                    }
+                }
+                outcome
+            })?;
             retry::run("Upload failed", || {
                 let mut req = self.with_auth(self.agent.post(&self.url(&format!("/files/uploads/{upload_id}/complete"))), vault_id_override);
                 if let Some(t) = &token {
@@ -628,6 +659,7 @@ impl Drop for ApiClient {
 
 pub const SINGLE_REQUEST_MAX_BYTES: u64 = 32 * 1024 * 1024 + 1024;
 pub const MULTIPART_PART_BYTES: u64 = 32 * 1024 * 1024 + 16;
+pub const PARALLEL_PARTS: usize = 3;
 
 #[derive(Debug, Deserialize)]
 pub struct RemoteDuress {

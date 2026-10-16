@@ -24,7 +24,7 @@ struct Cli {
     #[arg(long, global = true)]
     server: Option<String>,
 
-    #[arg(long, global = true)]
+    #[arg(long, global = true, env = "LETHEAN_ACCESS_TOKEN", hide_env_values = true)]
     access_token: Option<String>,
 
     #[arg(long, global = true, default_value_t = kdf::CURRENT_KDF_VERSION)]
@@ -292,20 +292,26 @@ fn format_bytes(n: u64) -> String {
     }
 }
 
+fn printable(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() || matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}') { c.escape_unicode().to_string() } else { c.to_string() }).collect()
+}
+
 fn cmd_tree(cli: &Cli, config: &Config) -> Result<()> {
     let vault = unlock_session(cli, config)?;
-    fn walk(vault: &Vault, parent_id: Option<&str>, depth: usize) {
+    fn walk(vault: &Vault, parent_id: Option<&str>, depth: usize, seen: &mut std::collections::HashSet<String>) {
         for entry in vault.children_of(parent_id) {
             let indent = "  ".repeat(depth);
             if entry.is_folder() {
-                println!("{indent}{}/  [{}]", entry.name(), entry.record.id);
-                walk(vault, Some(&entry.record.id), depth + 1);
+                println!("{indent}{}/  [{}]", printable(entry.name()), printable(&entry.record.id));
+                if seen.insert(entry.record.id.clone()) {
+                    walk(vault, Some(&entry.record.id), depth + 1, seen);
+                }
             } else {
-                println!("{indent}{}  ({}, id {})", entry.name(), format_bytes(entry.size()), entry.record.id);
+                println!("{indent}{}  ({}, id {})", printable(entry.name()), format_bytes(entry.size()), printable(&entry.record.id));
             }
         }
     }
-    walk(&vault, None, 0);
+    walk(&vault, None, 0, &mut std::collections::HashSet::new());
     vault.close();
     Ok(())
 }
@@ -383,12 +389,12 @@ fn cmd_upgrade(cli: &Cli, config: &Config, include_hidden: bool) -> Result<()> {
     eprintln!("Upgrading {legacy} item(s). Each is re-encrypted, uploaded, and checked before its old copy is deleted. Share links to upgraded items will stop working.");
     let report = upgrade::upgrade_legacy_items(&vault, |done, total, name| {
         if !name.is_empty() {
-            eprintln!("[{}/{}] {name}", (done + 1).min(total), total);
+            eprintln!("[{}/{}] {}", (done + 1).min(total), total, printable(name));
         }
     })?;
     println!("Upgraded {} item(s).", report.upgraded);
     for (name, err) in &report.failed {
-        eprintln!("- couldn't upgrade \"{name}\": {err}");
+        eprintln!("- couldn't upgrade \"{}\": {err}", printable(name));
     }
     if report.folders_kept > 0 {
         eprintln!("{} old folder(s) were kept because something inside couldn't be upgraded.", report.folders_kept);
@@ -411,9 +417,9 @@ fn cmd_share(cli: &Cli, config: &Config, file_id: String, max_downloads: Option<
     let vault = unlock_session(cli, config)?;
     let opts = api::CreateShareOptions { max_downloads, expires_in_seconds, allow_delete };
     let share = vault.api.create_file_share(&file_id, &opts)?;
-    println!("share_token = {}", share.share_token);
+    println!("share_token = {}", printable(&share.share_token));
     if let Some(exp) = share.expires_at {
-        println!("expires_at  = {exp}");
+        println!("expires_at  = {}", printable(&exp));
     }
     println!("max_downloads = {}", share.max_downloads);
     vault.close();
@@ -515,9 +521,19 @@ fn cmd_duress(cli: &Cli, config: &Config, action: DuressAction) -> Result<()> {
     }
 }
 
+fn access_token_on_command_line() -> bool {
+    std::env::args_os().any(|a| {
+        let a = a.to_string_lossy();
+        a == "--access-token" || a.starts_with("--access-token=")
+    })
+}
+
 fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     let cli = Cli::parse();
+    if access_token_on_command_line() {
+        eprintln!("Warning: --access-token on the command line is visible to other users on this machine. Use the LETHEAN_ACCESS_TOKEN environment variable or `lethean-fuse config set-token` instead.");
+    }
     let config = Config::load()?;
 
     match cli.command {

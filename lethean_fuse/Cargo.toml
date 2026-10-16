@@ -13,7 +13,7 @@ name = "lethean-fuse"
 path = "src/main.rs"
 
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 thiserror = "1"
 dirs = "5"
@@ -35,7 +35,7 @@ hex = "0.4"
 
 flate2 = "1"
 
-fuser = "0.14"
+fuser = { version = "0.14", features = ["abi-7-31"] }
 libc = "0.2"
 
 env_logger = "0.11"

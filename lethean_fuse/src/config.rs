@@ -70,19 +70,44 @@ impl Config {
     }
 
     pub fn save(&self) -> Result<()> {
-        let path = config_path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let raw = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, raw)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
+        save_private(&config_path()?, serde_json::to_string_pretty(self)?.as_bytes())
     }
+}
+
+fn save_private(path: &std::path::Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+    let parent = path.parent().context("config path has no parent directory")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(not(unix))]
+    std::fs::create_dir_all(parent)?;
+
+    let mut suffix = [0u8; 8];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut suffix);
+    let tmp = parent.join(format!(".config.json.{}.tmp", hex::encode(suffix)));
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let result = (|| -> Result<()> {
+        let mut f = opts.open(&tmp).with_context(|| format!("writing {}", tmp.display()))?;
+        f.write_all(data)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path).with_context(|| format!("replacing {}", path.display()))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 pub struct ConfigDuressCache;

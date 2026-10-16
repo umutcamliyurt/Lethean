@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, SystemTime};
 
 use fuser::consts::{FOPEN_DIRECT_IO, FOPEN_KEEP_CACHE};
-use fuser::{FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow};
+use fuser::{FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow};
 use libc::{c_int, EBADF, EDQUOT, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, O_ACCMODE, O_TRUNC};
 use log::{error, warn};
 use zeroize::Zeroizing;
@@ -19,6 +19,11 @@ use crate::vault::{LargeFile, Stat, Vault};
 
 const TTL: Duration = Duration::from_secs(5);
 const ROOT_INO: u64 = 1;
+
+#[cfg(target_os = "macos")]
+const RENAME_NOREPLACE_FLAG: u32 = 0x4;
+#[cfg(not(target_os = "macos"))]
+const RENAME_NOREPLACE_FLAG: u32 = 0x1;
 
 const NET_WORKERS: usize = 64;
 const IO_WORKERS: usize = 8;
@@ -70,6 +75,7 @@ struct DirEntry {
     ino: u64,
     kind: FileType,
     name: String,
+    id: Option<String>,
 }
 
 struct FsState {
@@ -412,11 +418,11 @@ fn make_attr(ctx: AttrCtx, ino: u64, kind: FileType, size: u64, perm: u16) -> Fi
 }
 
 fn dir_attr(ctx: AttrCtx, ino: u64) -> FileAttr {
-    make_attr(ctx, ino, FileType::Directory, 0, 0o755)
+    make_attr(ctx, ino, FileType::Directory, 0, 0o700)
 }
 
 fn file_attr(ctx: AttrCtx, ino: u64, size: u64) -> FileAttr {
-    make_attr(ctx, ino, FileType::RegularFile, size, 0o644)
+    make_attr(ctx, ino, FileType::RegularFile, size, 0o600)
 }
 
 fn attr_from_stat(state: &FsState, ctx: AttrCtx, ino: u64, stat: Stat) -> FileAttr {
@@ -540,17 +546,29 @@ fn slice_reply(data: &[u8], offset: u64, size: usize) -> &[u8] {
 fn build_listing(state: &FsState, vault: &Vault, ino: u64, dir_id: Option<&str>) -> Vec<DirEntry> {
     let children = vault.list_children(dir_id);
     let mut entries = Vec::with_capacity(children.len() + 2);
-    entries.push(DirEntry { ino, kind: FileType::Directory, name: ".".to_string() });
-    entries.push(DirEntry { ino: ROOT_INO, kind: FileType::Directory, name: "..".to_string() });
+    entries.push(DirEntry { ino, kind: FileType::Directory, name: ".".to_string(), id: None });
+    entries.push(DirEntry { ino: ROOT_INO, kind: FileType::Directory, name: "..".to_string(), id: None });
     for child in children {
-        entries.push(DirEntry { ino: peek_ino(state, &child.id), kind: if child.is_folder { FileType::Directory } else { FileType::RegularFile }, name: child.name });
+        entries.push(DirEntry { ino: peek_ino(state, &child.id), kind: if child.is_folder { FileType::Directory } else { FileType::RegularFile }, name: child.name, id: Some(child.id) });
     }
     for ((parent, name), pino) in &state.pending_by_key {
         if parent.as_deref() == dir_id {
-            entries.push(DirEntry { ino: *pino, kind: FileType::RegularFile, name: name.clone() });
+            entries.push(DirEntry { ino: *pino, kind: FileType::RegularFile, name: name.clone(), id: None });
         }
     }
     entries
+}
+
+fn listing_for(state: &mut FsState, vault: &Vault, ino: u64, fh: u64, offset: i64) -> Result<Arc<Vec<DirEntry>>, c_int> {
+    if offset > 0 {
+        if let Some(l) = state.dir_handles.get(&fh) {
+            return Ok(Arc::clone(l));
+        }
+    }
+    let dir_id = dir_id_of_ino(state, vault, ino)?;
+    let listing = Arc::new(build_listing(state, vault, ino, dir_id.as_deref()));
+    state.dir_handles.insert(fh, Arc::clone(&listing));
+    Ok(listing)
 }
 
 impl VaultFs {
@@ -601,6 +619,10 @@ impl Filesystem for VaultFs {
     fn init(&mut self, _req: &Request<'_>, config: &mut KernelConfig) -> Result<(), c_int> {
         if let Err(max) = config.set_max_readahead(1024 * 1024) {
             let _ = config.set_max_readahead(max);
+        }
+        let _ = config.add_capabilities(fuser::consts::FUSE_DO_READDIRPLUS);
+        if let Err(max) = config.set_max_background(64) {
+            let _ = config.set_max_background(max);
         }
         Ok(())
     }
@@ -896,7 +918,10 @@ impl Filesystem for VaultFs {
         });
     }
 
-    fn rename(&mut self, _req: &Request<'_>, parent: u64, name: &std::ffi::OsStr, newparent: u64, newname: &std::ffi::OsStr, _flags: u32, reply: ReplyEmpty) {
+    fn rename(&mut self, _req: &Request<'_>, parent: u64, name: &std::ffi::OsStr, newparent: u64, newname: &std::ffi::OsStr, flags: u32, reply: ReplyEmpty) {
+        if flags & !RENAME_NOREPLACE_FLAG != 0 {
+            return reply.error(EINVAL);
+        }
         let name = match name_str(name) {
             Ok(n) => n.to_string(),
             Err(e) => return reply.error(e),
@@ -921,7 +946,35 @@ impl Filesystem for VaultFs {
             Some(e) => e,
             None => return reply.error(ENOENT),
         };
-        let existing_id_to_replace = self.vault.find_child(new_parent_id.as_deref(), &newname).map(|e| e.record.id.clone()).filter(|id| *id != entry.record.id);
+        let existing = self.vault.find_child(new_parent_id.as_deref(), &newname).filter(|e| e.record.id != entry.record.id);
+        let pending_target = lock_state(&self.state).pending_by_key.contains_key(&(new_parent_id.clone(), newname.clone()));
+        if (existing.is_some() || pending_target) && flags & RENAME_NOREPLACE_FLAG != 0 {
+            return reply.error(EEXIST);
+        }
+        if pending_target {
+            return reply.error(libc::EBUSY);
+        }
+        if let Some(target) = &existing {
+            match (entry.is_folder(), target.is_folder()) {
+                (true, false) => return reply.error(ENOTDIR),
+                (false, true) => return reply.error(EISDIR),
+                (true, true) => {
+                    let has_pending = lock_state(&self.state).pending_by_key.keys().any(|(p, _)| p.as_deref() == Some(target.record.id.as_str()));
+                    if self.vault.has_children(&target.record.id) || has_pending {
+                        return reply.error(ENOTEMPTY);
+                    }
+                }
+                (false, false) => {}
+            }
+        }
+        if entry.is_folder() {
+            if let Some(np) = new_parent_id.as_deref() {
+                if np == entry.record.id || self.vault.descendant_ids(&entry.record.id).iter().any(|d| d == np) {
+                    return reply.error(EINVAL);
+                }
+            }
+        }
+        let existing_id_to_replace = existing.map(|e| e.record.id.clone());
 
         let name_changed = if name == newname { None } else { Some(newname) };
         let parent_changed = if parent_id == new_parent_id { None } else { Some(new_parent_id) };
@@ -933,15 +986,25 @@ impl Filesystem for VaultFs {
         self.net_workers.run(move || {
             let _permit = net_sem.acquire();
             let outcome = run_guarded("rename", move || {
-                if let Some(existing_id) = &existing_id_to_replace {
-                    let _ = vault.delete_one(existing_id);
-                    lock_state(&state_arc).ino_of_id.remove(existing_id);
-                }
                 let parent_changed_ref = parent_changed.as_ref().map(|p| p.as_deref());
                 let new_entry = vault.rename_or_move(&entry_id, name_changed.as_deref(), parent_changed_ref).map_err(|e| {
                     error!("[lethean-cli] rename failed: {e:#}");
                     EIO
                 })?;
+                if let Some(existing_id) = &existing_id_to_replace {
+                    match vault.delete_one(existing_id) {
+                        Ok(()) => {
+                            let mut state = lock_state(&state_arc);
+                            if let Some(ino) = state.ino_of_id.remove(existing_id) {
+                                state.cached_content.remove(&ino);
+                                if let Some(w) = state.writers.get(&ino) {
+                                    *lock_plain(&w.file.target) = WriteTarget::Discarded;
+                                }
+                            }
+                        }
+                        Err(e) => warn!("[lethean-cli] rename: the replaced item could not be removed and is still there: {e:#}"),
+                    }
+                }
                 let mut state = lock_state(&state_arc);
                 if let Some(&ino) = state.ino_of_id.get(&entry_id) {
                     repoint_ino_to(&mut state, ino, Some(&entry_id), &new_entry.record.id);
@@ -1303,17 +1366,9 @@ impl Filesystem for VaultFs {
 
     fn readdir(&mut self, _req: &Request<'_>, ino: u64, fh: u64, offset: i64, mut reply: ReplyDirectory) {
         let mut state = lock_state(&self.state);
-        let listing = match (offset, state.dir_handles.get(&fh)) {
-            (o, Some(l)) if o > 0 => Arc::clone(l),
-            _ => {
-                let dir_id = match dir_id_of_ino(&state, &self.vault, ino) {
-                    Ok(p) => p,
-                    Err(e) => return reply.error(e),
-                };
-                let listing = Arc::new(build_listing(&state, &self.vault, ino, dir_id.as_deref()));
-                state.dir_handles.insert(fh, Arc::clone(&listing));
-                listing
-            }
+        let listing = match listing_for(&mut state, &self.vault, ino, fh, offset) {
+            Ok(l) => l,
+            Err(e) => return reply.error(e),
         };
         drop(state);
 
@@ -1322,6 +1377,35 @@ impl Filesystem for VaultFs {
                 break;
             }
         }
+        reply.ok();
+    }
+
+    fn readdirplus(&mut self, _req: &Request<'_>, ino: u64, fh: u64, offset: i64, mut reply: ReplyDirectoryPlus) {
+        let mut state = lock_state(&self.state);
+        let listing = match listing_for(&mut state, &self.vault, ino, fh, offset) {
+            Ok(l) => l,
+            Err(e) => return reply.error(e),
+        };
+        for (i, entry) in listing.iter().enumerate().skip(offset.max(0) as usize) {
+            let (entry_ino, attr) = match &entry.id {
+                Some(id) => {
+                    let Some(stat) = self.vault.stat(id) else { continue };
+                    let entry_ino = ino_for_remote(&mut state, id);
+                    (entry_ino, attr_from_stat(&state, self.ctx, entry_ino, stat))
+                }
+                None => match attr_for_known_ino(&state, &self.vault, self.ctx, entry.ino) {
+                    Some(attr) => (entry.ino, attr),
+                    None => continue,
+                },
+            };
+            if reply.add(entry_ino, (i + 1) as i64, &entry.name, &TTL, &attr, 0) {
+                break;
+            }
+            if entry.name != "." && entry.name != ".." {
+                add_lookup(&mut state, entry_ino);
+            }
+        }
+        drop(state);
         reply.ok();
     }
 

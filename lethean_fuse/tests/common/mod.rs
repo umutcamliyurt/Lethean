@@ -28,6 +28,14 @@ pub struct Server {
     pub full_gets: Arc<AtomicUsize>,
     pub bytes_served: Arc<AtomicUsize>,
     pub rotation: Arc<Mutex<Option<String>>>,
+    pub parts_seen: Arc<AtomicUsize>,
+    pub peak_parts_in_flight: Arc<AtomicUsize>,
+}
+
+struct PendingUpload {
+    fields: HashMap<String, String>,
+    part_count: usize,
+    parts: HashMap<usize, Vec<u8>>,
 }
 
 pub struct ServerOpts {
@@ -69,6 +77,14 @@ fn parse_fields(head: &[u8]) -> HashMap<String, String> {
 }
 
 pub fn start_server(opts: ServerOpts) -> Server {
+    start_server_ext(opts, false)
+}
+
+pub fn start_multipart_server(opts: ServerOpts) -> Server {
+    start_server_ext(opts, true)
+}
+
+fn start_server_ext(opts: ServerOpts, multipart: bool) -> Server {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().unwrap();
     let files: Arc<Mutex<Vec<(String, Stored)>>> = Arc::default();
@@ -79,8 +95,12 @@ pub fn start_server(opts: ServerOpts) -> Server {
     let rotation: Arc<Mutex<Option<String>>> = Arc::default();
     let failed_once = Arc::new(AtomicBool::new(false));
     let opts = Arc::new(opts);
+    let parts_seen = Arc::new(AtomicUsize::new(0));
+    let peak_parts_in_flight = Arc::new(AtomicUsize::new(0));
+    let parts_in_flight = Arc::new(AtomicUsize::new(0));
+    let pending: Arc<Mutex<HashMap<String, PendingUpload>>> = Arc::default();
 
-    let server = Server { addr, files: Arc::clone(&files), uploads_seen: Arc::clone(&uploads_seen), range_gets: Arc::clone(&range_gets), full_gets: Arc::clone(&full_gets), bytes_served: Arc::clone(&bytes_served), rotation: Arc::clone(&rotation) };
+    let server = Server { addr, files: Arc::clone(&files), uploads_seen: Arc::clone(&uploads_seen), range_gets: Arc::clone(&range_gets), full_gets: Arc::clone(&full_gets), bytes_served: Arc::clone(&bytes_served), rotation: Arc::clone(&rotation), parts_seen: Arc::clone(&parts_seen), peak_parts_in_flight: Arc::clone(&peak_parts_in_flight) };
 
     thread::spawn(move || {
         for stream in listener.incoming() {
@@ -94,6 +114,10 @@ pub fn start_server(opts: ServerOpts) -> Server {
             let rotation = Arc::clone(&rotation);
             let failed_once = Arc::clone(&failed_once);
             let opts = Arc::clone(&opts);
+            let parts_seen = Arc::clone(&parts_seen);
+            let peak_parts_in_flight = Arc::clone(&peak_parts_in_flight);
+            let parts_in_flight = Arc::clone(&parts_in_flight);
+            let pending = Arc::clone(&pending);
             thread::spawn(move || {
                 let mut writer = stream.try_clone().unwrap();
                 let mut reader = BufReader::with_capacity(64 * 1024, stream);
@@ -128,7 +152,59 @@ pub fn start_server(opts: ServerOpts) -> Server {
                         w.flush()
                     };
 
-                    if method == "POST" && path == "/files" {
+                    if multipart && path.starts_with("/files/uploads") {
+                        let mut body = vec![0u8; content_length as usize];
+                        if reader.read_exact(&mut body).is_err() {
+                            return;
+                        }
+                        let rest = path.trim_start_matches("/files/uploads").trim_start_matches('/');
+                        let segs: Vec<&str> = rest.split('/').collect();
+                        let reply = if method == "POST" && rest.is_empty() {
+                            let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                            let mut fields = HashMap::new();
+                            for k in ["content_iv", "encrypted_metadata", "metadata_iv", "wrapped_file_key", "wrap_iv"] {
+                                fields.insert(k.to_string(), v[k].as_str().unwrap().to_string());
+                            }
+                            let id = format!("up{:030}", uploads_seen.fetch_add(1, Ordering::SeqCst));
+                            pending.lock().unwrap().insert(id.clone(), PendingUpload { fields, part_count: v["part_count"].as_u64().unwrap() as usize, parts: HashMap::new() });
+                            ("200 OK", format!(r#"{{"upload_id":"{id}"}}"#))
+                        } else if method == "PUT" && segs.len() == 3 && segs[1] == "parts" {
+                            let now = parts_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                            peak_parts_in_flight.fetch_max(now, Ordering::SeqCst);
+                            thread::sleep(std::time::Duration::from_millis(150));
+                            parts_in_flight.fetch_sub(1, Ordering::SeqCst);
+                            parts_seen.fetch_add(1, Ordering::SeqCst);
+                            let n: usize = segs[2].parse().unwrap();
+                            if let Some(u) = pending.lock().unwrap().get_mut(segs[0]) {
+                                u.parts.insert(n, body);
+                            }
+                            ("200 OK", "{}".to_string())
+                        } else if method == "POST" && segs.len() == 2 && segs[1] == "complete" {
+                            let u = pending.lock().unwrap().remove(segs[0]).unwrap();
+                            assert_eq!(u.parts.len(), u.part_count, "every part must arrive before complete");
+                            let mut blob = Vec::new();
+                            for i in 0..u.part_count {
+                                blob.extend_from_slice(&u.parts[&i]);
+                            }
+                            let blob_len = blob.len() as u64;
+                            let id = format!("file{:028}", uploads_seen.fetch_add(1, Ordering::SeqCst) + 1);
+                            let f = &u.fields;
+                            let json = format!(
+                                r#"{{"id":"{id}","content_iv":"{}","encrypted_metadata":"{}","metadata_iv":"{}","wrapped_file_key":"{}","wrap_iv":"{}","size":{blob_len}}}"#,
+                                f["content_iv"], f["encrypted_metadata"], f["metadata_iv"], f["wrapped_file_key"], f["wrap_iv"]
+                            );
+                            files.lock().unwrap().push((id, Stored { generator: None, fields: u.fields, blob, blob_len }));
+                            ("200 OK", json)
+                        } else if method == "DELETE" {
+                            pending.lock().unwrap().remove(segs[0]);
+                            ("200 OK", "{}".to_string())
+                        } else {
+                            ("404 Not Found", String::new())
+                        };
+                        if respond(&mut writer, reply.0, "", reply.1.as_bytes()).is_err() {
+                            return;
+                        }
+                    } else if method == "POST" && path == "/files" {
                         let n = uploads_seen.fetch_add(1, Ordering::SeqCst);
                         let boundary = content_type.split("boundary=").nth(1).unwrap_or("").to_string();
                         let tail_len = format!("\r\n--{boundary}--\r\n").len() as u64;
