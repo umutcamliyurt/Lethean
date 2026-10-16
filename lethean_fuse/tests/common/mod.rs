@@ -76,6 +76,32 @@ fn parse_fields(head: &[u8]) -> HashMap<String, String> {
     out
 }
 
+fn mock_bandwidth() -> Option<f64> {
+    std::env::var("MOCK_BANDWIDTH_MBPS").ok().and_then(|v| v.parse::<f64>().ok()).filter(|v| *v > 0.0)
+}
+
+static LOST_ONE_RESPONSE: AtomicBool = AtomicBool::new(false);
+
+static LINK_FREE_AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+fn paced_write(w: &mut TcpStream, body: &[u8]) -> io::Result<()> {
+    let rate = mock_bandwidth().unwrap_or(f64::INFINITY) * 1024.0 * 1024.0;
+    for piece in body.chunks(64 * 1024) {
+        let at = {
+            let mut free = LINK_FREE_AT.lock().unwrap();
+            let now = std::time::Instant::now();
+            let start = free.map(|t| t.max(now)).unwrap_or(now);
+            *free = Some(start + std::time::Duration::from_secs_f64(piece.len() as f64 / rate));
+            start
+        };
+        if let Some(d) = at.checked_duration_since(std::time::Instant::now()) {
+            thread::sleep(d);
+        }
+        w.write_all(piece)?;
+    }
+    w.flush()
+}
+
 pub fn start_server(opts: ServerOpts) -> Server {
     start_server_ext(opts, false)
 }
@@ -144,6 +170,10 @@ fn start_server_ext(opts: ServerOpts, multipart: bool) -> Server {
                         } else if let Some(v) = lower.strip_prefix("range:") {
                             range = Some(v.trim().to_string());
                         }
+                    }
+
+                    if let Some(ms) = std::env::var("MOCK_LATENCY_MS").ok().and_then(|v| v.parse::<u64>().ok()) {
+                        thread::sleep(std::time::Duration::from_millis(ms));
                     }
 
                     let respond = |w: &mut TcpStream, status: &str, extra: &str, body: &[u8]| -> io::Result<()> {
@@ -257,6 +287,10 @@ fn start_server_ext(opts: ServerOpts, multipart: bool) -> Server {
                             fields["content_iv"], fields["encrypted_metadata"], fields["metadata_iv"], fields["wrapped_file_key"], fields["wrap_iv"]
                         );
                         files.lock().unwrap().push((id, Stored { generator: None, fields, blob, blob_len }));
+                        if std::env::var_os("MOCK_LOSE_FIRST_UPLOAD_RESPONSE").is_some() && !LOST_ONE_RESPONSE.swap(true, Ordering::SeqCst) {
+                            let _ = writer.shutdown(std::net::Shutdown::Both);
+                            return;
+                        }
                         if respond(&mut writer, "200 OK", "", json.as_bytes()).is_err() {
                             return;
                         }
@@ -317,7 +351,14 @@ fn start_server_ext(opts: ServerOpts, multipart: bool) -> Server {
                             Plan::Partial(body, a, b, total) => {
                                 range_gets.fetch_add(1, Ordering::SeqCst);
                                 bytes_served.fetch_add(body.len(), Ordering::SeqCst);
-                                respond(&mut writer, "206 Partial Content", &format!("Content-Range: bytes {a}-{b}/{total}\r\n"), &body)
+                                if mock_bandwidth().is_some() {
+                                    if write!(writer, "HTTP/1.1 206 Partial Content\r\nContent-Type: application/octet-stream\r\nContent-Length: {}\r\nContent-Range: bytes {a}-{b}/{total}\r\n\r\n", body.len()).is_err() {
+                                        return;
+                                    }
+                                    paced_write(&mut writer, &body)
+                                } else {
+                                    respond(&mut writer, "206 Partial Content", &format!("Content-Range: bytes {a}-{b}/{total}\r\n"), &body)
+                                }
                             }
                             Plan::Full(blob) => {
                                 full_gets.fetch_add(1, Ordering::SeqCst);

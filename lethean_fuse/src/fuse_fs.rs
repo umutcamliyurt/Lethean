@@ -6,16 +6,17 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use fuser::consts::{FOPEN_DIRECT_IO, FOPEN_KEEP_CACHE};
+use std::sync::atomic::AtomicBool;
 use fuser::{FileAttr, FileType, Filesystem, KernelConfig, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory, ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow};
 use libc::{c_int, EBADF, EDQUOT, EEXIST, EFBIG, EINVAL, EIO, EISDIR, ENOENT, ENOSPC, ENOTDIR, ENOTEMPTY, O_ACCMODE, O_TRUNC};
 use log::{error, warn};
 use zeroize::Zeroizing;
 
 use crate::scratch::{Scratch, ScratchPool, ScratchReader, ScratchWriter, DEFAULT_POOL_BYTES};
-use crate::vault::{LargeFile, Stat, Vault};
+use crate::vault::{LargeFile, Stat, SyncReport, Vault, UNRESOLVED_PARENT};
 
 const TTL: Duration = Duration::from_secs(5);
 const ROOT_INO: u64 = 1;
@@ -44,8 +45,50 @@ struct PendingFile {
 #[derive(Clone)]
 enum WriteTarget {
     NewFile { parent_id: Option<String>, name: String, mime: String },
-    ExistingFile { id: String },
+    ExistingFile { id: String, save_as: SaveAs },
     Discarded,
+}
+
+#[derive(Clone, Debug)]
+struct SaveAs {
+    parent_id: Option<String>,
+    name: String,
+    mime: String,
+}
+
+fn save_as_for(vault: &Vault, id: &str) -> SaveAs {
+    let entry = vault.entry(id);
+    let parent_id = match vault.parent_of(id) {
+        Some(Some(p)) if p != UNRESOLVED_PARENT => Some(p),
+        _ => None,
+    };
+    SaveAs {
+        parent_id,
+        name: entry.as_ref().map(|e| e.fs_name().to_string()).unwrap_or_else(|| "Untitled".to_string()),
+        mime: entry.as_ref().map(|e| e.meta.mime.clone()).unwrap_or_else(|| "application/octet-stream".to_string()),
+    }
+}
+
+fn existing_target(vault: &Vault, id: String) -> WriteTarget {
+    let save_as = save_as_for(vault, &id);
+    WriteTarget::ExistingFile { id, save_as }
+}
+
+fn free_name(vault: &Vault, parent: Option<&str>, name: &str) -> String {
+    if vault.find_child(parent, name).is_none() {
+        return name.to_string();
+    }
+    let (stem, ext) = match name.rfind('.') {
+        Some(i) if i > 0 => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    };
+    for n in 1.. {
+        let candidate = if n == 1 { format!("{stem} (conflicted copy){ext}") } else { format!("{stem} (conflicted copy {n}){ext}") };
+        if vault.find_child(parent, &candidate).is_none() {
+            return candidate;
+        }
+    }
+    unreachable!()
 }
 
 struct WriteFile {
@@ -140,7 +183,7 @@ fn errno_of(e: &anyhow::Error) -> c_int {
     EIO
 }
 
-const MAX_CONCURRENT_NETWORK_OPS: usize = 8;
+const MAX_CONCURRENT_NETWORK_OPS: usize = 16;
 
 struct NetSemaphore {
     available: Mutex<usize>,
@@ -274,12 +317,329 @@ impl BurstPool {
 pub struct FsOptions {
     pub scratch_dir: Option<PathBuf>,
     pub scratch_ram_bytes: u64,
+    pub refresh_interval: Option<Duration>,
+    pub prefetch: bool,
 }
+
+pub const DEFAULT_REFRESH_INTERVAL: Duration = Duration::from_secs(10);
 
 impl Default for FsOptions {
     fn default() -> Self {
-        Self { scratch_dir: None, scratch_ram_bytes: DEFAULT_POOL_BYTES }
+        Self { scratch_dir: None, scratch_ram_bytes: DEFAULT_POOL_BYTES, refresh_interval: Some(DEFAULT_REFRESH_INTERVAL), prefetch: true }
     }
+}
+
+enum NotifyMsg {
+    Entry(u64, String),
+    Inode(u64),
+}
+
+#[derive(Default)]
+pub struct NotifyHub {
+    tx: Mutex<Option<std::sync::mpsc::Sender<NotifyMsg>>>,
+}
+
+pub type NotifierSlot = Arc<NotifyHub>;
+
+impl NotifyHub {
+    pub fn attach(&self, notifier: fuser::Notifier) {
+        let (tx, rx) = std::sync::mpsc::channel::<NotifyMsg>();
+        let spawned = thread::Builder::new().name("lethean-notify".into()).spawn(move || {
+            for msg in rx {
+                let _ = match msg {
+                    NotifyMsg::Entry(parent, name) => notifier.inval_entry(parent, std::ffi::OsStr::new(&name)),
+                    NotifyMsg::Inode(ino) => notifier.inval_inode(ino, 0, 0),
+                };
+            }
+        });
+        if spawned.is_ok() {
+            *lock_plain(&self.tx) = Some(tx);
+        }
+    }
+
+    pub fn is_attached(&self) -> bool {
+        lock_plain(&self.tx).is_some()
+    }
+
+    fn send(&self, msg: NotifyMsg) {
+        if let Some(tx) = lock_plain(&self.tx).as_ref() {
+            let _ = tx.send(msg);
+        }
+    }
+
+    fn entry(&self, parent: u64, name: &str) {
+        self.send(NotifyMsg::Entry(parent, name.to_string()));
+    }
+
+    fn inode(&self, ino: u64) {
+        self.send(NotifyMsg::Inode(ino));
+    }
+
+    fn detach(&self) {
+        lock_plain(&self.tx).take();
+    }
+}
+
+const OPENDIR_SYNC_BUDGET: Duration = Duration::from_millis(300);
+const OPENDIR_MAX_AGE: Duration = Duration::from_secs(2);
+
+struct SyncCtl {
+    running: bool,
+    started: Option<Instant>,
+    finished: Option<Instant>,
+    last_duration: Duration,
+    generation: u64,
+    failing: bool,
+}
+
+struct Syncer {
+    vault: Arc<Vault>,
+    state: Arc<Mutex<FsState>>,
+    notify: NotifierSlot,
+    interval: Duration,
+    ctl: Mutex<SyncCtl>,
+    changed: Condvar,
+    stop: AtomicBool,
+}
+
+impl Syncer {
+    fn new(vault: Arc<Vault>, state: Arc<Mutex<FsState>>, notify: NotifierSlot, interval: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            vault: Arc::clone(&vault),
+            state,
+            notify,
+            interval,
+            ctl: Mutex::new(SyncCtl { running: false, started: None, finished: Some(Instant::now()), last_duration: vault.last_listing_duration(), generation: 0, failing: false }),
+            changed: Condvar::new(),
+            stop: AtomicBool::new(false),
+        })
+    }
+
+    fn min_gap(ctl: &SyncCtl, floor: Duration) -> Duration {
+        floor.max(ctl.last_duration * 30)
+    }
+
+    fn start_locked(self: &Arc<Self>, ctl: &mut SyncCtl) -> u64 {
+        let target = ctl.generation + 1;
+        if ctl.running {
+            return target;
+        }
+        ctl.running = true;
+        ctl.started = Some(Instant::now());
+        let me = Arc::clone(self);
+        let spawned = thread::Builder::new().name("lethean-sync".into()).spawn(move || me.run_once());
+        if spawned.is_err() {
+            ctl.running = false;
+        }
+        target
+    }
+
+    fn kick_if_stale(self: &Arc<Self>, max_age: Duration, budget: Duration) -> Option<(u64, Instant)> {
+        if self.stop.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut ctl = lock_plain(&self.ctl);
+        if !ctl.running {
+            let gap = Self::min_gap(&ctl, max_age);
+            if ctl.finished.map(|t| t.elapsed() < gap).unwrap_or(false) {
+                return None;
+            }
+            self.start_locked(&mut ctl);
+        }
+        let expected = ctl.last_duration.max(self.vault.last_listing_duration());
+        if expected > budget {
+            return None;
+        }
+        let started = ctl.started.unwrap_or_else(Instant::now);
+        Some((ctl.generation + 1, started + budget))
+    }
+
+    fn wait_until(&self, generation: u64, deadline: Instant) {
+        let mut ctl = lock_plain(&self.ctl);
+        while ctl.generation < generation && !self.stop.load(Ordering::Acquire) {
+            let now = Instant::now();
+            if now >= deadline {
+                return;
+            }
+            ctl = self.changed.wait_timeout(ctl, deadline - now).map(|(g, _)| g).unwrap_or_else(|p| p.into_inner().0);
+        }
+    }
+
+    fn run_once(&self) {
+        let t = Instant::now();
+        let result = run_guarded("refresh", || self.vault.sync().map_err(|e| {
+            let first = !lock_plain(&self.ctl).failing;
+            if first {
+                warn!("[lethean-cli] could not check the vault for changes made elsewhere (will keep trying): {e:#}");
+            }
+            EIO
+        }));
+        let ok = result.is_ok();
+        if let Ok(report) = result {
+            if !report.is_empty() {
+                self.apply(&report);
+            }
+        }
+        if ok {
+            self.heal();
+        }
+        let mut ctl = lock_plain(&self.ctl);
+        ctl.running = false;
+        ctl.generation += 1;
+        ctl.finished = Some(Instant::now());
+        ctl.last_duration = t.elapsed();
+        if ok && ctl.failing {
+            log::info!("[lethean-cli] reconnected; changes made elsewhere are showing again");
+        }
+        ctl.failing = !ok;
+        drop(ctl);
+        self.changed.notify_all();
+    }
+
+    fn apply(&self, report: &SyncReport) {
+        let mut entries: Vec<(u64, String)> = Vec::new();
+        let mut inodes: Vec<u64> = Vec::new();
+        {
+            let mut st = lock_state(&self.state);
+            for (old, new, same_content) in &report.aliases {
+                let Some(&ino) = st.ino_of_id.get(old) else { continue };
+                if st.ino_of_id.contains_key(new) {
+                    continue;
+                }
+                repoint_ino_to(&mut st, ino, Some(old), new);
+                if let Some(w) = st.writers.get(&ino) {
+                    let mut t = lock_plain(&w.file.target);
+                    if let WriteTarget::ExistingFile { id, save_as } = &mut *t {
+                        if id == old {
+                            *id = new.clone();
+                            *save_as = save_as_for(&self.vault, new);
+                        }
+                    }
+                }
+                if *same_content {
+                    if st.cached_content.get(&ino) == Some(old) {
+                        st.cached_content.insert(ino, new.clone());
+                    }
+                } else {
+                    st.cached_content.remove(&ino);
+                    inodes.push(ino);
+                }
+            }
+            for id in &report.modified {
+                if let Some(&ino) = st.ino_of_id.get(id) {
+                    st.cached_content.remove(&ino);
+                    inodes.push(ino);
+                }
+            }
+            for id in &report.removed {
+                if let Some(&ino) = st.ino_of_id.get(id) {
+                    st.cached_content.remove(&ino);
+                }
+            }
+            for (pk, name) in &report.touched_names {
+                let parent = if pk.is_empty() { Some(ROOT_INO) } else { st.ino_of_id.get(pk).copied() };
+                if let Some(p) = parent {
+                    entries.push((p, name.clone()));
+                }
+            }
+        }
+        for (p, name) in entries {
+            self.notify.entry(p, &name);
+        }
+        for ino in inodes {
+            self.notify.inode(ino);
+        }
+    }
+
+    fn heal(&self) {
+        if let Ok(report) = run_guarded("cleanup", || Ok::<_, c_int>(self.vault.heal_pending())) {
+            if !report.is_empty() {
+                self.apply(&report);
+            }
+        }
+    }
+
+    fn background(self: Arc<Self>) {
+        self.heal();
+        loop {
+            {
+                let mut ctl = lock_plain(&self.ctl);
+                loop {
+                    if self.stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    let gap = Self::min_gap(&ctl, self.interval);
+                    let due = ctl.finished.map(|t| t + gap).unwrap_or_else(Instant::now);
+                    let now = Instant::now();
+                    if !ctl.running && now >= due {
+                        break;
+                    }
+                    let wait = if ctl.running { gap } else { due - now };
+                    ctl = self.changed.wait_timeout(ctl, wait).map(|(g, _)| g).unwrap_or_else(|p| p.into_inner().0);
+                }
+                self.start_locked(&mut ctl);
+            }
+        }
+    }
+
+    fn shutdown(&self) {
+        self.stop.store(true, Ordering::Release);
+        self.changed.notify_all();
+    }
+}
+
+#[derive(Default)]
+struct ScanTracker {
+    dir: Option<String>,
+    seen: Vec<String>,
+    last: Option<Instant>,
+    running: std::collections::HashSet<String>,
+}
+
+const SCAN_WINDOW: Duration = Duration::from_secs(3);
+const SCAN_TRIGGER: usize = 3;
+const PREFETCH_MAX_FILE: u64 = 2 * 1024 * 1024;
+const PREFETCH_MAX_BYTES: u64 = 16 * 1024 * 1024;
+const PREFETCH_MAX_FILES: usize = 256;
+const PREFETCH_PARALLELISM: usize = 8;
+
+fn prefetch_dir(vault: &Vault, stop: &AtomicBool, dir: Option<&str>, after_name: &str) {
+    let kids = vault.list_children(dir);
+    let start = kids.iter().position(|c| c.name.as_str() == after_name).map(|i| i + 1).unwrap_or(0);
+    let mut picked = Vec::new();
+    let mut bytes = 0u64;
+    for child in &kids[start..] {
+        if child.is_folder || child.name == after_name {
+            continue;
+        }
+        let Some(info) = vault.read_info(&child.id) else { continue };
+        if info.large || info.size > PREFETCH_MAX_FILE || vault.cached_small(&child.id).is_some() {
+            continue;
+        }
+        if bytes + info.size > PREFETCH_MAX_BYTES || picked.len() >= PREFETCH_MAX_FILES {
+            break;
+        }
+        bytes += info.size;
+        picked.push(child.id.clone());
+    }
+    if picked.is_empty() {
+        return;
+    }
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    thread::scope(|s| {
+        for _ in 0..PREFETCH_PARALLELISM.min(picked.len()) {
+            s.spawn(|| loop {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(id) = picked.get(i) else { return };
+                if let Err(e) = vault.download_arc(id) {
+                    log::debug!("[lethean-cli] prefetch skipped a file: {e:#}");
+                }
+            });
+        }
+    });
 }
 
 pub fn default_scratch_dir() -> PathBuf {
@@ -294,6 +654,12 @@ pub struct VaultFs {
     pool: Arc<ScratchPool>,
     net_workers: BurstPool,
     io_workers: WorkerPool,
+    notify: NotifierSlot,
+    refresh_interval: Option<Duration>,
+    syncer: Option<Arc<Syncer>>,
+    prefetch: bool,
+    scan: Arc<Mutex<ScanTracker>>,
+    stop: Arc<AtomicBool>,
 }
 
 fn guess_mime(name: &str) -> String {
@@ -388,6 +754,17 @@ fn repoint_ino_to(state: &mut FsState, ino: u64, old_id: Option<&str>, new_id: &
     }
     state.ino_of_id.insert(new_id.to_string(), ino);
     state.node_of_ino.insert(ino, Node::Remote(new_id.to_string()));
+    if let Some(old) = old_id {
+        if old != new_id {
+            for h in state.handles.values_mut() {
+                if let Handle::Read { id, .. } = h {
+                    if id == old {
+                        *id = new_id.to_string();
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn alloc_fh(state: &mut FsState) -> u64 {
@@ -456,7 +833,7 @@ fn new_write_file(scratch: Scratch, target: WriteTarget) -> Arc<WriteFile> {
     Arc::new(WriteFile { target: Mutex::new(target), scratch: Arc::new(Mutex::new(scratch)), len, commit_lock: Mutex::new(()) })
 }
 
-fn commit_write_session(vault: &Vault, state: &Mutex<FsState>, fh: u64) -> bool {
+fn commit_write_session(vault: &Vault, state: &Mutex<FsState>, notify: &NotifyHub, fh: u64) -> bool {
     let (ino, file) = {
         let st = lock_state(state);
         match st.handles.get(&fh) {
@@ -467,10 +844,10 @@ fn commit_write_session(vault: &Vault, state: &Mutex<FsState>, fh: u64) -> bool 
             _ => return true,
         }
     };
-    commit_write_file(vault, state, ino, &file)
+    commit_write_file(vault, state, notify, ino, &file)
 }
 
-fn commit_write_file(vault: &Vault, state: &Mutex<FsState>, ino: u64, file: &Arc<WriteFile>) -> bool {
+fn commit_write_file(vault: &Vault, state: &Mutex<FsState>, notify: &NotifyHub, ino: u64, file: &Arc<WriteFile>) -> bool {
     let _serial = lock_plain(&file.commit_lock);
 
     let (generation, len) = {
@@ -487,19 +864,34 @@ fn commit_write_file(vault: &Vault, state: &Mutex<FsState>, ino: u64, file: &Arc
         Ok(reader)
     };
 
+    let mut saved_elsewhere: Option<(Option<String>, String, String)> = None;
     let result = match &target {
         WriteTarget::Discarded => {
             lock_scratch(&file.scratch).mark_committed(generation);
             return true;
         }
-        WriteTarget::NewFile { parent_id, name, mime } => vault.create_file_streaming(name, mime, len, parent_id.as_deref(), factory),
-        WriteTarget::ExistingFile { id } => {
-            if vault.stat(id).is_none() {
-                warn!("[lethean-cli] dropping unsaved changes to a file that no longer exists");
-                lock_scratch(&file.scratch).mark_committed(generation);
-                return true;
+        WriteTarget::NewFile { parent_id, name, mime } => {
+            let save_name = free_name(vault, parent_id.as_deref(), name);
+            if save_name != *name {
+                warn!("[lethean-cli] \"{name}\" was created elsewhere while it was being written here; your version is saved as \"{save_name}\"");
+                saved_elsewhere = Some((parent_id.clone(), name.clone(), save_name.clone()));
             }
-            vault.replace_content_streaming(id, len, factory)
+            vault.create_file_streaming(&save_name, mime, len, parent_id.as_deref(), factory)
+        }
+        WriteTarget::ExistingFile { id, save_as } => {
+            if vault.stat(id).is_none() {
+                let parent = save_as.parent_id.clone().filter(|p| vault.stat(p).map(|s| s.is_folder).unwrap_or(false));
+                let name = free_name(vault, parent.as_deref(), &save_as.name);
+                if name != save_as.name {
+                    warn!("[lethean-cli] \"{}\" was changed elsewhere while it was open here; your version is saved as \"{name}\"", save_as.name);
+                } else {
+                    warn!("[lethean-cli] \"{name}\" was removed elsewhere while it was open here; saving your version again");
+                }
+                saved_elsewhere = Some((parent.clone(), save_as.name.clone(), name.clone()));
+                vault.create_file_streaming(&name, &save_as.mime, len, parent.as_deref(), factory)
+            } else {
+                vault.replace_content_streaming(id, len, factory)
+            }
         }
     };
 
@@ -507,13 +899,24 @@ fn commit_write_file(vault: &Vault, state: &Mutex<FsState>, ino: u64, file: &Arc
         Ok(new_entry) => {
             lock_scratch(&file.scratch).mark_committed(generation);
             let old_id = match &target {
-                WriteTarget::ExistingFile { id } => Some(id.clone()),
+                WriteTarget::ExistingFile { id, .. } => Some(id.clone()),
                 _ => None,
             };
             let new_id = new_entry.record.id.clone();
-            *lock_plain(&file.target) = WriteTarget::ExistingFile { id: new_id.clone() };
+            *lock_plain(&file.target) = existing_target(vault, new_id.clone());
             let mut st = lock_state(state);
             repoint_ino_to(&mut st, ino, old_id.as_deref(), &new_id);
+            if let Some((parent, original, saved_as)) = saved_elsewhere {
+                let pino = match &parent {
+                    None => Some(ROOT_INO),
+                    Some(p) => st.ino_of_id.get(p).copied(),
+                };
+                drop(st);
+                if let Some(p) = pino {
+                    notify.entry(p, &original);
+                    notify.entry(p, &saved_as);
+                }
+            }
             true
         }
         Err(e) => {
@@ -548,13 +951,17 @@ fn build_listing(state: &FsState, vault: &Vault, ino: u64, dir_id: Option<&str>)
     let mut entries = Vec::with_capacity(children.len() + 2);
     entries.push(DirEntry { ino, kind: FileType::Directory, name: ".".to_string(), id: None });
     entries.push(DirEntry { ino: ROOT_INO, kind: FileType::Directory, name: "..".to_string(), id: None });
-    for child in children {
-        entries.push(DirEntry { ino: peek_ino(state, &child.id), kind: if child.is_folder { FileType::Directory } else { FileType::RegularFile }, name: child.name, id: Some(child.id) });
-    }
+    let mut seen: std::collections::HashSet<String> = [".".to_string(), "..".to_string()].into_iter().collect();
     for ((parent, name), pino) in &state.pending_by_key {
-        if parent.as_deref() == dir_id {
+        if parent.as_deref() == dir_id && seen.insert(name.clone()) {
             entries.push(DirEntry { ino: *pino, kind: FileType::RegularFile, name: name.clone(), id: None });
         }
+    }
+    for child in children {
+        if !seen.insert(child.name.clone()) {
+            continue;
+        }
+        entries.push(DirEntry { ino: peek_ino(state, &child.id), kind: if child.is_folder { FileType::Directory } else { FileType::RegularFile }, name: child.name, id: Some(child.id) });
     }
     entries
 }
@@ -582,6 +989,7 @@ impl VaultFs {
         let scratch_dir = options.scratch_dir.unwrap_or_else(default_scratch_dir);
         let pool = ScratchPool::new(options.scratch_ram_bytes, scratch_dir);
         vault.set_scratch_pool(Arc::clone(&pool));
+        vault.set_deferred_deletes(true);
         Self {
             vault: Arc::new(vault),
             state: Arc::new(Mutex::new(FsState {
@@ -601,16 +1009,89 @@ impl VaultFs {
             pool,
             net_workers: BurstPool::new("lethean-net", NET_WORKERS),
             io_workers: WorkerPool::new("lethean-io", IO_WORKERS),
+            notify: Arc::new(NotifyHub::default()),
+            refresh_interval: options.refresh_interval.filter(|d| !d.is_zero()),
+            syncer: None,
+            prefetch: options.prefetch,
+            scan: Arc::new(Mutex::new(ScanTracker::default())),
+            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn refresh(&mut self) -> anyhow::Result<()> {
         self.vault.refresh_all()
     }
+
+    pub fn notifier_slot(&self) -> NotifierSlot {
+        Arc::clone(&self.notify)
+    }
+
+    fn shutdown(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(s) = self.syncer.take() {
+            s.shutdown();
+        }
+        self.notify.detach();
+    }
+
+    fn kick_sync(&self) -> Option<(Arc<Syncer>, u64, Instant)> {
+        let syncer = self.syncer.as_ref()?;
+        let (generation, deadline) = syncer.kick_if_stale(OPENDIR_MAX_AGE, OPENDIR_SYNC_BUDGET)?;
+        Some((Arc::clone(syncer), generation, deadline))
+    }
+
+    fn note_read_open(&self, id: &str) {
+        if !self.prefetch {
+            return;
+        }
+        let Some(info) = self.vault.read_info(id) else { return };
+        if info.large || info.size > PREFETCH_MAX_FILE {
+            return;
+        }
+        let Some(parent) = self.vault.parent_of(id) else { return };
+        if parent.as_deref() == Some(UNRESOLVED_PARENT) {
+            return;
+        }
+        let key = parent.clone().unwrap_or_default();
+        let trigger = {
+            let mut scan = lock_plain(&self.scan);
+            let now = Instant::now();
+            let same_dir = scan.dir.as_deref() == Some(key.as_str()) && scan.last.map(|t| now - t < SCAN_WINDOW).unwrap_or(false);
+            if !same_dir {
+                scan.dir = Some(key.clone());
+                scan.seen.clear();
+            }
+            scan.last = Some(now);
+            if scan.seen.len() < SCAN_TRIGGER && !scan.seen.iter().any(|s| s == id) {
+                scan.seen.push(id.to_string());
+            }
+            if scan.seen.len() >= SCAN_TRIGGER && !scan.running.contains(&key) && self.vault.cached_small(id).is_none() {
+                scan.running.insert(key.clone());
+                true
+            } else {
+                false
+            }
+        };
+        if !trigger {
+            return;
+        }
+        let name = self.vault.entry(id).map(|e| e.fs_name().to_string()).unwrap_or_default();
+        let vault = Arc::clone(&self.vault);
+        let stop = Arc::clone(&self.stop);
+        let scan = Arc::clone(&self.scan);
+        let spawned = thread::Builder::new().name("lethean-prefetch".into()).spawn(move || {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prefetch_dir(&vault, &stop, parent.as_deref(), &name)));
+            lock_plain(&scan).running.remove(&key);
+        });
+        if spawned.is_err() {
+            lock_plain(&self.scan).running.clear();
+        }
+    }
 }
 
 impl Drop for VaultFs {
     fn drop(&mut self) {
+        self.shutdown();
         self.vault.close();
     }
 }
@@ -624,7 +1105,19 @@ impl Filesystem for VaultFs {
         if let Err(max) = config.set_max_background(64) {
             let _ = config.set_max_background(max);
         }
+        if let Some(interval) = self.refresh_interval {
+            let syncer = Syncer::new(Arc::clone(&self.vault), Arc::clone(&self.state), Arc::clone(&self.notify), interval);
+            let bg = Arc::clone(&syncer);
+            if thread::Builder::new().name("lethean-refresh".into()).spawn(move || bg.background()).is_ok() {
+                self.syncer = Some(syncer);
+            }
+        }
         Ok(())
+    }
+
+    fn destroy(&mut self) {
+        self.shutdown();
+        self.vault.flush_pending_deletes();
     }
 
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &std::ffi::OsStr, reply: ReplyEntry) {
@@ -646,6 +1139,8 @@ impl Filesystem for VaultFs {
         }
 
         let Some(child) = self.vault.find_child(parent_id.as_deref(), name) else {
+            drop(state);
+            let _ = self.kick_sync();
             return reply.error(ENOENT);
         };
         let ino = ino_for_remote(&mut state, &child.record.id);
@@ -1008,6 +1503,15 @@ impl Filesystem for VaultFs {
                 let mut state = lock_state(&state_arc);
                 if let Some(&ino) = state.ino_of_id.get(&entry_id) {
                     repoint_ino_to(&mut state, ino, Some(&entry_id), &new_entry.record.id);
+                    if let Some(w) = state.writers.get(&ino) {
+                        let mut t = lock_plain(&w.file.target);
+                        if let WriteTarget::ExistingFile { id, save_as } = &mut *t {
+                            if *id == entry_id {
+                                *id = new_entry.record.id.clone();
+                                *save_as = save_as_for(&vault, &new_entry.record.id);
+                            }
+                        }
+                    }
                 }
                 Ok(())
             });
@@ -1065,9 +1569,11 @@ impl Filesystem for VaultFs {
                         0
                     };
                     let fh = alloc_fh(&mut state);
-                    state.handles.insert(fh, Handle::Read { id, pinned: None });
+                    state.handles.insert(fh, Handle::Read { id: id.clone(), pinned: None });
                     drop(state);
-                    return reply.opened(fh, open_flags);
+                    reply.opened(fh, open_flags);
+                    self.note_read_open(&id);
+                    return;
                 }
 
                 {
@@ -1088,7 +1594,7 @@ impl Filesystem for VaultFs {
                 if flags & O_TRUNC != 0 {
                     let mut scratch = self.pool.new_scratch();
                     scratch.mark_dirty();
-                    let file = new_write_file(scratch, WriteTarget::ExistingFile { id });
+                    let file = new_write_file(scratch, existing_target(&self.vault, id));
                     let mut state = lock_state(&self.state);
                     attach_writer(&mut state, ino, file);
                     let fh = alloc_fh(&mut state);
@@ -1111,7 +1617,7 @@ impl Filesystem for VaultFs {
                             errno_of(&e)
                         })?;
                         scratch.mark_committed(scratch.generation());
-                        let file = new_write_file(scratch, WriteTarget::ExistingFile { id });
+                        let file = new_write_file(scratch, existing_target(&vault, id));
                         let mut state = lock_state(&state_arc);
                         let existing = state.writers.get(&ino).map(|w| Arc::clone(&w.file));
                         attach_writer(&mut state, ino, existing.unwrap_or(file));
@@ -1262,9 +1768,10 @@ impl Filesystem for VaultFs {
         let vault = Arc::clone(&self.vault);
         let state_arc = Arc::clone(&self.state);
         let net_sem = Arc::clone(&self.net_sem);
+        let notify = Arc::clone(&self.notify);
         self.net_workers.run(move || {
             let _permit = net_sem.acquire();
-            match run_guarded("flush", move || Ok::<bool, c_int>(commit_write_session(&vault, &state_arc, fh))) {
+            match run_guarded("flush", move || Ok::<bool, c_int>(commit_write_session(&vault, &state_arc, &notify, fh))) {
                 Ok(true) => reply.ok(),
                 Ok(false) => reply.error(EIO),
                 Err(errno) => reply.error(errno),
@@ -1273,31 +1780,49 @@ impl Filesystem for VaultFs {
     }
 
     fn release(&mut self, _req: &Request<'_>, _ino: u64, fh: u64, _flags: i32, _lock_owner: Option<u64>, _flush: bool, reply: ReplyEmpty) {
-        let is_writer = matches!(lock_state(&self.state).handles.get(&fh), Some(Handle::Write { .. }));
-        if !is_writer {
-            lock_state(&self.state).handles.remove(&fh);
-            return reply.ok();
+        fn close_write_handle(st: &mut FsState, fh: u64) {
+            if let Some(Handle::Write { ino }) = st.handles.remove(&fh) {
+                let mut drop_writer = false;
+                if let Some(w) = st.writers.get_mut(&ino) {
+                    w.handles = w.handles.saturating_sub(1);
+                    drop_writer = w.handles == 0;
+                }
+                if drop_writer {
+                    st.writers.remove(&ino);
+                }
+            }
+        }
+
+        {
+            let mut st = lock_state(&self.state);
+            let writer_dirty = match st.handles.get(&fh) {
+                Some(Handle::Write { ino }) => Some(st.writers.get(ino).map(|w| lock_scratch(&w.file.scratch).is_dirty()).unwrap_or(false)),
+                _ => None,
+            };
+            match writer_dirty {
+                None => {
+                    st.handles.remove(&fh);
+                    return reply.ok();
+                }
+                Some(false) => {
+                    close_write_handle(&mut st, fh);
+                    return reply.ok();
+                }
+                Some(true) => {}
+            }
         }
 
         let vault = Arc::clone(&self.vault);
         let state_arc = Arc::clone(&self.state);
         let net_sem = Arc::clone(&self.net_sem);
+        let notify = Arc::clone(&self.notify);
         self.net_workers.run(move || {
             let _permit = net_sem.acquire();
             let state_for_cleanup = Arc::clone(&state_arc);
-            match run_guarded("release", move || Ok::<bool, c_int>(commit_write_session(&vault, &state_arc, fh))) {
+            match run_guarded("release", move || Ok::<bool, c_int>(commit_write_session(&vault, &state_arc, &notify, fh))) {
                 Ok(true) => {
                     let mut st = lock_state(&state_for_cleanup);
-                    if let Some(Handle::Write { ino }) = st.handles.remove(&fh) {
-                        let mut drop_writer = false;
-                        if let Some(w) = st.writers.get_mut(&ino) {
-                            w.handles = w.handles.saturating_sub(1);
-                            drop_writer = w.handles == 0;
-                        }
-                        if drop_writer {
-                            st.writers.remove(&ino);
-                        }
-                    }
+                    close_write_handle(&mut st, fh);
                 }
                 Ok(false) => {
                     warn!("[lethean-cli] release: changes are still unsaved after retries; keeping the write buffer for a later attempt");
@@ -1354,13 +1879,19 @@ impl Filesystem for VaultFs {
     }
 
     fn opendir(&mut self, _req: &Request<'_>, ino: u64, _flags: i32, reply: ReplyOpen) {
-        let mut state = lock_state(&self.state);
-        match dir_id_of_ino(&state, &self.vault, ino) {
-            Ok(_) => {
-                let fh = alloc_fh(&mut state);
-                reply.opened(fh, 0)
+        let fh = {
+            let mut state = lock_state(&self.state);
+            match dir_id_of_ino(&state, &self.vault, ino) {
+                Ok(_) => alloc_fh(&mut state),
+                Err(e) => return reply.error(e),
             }
-            Err(e) => reply.error(e),
+        };
+        match self.kick_sync() {
+            Some((syncer, generation, deadline)) => self.net_workers.run(move || {
+                syncer.wait_until(generation, deadline);
+                reply.opened(fh, 0);
+            }),
+            None => reply.opened(fh, 0),
         }
     }
 

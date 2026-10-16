@@ -28,7 +28,7 @@ fn mount(vault: Vault, tag: &str) -> Mounted {
     let dir = std::env::temp_dir().join(format!("lethean-hard-{tag}-{}", std::process::id()));
     let scratch = std::env::temp_dir().join(format!("lethean-hard-scratch-{tag}-{}", std::process::id()));
     fs::create_dir_all(&dir).unwrap();
-    let mut vfs = VaultFs::with_options(vault, FsOptions { scratch_dir: Some(scratch), scratch_ram_bytes: 8 * 1024 * 1024 });
+    let mut vfs = VaultFs::with_options(vault, FsOptions { scratch_dir: Some(scratch), scratch_ram_bytes: 8 * 1024 * 1024, ..Default::default() });
     vfs.refresh().unwrap();
     let session = fuser::spawn_mount2(vfs, &dir, &[fuser::MountOption::FSName("lethean-hard".into()), fuser::MountOption::DefaultPermissions]).expect("mount");
     Mounted { dir, _session: session }

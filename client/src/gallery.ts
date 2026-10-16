@@ -14,7 +14,10 @@ import { openTile, downloadAndSave } from './lightbox.js';
 import { shareFile } from './share.js';
 import { openMovePicker } from './move.js';
 import type { FileMeta, FileRecord, UsageResponse, ViewMode } from './types.js';
-import { rememberFileKey, forgetFileKey, effectiveParentId, parentRefFor } from './tree.js';
+import { rememberFileKey, forgetFileKey, effectiveParentId, parentRefFor, nodeRefOf } from './tree.js';
+import { uniqueById, healPlan, recordFingerprint, shownNames } from './dedupe-core.js';
+import type { UploadFields, HealKind, HealItem } from './dedupe-core.js';
+import type { FileKey } from './crypto-encrypt-core.js';
 
 let viewMode: ViewMode = getStoredViewMode();
 
@@ -203,6 +206,21 @@ async function moveIds(ids: string[]): Promise<void> {
   });
 }
 
+export function namesInFolder(folderId: string | null, exceptIds: Iterable<string> = []): Set<string> {
+  const except = new Set(exceptIds);
+  const names = new Set<string>();
+  for (const r of records) {
+    if (except.has(r.id) || parentIdOf(r.id) !== folderId) continue;
+    const name = metaCache.get(r.id)?.name;
+    if (name) names.add(name);
+  }
+  return names;
+}
+
+export function nameTakenIn(folderId: string | null, name: string, exceptIds: Iterable<string> = []): boolean {
+  return namesInFolder(folderId, exceptIds).has(name);
+}
+
 function isDescendantOf(id: string, ancestorId: string): boolean {
   let cur: string | null = parentIdOf(id);
   const seen = new Set<string>();
@@ -226,9 +244,10 @@ async function moveOneRecord(oldId: string, newParentId: string | null): Promise
   const { stream } = await api.openDownloadStream(oldId);
   const ciphertextBlob = await C.streamToBlob(stream);
   const { parentId: _oldParentId, pref: _oldPref, ...rest } = meta;
+  const rev = (meta.rev ?? 0) + 1;
   const updatedMeta: FileMeta = oldFileKey.format === C.FILE_FORMAT_V2
-    ? { ...rest, ...C.parentFields(parentRefFor(newParentId)) }
-    : { ...rest, parentId: newParentId };
+    ? { ...rest, rev, ...C.parentFields(parentRefFor(newParentId)) }
+    : { ...rest, rev, parentId: newParentId };
 
   const fileKey = C.rebindFileKey(oldFileKey);
   const { encryptedMetadata, metadataIv } = await C.encryptMetadata(fileKey, updatedMeta);
@@ -248,16 +267,22 @@ async function moveOneRecord(oldId: string, newParentId: string | null): Promise
       : api.ciphertextBlobAsParts(fields, ciphertextBlob)
   );
 
-  await api.deleteFile(oldId);
+  metaCache.set(newRecord.id, updatedMeta);
+  await rememberFileKey(newRecord.id, fileKey);
+  if (!records.some((r) => r.id === newRecord.id)) records.push(newRecord);
+  await settleUploads([{ fields, keepId: newRecord.id }]);
+
+  try {
+    await api.deleteFileWithRetry(oldId);
+  } catch (err) {
+    throw new Error(`"${meta.name}" was copied to its new place, but the original couldn't be removed (${(err as Error).message}). Delete the original yourself.`);
+  }
 
   if (objectUrlCache.has(oldId)) { URL.revokeObjectURL(objectUrlCache.get(oldId)!); objectUrlCache.delete(oldId); }
   dropThumbnail(oldId);
   forgetFileKey(oldId);
   metaCache.delete(oldId);
-  metaCache.set(newRecord.id, updatedMeta);
-  await rememberFileKey(newRecord.id, fileKey);
   records = records.filter((r) => r.id !== oldId);
-  records.push(newRecord);
 
   return newRecord.id;
 }
@@ -291,6 +316,12 @@ async function moveRecords(ids: string[], destinationFolderId: string | null): P
       failed++;
       continue;
     }
+    const name = metaCache.get(id)?.name;
+    if (name && nameTakenIn(destinationFolderId, name, [id])) {
+      failed++;
+      showToast(`"${name}" wasn't moved: something with that name is already there.`, 'error');
+      continue;
+    }
     try {
       await moveSubtree(id, destinationFolderId);
       moved++;
@@ -308,6 +339,7 @@ async function moveRecords(ids: string[], destinationFolderId: string | null): P
 
 const PAGE_SIZE = 24;
 let pageOffset = 0;
+let lastPageKey = '';
 let hasMorePages = true;
 let isLoadingPage = false;
 let searchQuery = '';
@@ -337,6 +369,12 @@ export function getRecords(): FileRecord[] {
 }
 
 export function resetRecords(): void {
+  loadGeneration++;
+  staleRecords.clear();
+  healKeep.clear();
+  contentHashes.clear();
+  hashBytesUsed = 0;
+  fingerprintOwner.clear();
   records = [];
   quarantined = [];
   strictMode = false;
@@ -362,12 +400,35 @@ export function clearRenderedGrid(): void {
   currentFolderId = null;
 }
 
-export async function refreshGallery(): Promise<void> {
+let loadGeneration = 0;
+let refreshRunning: Promise<void> | null = null;
+let refreshQueued: Promise<void> | null = null;
+
+export function refreshGallery(): Promise<void> {
+  if (!refreshRunning) {
+    refreshRunning = refreshGalleryNow().finally(() => { refreshRunning = null; });
+    return refreshRunning;
+  }
+  if (!refreshQueued) {
+    refreshQueued = refreshRunning.catch(() => {}).then(() => {
+      refreshQueued = null;
+      return refreshGallery();
+    });
+  }
+  return refreshQueued;
+}
+
+async function refreshGalleryNow(): Promise<void> {
+  loadGeneration++;
+  staleRecords.clear();
+  fingerprintOwner.clear();
   records = [];
   quarantined = [];
   pageOffset = 0;
+  lastPageKey = '';
   hasMorePages = true;
   loadFailed = false;
+  while (isLoadingPage) await new Promise((r) => setTimeout(r, 20));
   const vaultId = getCurrentVaultId();
   legacyFreeMarker = vaultId ? await C.deriveVaultMarkers(vaultId) : null;
   strictMode = legacyFreeMarker !== null && isVaultLegacyFree(legacyFreeMarker);
@@ -380,6 +441,7 @@ export async function refreshGallery(): Promise<void> {
   renderCurrentView();
   await loadAllPages();
   settleLegacyState();
+  if (isFullyLoaded()) void healVault();
 }
 
 let quarantined: FileRecord[] = [];
@@ -391,7 +453,7 @@ let legacyNoticeShown = false;
 function settleLegacyState(): void {
   if (loadFailed || !legacyFreeMarker) return;
   const legacyCount = legacyRecords().length;
-  if (!strictMode && legacyCount === 0 && quarantined.length === 0) {
+  if (!strictMode && legacyCount === 0 && quarantined.length === 0 && staleRecords.size === 0) {
     markVaultLegacyFree(legacyFreeMarker);
     strictMode = true;
   }
@@ -426,7 +488,11 @@ export function getQuarantined(): FileRecord[] {
 }
 
 export function getRecordsForRotation(): FileRecord[] {
-  return records.concat(quarantined);
+  const hidden = [...staleRecords.values()].filter((s) => s.hidden);
+  for (const s of hidden) {
+    if (s.key && !fileKeyCache.has(s.record.id)) fileKeyCache.set(s.record.id, s.key);
+  }
+  return uniqueById(records.concat(quarantined, hidden.map((s) => s.record)));
 }
 
 export async function admitQuarantined(): Promise<void> {
@@ -481,8 +547,9 @@ export async function addUploadedRecord(record: FileRecord): Promise<void> {
     }
   }
 
-  records.push(record);
   scheduleUsageRefresh();
+  if (records.some((r) => r.id === record.id)) return;
+  records.push(record);
   appendRecordIfVisible(record);
 }
 
@@ -512,6 +579,7 @@ function isVisibleInCurrentView(record: FileRecord): boolean {
 }
 
 function appendVisibleRecords(toAppend: FileRecord[]): void {
+  refreshDisplayNames();
   const shown = visibleRecords();
   updateEmptyState(shown, !!searchQuery);
   updateGridLabel(shown, !!searchQuery);
@@ -536,6 +604,7 @@ function updateUsagePill(usage: UsageResponse): void {
 
 async function loadAllPages(): Promise<void> {
   while (hasMorePages) {
+    if (isLoadingPage) { await new Promise((r) => setTimeout(r, 20)); continue; }
     await loadNextPage();
   }
 }
@@ -543,14 +612,18 @@ async function loadAllPages(): Promise<void> {
 async function loadNextPage(): Promise<void> {
   if (isLoadingPage || !hasMorePages) return;
   isLoadingPage = true;
+  const generation = loadGeneration;
   gridSentinel.classList.remove('hidden');
   gridSentinel.textContent = 'Loading\u2026';
   try {
     const page = await api.listFiles({ offset: pageOffset, limit: PAGE_SIZE });
+    if (generation !== loadGeneration) return;
     const known = new Set(records.map((r) => r.id).concat(quarantined.map((r) => r.id)));
-    const listed = page.filter((r) => !known.has(r.id));
+    const listed = uniqueById(page.filter((r) => !known.has(r.id)));
 
-    if (page.length < PAGE_SIZE || listed.length === 0) hasMorePages = false;
+    const pageKey = page.map((r) => r.id).join(',');
+    if (page.length < PAGE_SIZE || (listed.length === 0 && pageKey === lastPageKey)) hasMorePages = false;
+    lastPageKey = pageKey;
     pageOffset += page.length || PAGE_SIZE;
 
     const refused = new Set<string>();
@@ -573,18 +646,22 @@ async function loadNextPage(): Promise<void> {
         metaCache.set(record.id, { name: 'Unreadable item', mime: 'application/octet-stream' });
       }
     }));
-    quarantined = quarantined.concat(listed.filter((r) => refused.has(r.id)));
-    const fresh = listed.filter((r) => !refused.has(r.id));
+    if (generation !== loadGeneration) return;
+    const knownNow = new Set(records.map((r) => r.id).concat(quarantined.map((r) => r.id)));
+    quarantined = quarantined.concat(listed.filter((r) => refused.has(r.id) && !knownNow.has(r.id)));
+    const fresh = listed.filter((r) => !refused.has(r.id) && !knownNow.has(r.id));
 
     const isFirstPage = records.length === 0;
     records = records.concat(fresh);
+    const hidIdentical = hideIdenticalAmong(fresh);
     const freshVisible = fresh.filter((r) => isVisibleInCurrentView(r));
-    if (isFirstPage || freshVisible.some((r) => metaCache.get(r.id)?.isFolder)) {
+    if (isFirstPage || hidIdentical || freshVisible.some((r) => metaCache.get(r.id)?.isFolder)) {
       renderCurrentView();
     } else if (freshVisible.length) {
       appendVisibleRecords(freshVisible);
     }
   } catch (err) {
+    if (generation !== loadGeneration) return;
     showToast((err as Error).message, 'error');
     hasMorePages = false;
     loadFailed = true;
@@ -595,7 +672,7 @@ async function loadNextPage(): Promise<void> {
 }
 
 export function visibleRecords(): FileRecord[] {
-  const inFolder = records.filter((r) => parentIdOf(r.id) === currentFolderId);
+  const inFolder = uniqueById(records).filter((r) => parentIdOf(r.id) === currentFolderId);
   const q = searchQuery.toLowerCase();
   const filtered = q
     ? inFolder.filter((r) => (metaCache.get(r.id)?.name || '').toLowerCase().includes(q))
@@ -652,10 +729,22 @@ function renderBreadcrumb(): void {
   });
 }
 
+let displayNames = new Map<string, string>();
+
+function refreshDisplayNames(): void {
+  const inFolder = uniqueById(records).filter((r) => parentIdOf(r.id) === currentFolderId);
+  displayNames = shownNames(inFolder.map((r) => ({ id: r.id, name: metaCache.get(r.id)?.name || '\u2026' })));
+}
+
+function displayName(record: FileRecord, meta: FileMeta): string {
+  return displayNames.get(record.id) ?? meta.name;
+}
+
 function renderCurrentView(): void {
   unmountAllThumbs();
   boxGrid.innerHTML = '';
   fileListBody.innerHTML = '';
+  refreshDisplayNames();
   const shown = visibleRecords();
   const searching = !!searchQuery;
 
@@ -753,6 +842,7 @@ function unmountAllThumbs(): void {
 
 function renderTile(record: FileRecord): HTMLDivElement {
   const meta: FileMeta = metaCache.get(record.id) || { name: '\u2026', mime: '' };
+  const name = displayName(record, meta);
   const isFolder = !!meta.isFolder;
   const kind = isFolder ? 'folder' : fileKind(meta.mime);
 
@@ -764,7 +854,7 @@ function renderTile(record: FileRecord): HTMLDivElement {
   tile.dataset.id = record.id;
   tile.tabIndex = 0;
   tile.setAttribute('role', 'button');
-  tile.setAttribute('aria-label', isFolder ? `Open folder ${meta.name}` : `Open ${meta.name}`);
+  tile.setAttribute('aria-label', isFolder ? `Open folder ${name}` : `Open ${name}`);
 
   tile.innerHTML = `
     <label class="box-select-label">
@@ -783,13 +873,13 @@ function renderTile(record: FileRecord): HTMLDivElement {
         : `<div class="box-icon">${icon('file')}</div><div class="box-name"></div>`}
     </div>
   `;
-  tile.querySelector('.box-name')!.textContent = meta.name;
-  tile.querySelector('.delete-btn')?.setAttribute('aria-label', `Delete ${meta.name}`);
-  tile.querySelector('.share-btn')?.setAttribute('aria-label', `Share ${meta.name}`);
+  tile.querySelector('.box-name')!.textContent = name;
+  tile.querySelector('.delete-btn')?.setAttribute('aria-label', `Delete ${name}`);
+  tile.querySelector('.share-btn')?.setAttribute('aria-label', `Share ${name}`);
 
   const selectCheckbox = tile.querySelector('.box-select-checkbox') as HTMLInputElement;
   selectCheckbox.checked = selectedIds.has(record.id);
-  selectCheckbox.setAttribute('aria-label', `Select ${meta.name}`);
+  selectCheckbox.setAttribute('aria-label', `Select ${name}`);
   selectCheckbox.addEventListener('click', (e) => e.stopPropagation());
   selectCheckbox.addEventListener('change', () => toggleSelect(record.id));
 
@@ -828,6 +918,7 @@ function renderTile(record: FileRecord): HTMLDivElement {
 
 function renderListRow(record: FileRecord): HTMLDivElement {
   const meta: FileMeta = metaCache.get(record.id) || { name: '\u2026', mime: '' };
+  const name = displayName(record, meta);
   const isFolder = !!meta.isFolder;
   const kind = isFolder ? 'folder' : fileKind(meta.mime);
 
@@ -839,7 +930,7 @@ function renderListRow(record: FileRecord): HTMLDivElement {
   row.dataset.id = record.id;
   row.tabIndex = 0;
   row.setAttribute('role', 'row');
-  row.setAttribute('aria-label', isFolder ? `Open folder ${meta.name}` : `Open ${meta.name}`);
+  row.setAttribute('aria-label', isFolder ? `Open folder ${name}` : `Open ${name}`);
 
   row.innerHTML = `
     <span class="file-row-name" role="cell">
@@ -855,15 +946,15 @@ function renderListRow(record: FileRecord): HTMLDivElement {
       <button type="button" class="btn-icon file-delete-btn" title="Delete">${icon('trash')}</button>
     </span>
   `;
-  row.querySelector('.file-row-text')!.textContent = meta.name;
+  row.querySelector('.file-row-text')!.textContent = name;
   row.querySelector('.file-row-type')!.textContent = fileTypeLabel(meta);
-  row.querySelector('.file-share-btn')?.setAttribute('aria-label', `Share ${meta.name}`);
-  row.querySelector('.file-download-btn')?.setAttribute('aria-label', `Download ${meta.name}`);
-  row.querySelector('.file-delete-btn')!.setAttribute('aria-label', `Delete ${meta.name}`);
+  row.querySelector('.file-share-btn')?.setAttribute('aria-label', `Share ${name}`);
+  row.querySelector('.file-download-btn')?.setAttribute('aria-label', `Download ${name}`);
+  row.querySelector('.file-delete-btn')!.setAttribute('aria-label', `Delete ${name}`);
 
   const rowCheckbox = row.querySelector('.file-row-checkbox') as HTMLInputElement;
   rowCheckbox.checked = selectedIds.has(record.id);
-  rowCheckbox.setAttribute('aria-label', `Select ${meta.name}`);
+  rowCheckbox.setAttribute('aria-label', `Select ${name}`);
   rowCheckbox.addEventListener('click', (e) => e.stopPropagation());
   rowCheckbox.addEventListener('change', () => toggleSelect(record.id));
 
@@ -1057,13 +1148,212 @@ export async function createFolder(name: string): Promise<void> {
   if (!trimmed) return;
   const wrappingKeyRaw = getWrappingKeyRaw();
   if (!wrappingKeyRaw) return;
+  if (nameTakenIn(currentFolderId, trimmed)) {
+    showToast(`"${trimmed}" already exists here. Choose another name.`, 'error');
+    return;
+  }
   try {
     const payload = await C.encryptFolder(wrappingKeyRaw, trimmed, parentRefFor(currentFolderId));
-    await api.uploadFile(payload);
-    await refreshGallery();
+    const created = await api.uploadFile(payload);
+    await addUploadedRecord(created);
+    await settleUploads([{ fields: payload, keepId: created.id }]);
+    renderCurrentView();
     showToast('Folder created.');
   } catch (err) {
     showToast("Couldn't create folder. " + (err as Error).message, 'error');
+  }
+}
+
+interface StaleEntry {
+  record: FileRecord;
+  meta: FileMeta | undefined;
+  key: FileKey | undefined;
+  successor: string;
+  kind: HealKind;
+  hidden: boolean;
+}
+
+const staleRecords = new Map<string, StaleEntry>();
+const healKeep = new Set<string>();
+const contentHashes = new Map<string, string>();
+let hashBytesUsed = 0;
+const HEAL_HASH_BUDGET = 256 * 1024 * 1024;
+let healRunning = false;
+const fingerprintOwner = new Map<string, string>();
+
+function hideStale(id: string, successor: string, kind: HealKind, hidden: boolean): void {
+  if (staleRecords.has(id) || healKeep.has(id)) return;
+  const record = records.find((r) => r.id === id);
+  if (!record) return;
+  staleRecords.set(id, { record, meta: metaCache.get(id), key: fileKeyCache.get(id), successor, kind, hidden });
+  if (!hidden) return;
+  if (objectUrlCache.has(id)) { URL.revokeObjectURL(objectUrlCache.get(id)!); objectUrlCache.delete(id); }
+  dropThumbnail(id);
+  forgetFileKey(id);
+  metaCache.delete(id);
+  records = records.filter((r) => r.id !== id);
+}
+
+function hideIdenticalAmong(fresh: FileRecord[]): boolean {
+  let changed = false;
+  for (const r of fresh) {
+    const fp = recordFingerprint(r);
+    const owner = fingerprintOwner.get(fp);
+    if (owner === undefined) { fingerprintOwner.set(fp, r.id); continue; }
+    if (owner === r.id) continue;
+    const [keep, drop] = owner < r.id ? [owner, r.id] : [r.id, owner];
+    fingerprintOwner.set(fp, keep);
+    if (!healKeep.has(drop)) { hideStale(drop, keep, 'identical', true); changed = true; }
+  }
+  return changed;
+}
+
+function planHeal(): void {
+  const legacyParents = new Set<string>();
+  for (const r of records) {
+    const parentId = metaCache.get(r.id)?.parentId;
+    if (fileKeyCache.get(r.id)?.format !== C.FILE_FORMAT_V2 && typeof parentId === 'string') legacyParents.add(parentId);
+  }
+  const items: HealItem[] = records.filter((r) => !healKeep.has(r.id)).map((r) => {
+    const meta = metaCache.get(r.id);
+    const v2 = fileKeyCache.get(r.id)?.format === C.FILE_FORMAT_V2;
+    const isFolder = !!meta?.isFolder;
+    return {
+      id: r.id,
+      nodeRef: nodeRefOf(r.id),
+      from: v2 && typeof meta?.from === 'string' ? meta.from : null,
+      rev: typeof meta?.rev === 'number' ? meta.rev : null,
+      isFolder,
+      folderMovable: isFolder && v2 && !legacyParents.has(r.id),
+      fingerprint: recordFingerprint(r),
+    };
+  });
+  for (const d of healPlan(items)) hideStale(d.id, d.successor, d.kind, d.kind === 'identical');
+}
+
+function keepAfterAll(id: string): void {
+  const s = staleRecords.get(id);
+  staleRecords.delete(id);
+  healKeep.add(id);
+  if (!s?.hidden) return;
+  if (s.meta) metaCache.set(id, s.meta);
+  if (s.key) void rememberFileKey(id, s.key);
+  if (!records.some((r) => r.id === id)) records.push(s.record);
+  renderCurrentView();
+}
+
+function isRetryable(err: unknown): boolean {
+  if (err instanceof TypeError) return true;
+  const status = (err as { status?: number } | null)?.status;
+  if (typeof status === 'number') return status >= 500 || status === 429 || status === 408;
+  return /network|stalled|timed? ?out|Failed to fetch/i.test(String((err as Error)?.message ?? err));
+}
+
+async function verifyReadable(record: FileRecord): Promise<void> {
+  const key = fileKeyCache.get(record.id);
+  const meta = metaCache.get(record.id);
+  if (!key || !meta) throw new Error('not readable');
+  const { stream } = await api.openDownloadStream(record.id);
+  const reader = C.decryptToStream(key, record.content_iv, stream, meta).getReader();
+  let total = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    total += value.length;
+  }
+  if (total !== (meta.isFolder ? 0 : meta.size)) throw new Error('did not read back completely');
+}
+
+async function contentHashOf(record: FileRecord): Promise<string> {
+  const known = contentHashes.get(record.id);
+  if (known) return known;
+  const key = fileKeyCache.get(record.id);
+  const meta = metaCache.get(record.id);
+  if (!key || !meta) throw new Error('not readable');
+  const { stream } = await api.openDownloadStream(record.id);
+  const h = await C.sha256OfStream(C.decryptToStream(key, record.content_iv, stream, meta));
+  contentHashes.set(record.id, h);
+  return h;
+}
+
+async function removeIdenticalSameNameCopies(generation: number): Promise<void> {
+  const groups = new Map<string, FileRecord[]>();
+  for (const r of records) {
+    const meta = metaCache.get(r.id);
+    if (!meta || meta.isFolder || !fileKeyCache.has(r.id)) continue;
+    const k = `${parentIdOf(r.id) ?? ''}\u0000${meta.name}\u0000${decryptedSize(r, meta)}`;
+    groups.set(k, [...(groups.get(k) ?? []), r]);
+  }
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    group.sort((a, b) => (a.id < b.id ? -1 : 1));
+    const firstOf = new Map<string, string>();
+    for (const r of group) {
+      if (generation !== loadGeneration || !getWrappingKeyRaw()) return;
+      const size = decryptedSize(r, metaCache.get(r.id));
+      if (!contentHashes.has(r.id)) {
+        if (hashBytesUsed + size > HEAL_HASH_BUDGET) continue;
+        hashBytesUsed += size;
+      }
+      let h: string;
+      try { h = await contentHashOf(r); } catch { continue; }
+      if (!firstOf.has(h)) { firstOf.set(h, r.id); continue; }
+      try {
+        await api.deleteFileWithRetry(r.id);
+        removeRecordLocally(r.id);
+      } catch {
+      }
+    }
+  }
+}
+
+async function healVault(): Promise<void> {
+  if (healRunning) return;
+  healRunning = true;
+  const generation = loadGeneration;
+  try {
+    planHeal();
+    renderCurrentView();
+    const verified = new Set<string>();
+    for (const [id, s] of [...staleRecords]) {
+      if (generation !== loadGeneration || !getWrappingKeyRaw()) return;
+      if (!verified.has(s.successor)) {
+        const succ = records.find((r) => r.id === s.successor);
+        if (!succ) { keepAfterAll(id); continue; }
+        try {
+          await verifyReadable(succ);
+          verified.add(s.successor);
+        } catch (err) {
+          if (!isRetryable(err)) keepAfterAll(id);
+          continue;
+        }
+      }
+      try {
+        await api.deleteFileWithRetry(id);
+      } catch {
+        continue;
+      }
+      staleRecords.delete(id);
+      if (!s.hidden) removeRecordLocally(id);
+    }
+    await removeIdenticalSameNameCopies(generation);
+  } finally {
+    healRunning = false;
+  }
+}
+
+export async function healIdle(): Promise<void> {
+  while (healRunning) await new Promise((r) => setTimeout(r, 50));
+}
+
+export function pendingCleanupCount(): number {
+  return staleRecords.size;
+}
+
+export async function settleUploads(uploads: { fields: UploadFields; keepId: string }[]): Promise<void> {
+  try {
+    for (const id of await api.removeRepeatedUploads(uploads)) removeRecordLocally(id);
+  } catch {
   }
 }
 

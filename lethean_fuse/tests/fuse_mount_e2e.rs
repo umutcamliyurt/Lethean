@@ -52,7 +52,7 @@ fn mounted_filesystem_round_trips_small_and_chunked_files() {
     fs::create_dir_all(&mount_dir).unwrap();
     fs::create_dir_all(&scratch_dir).unwrap();
 
-    let mut vfs = VaultFs::with_options(vault, FsOptions { scratch_dir: Some(scratch_dir.clone()), scratch_ram_bytes: 4 * 1024 * 1024 });
+    let mut vfs = VaultFs::with_options(vault, FsOptions { scratch_dir: Some(scratch_dir.clone()), scratch_ram_bytes: 4 * 1024 * 1024, ..Default::default() });
     vfs.refresh().unwrap();
     let session = fuser::spawn_mount2(vfs, &mount_dir, &[fuser::MountOption::FSName("lethean-test".into())]).expect("mount");
 
@@ -137,7 +137,7 @@ fn mount(server: &Server, key: &[u8], tag: &str) -> (fuser::BackgroundSession, s
     let scratch_dir = std::env::temp_dir().join(format!("lethean-scratch-{tag}-{}", std::process::id()));
     fs::create_dir_all(&mount_dir).unwrap();
     fs::create_dir_all(&scratch_dir).unwrap();
-    let mut vfs = VaultFs::with_options(vault, FsOptions { scratch_dir: Some(scratch_dir.clone()), scratch_ram_bytes: 4 * 1024 * 1024 });
+    let mut vfs = VaultFs::with_options(vault, FsOptions { scratch_dir: Some(scratch_dir.clone()), scratch_ram_bytes: 4 * 1024 * 1024, ..Default::default() });
     vfs.refresh().unwrap();
     let session = fuser::spawn_mount2(vfs, &mount_dir, &[fuser::MountOption::FSName("lethean-test".into())]).expect("mount");
     (session, mount_dir, scratch_dir)

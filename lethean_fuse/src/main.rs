@@ -48,6 +48,10 @@ enum Command {
         scratch_dir: Option<PathBuf>,
         #[arg(long, default_value_t = 64)]
         scratch_ram_mib: u64,
+        #[arg(long, default_value_t = 10)]
+        refresh_interval: u64,
+        #[arg(long)]
+        no_prefetch: bool,
     },
     Usage,
     Tree,
@@ -183,7 +187,7 @@ fn unlock_session(cli: &Cli, config: &Config) -> Result<Vault> {
     if track_legacy {
         let legacy = vault.legacy_entries().len();
         let hidden = vault.quarantined_count();
-        if !vault.is_strict() && legacy == 0 && hidden == 0 {
+        if !vault.is_strict() && legacy == 0 && hidden == 0 && vault.stale_count() == 0 {
             cfg::mark_vault_legacy_free(&vault_id);
             vault.set_strict(true);
         }
@@ -253,16 +257,18 @@ fn cmd_mount(cli: &Cli, config: &Config, mountpoint: PathBuf, allow_other: bool,
     cleanup_stale_mount(&mountpoint)?;
 
     let vault = unlock_session(cli, config)?;
-    let mut fs = fuse_fs::VaultFs::with_options(vault, fs_options);
-    fs.refresh()?;
+    let fs = fuse_fs::VaultFs::with_options(vault, fs_options);
+    let notify = fs.notifier_slot();
 
     let mut options = vec![fuser::MountOption::FSName("e2ee-vault".to_string()), fuser::MountOption::DefaultPermissions];
     if allow_other {
         options.push(fuser::MountOption::AllowOther);
     }
 
+    let mut session = fuser::Session::new(fs, &mountpoint, &options).context("FUSE mount failed, if this persists, try `fusermount -u <mountpoint>` first")?;
+    notify.attach(session.notifier());
     println!("Mounted at {}, Ctrl+C to unmount.", mountpoint.display());
-    fuser::mount2(fs, &mountpoint, &options).context("FUSE mount failed, if this persists, try `fusermount -u <mountpoint>` first")?;
+    session.run().context("FUSE session ended with an error")?;
     Ok(())
 }
 
@@ -373,6 +379,7 @@ fn cmd_rotate_password(cli: &Cli, config: &Config) -> Result<()> {
 
 fn cmd_upgrade(cli: &Cli, config: &Config, include_hidden: bool) -> Result<()> {
     let vault = unlock_session(cli, config)?;
+    vault.heal_pending();
     let hidden = vault.quarantined_count();
     if include_hidden && hidden > 0 {
         vault.admit_quarantined();
@@ -401,7 +408,7 @@ fn cmd_upgrade(cli: &Cli, config: &Config, include_hidden: bool) -> Result<()> {
     }
     let vault_id = vault.api.vault_id();
     vault.refresh_all()?;
-    if !DURESS_SESSION.load(Ordering::Relaxed) && vault.legacy_entries().is_empty() && vault.quarantined_count() == 0 {
+    if !DURESS_SESSION.load(Ordering::Relaxed) && vault.legacy_entries().is_empty() && vault.quarantined_count() == 0 && vault.stale_count() == 0 {
         if let Some(id) = vault_id {
             cfg::mark_vault_legacy_free(&id);
         }
@@ -538,8 +545,13 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Config { action } => cmd_config(action),
-        Command::Mount { ref mountpoint, allow_other, ref scratch_dir, scratch_ram_mib } => {
-            let opts = fuse_fs::FsOptions { scratch_dir: scratch_dir.clone(), scratch_ram_bytes: scratch_ram_mib.max(1) * 1024 * 1024 };
+        Command::Mount { ref mountpoint, allow_other, ref scratch_dir, scratch_ram_mib, refresh_interval, no_prefetch } => {
+            let opts = fuse_fs::FsOptions {
+                scratch_dir: scratch_dir.clone(),
+                scratch_ram_bytes: scratch_ram_mib.max(1) * 1024 * 1024,
+                refresh_interval: (refresh_interval > 0).then(|| std::time::Duration::from_secs(refresh_interval)),
+                prefetch: !no_prefetch,
+            };
             cmd_mount(&cli, &config, mountpoint.clone(), allow_other, opts)
         }
         Command::Usage => cmd_usage(&cli, &config),

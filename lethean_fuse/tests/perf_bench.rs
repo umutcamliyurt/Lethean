@@ -40,7 +40,7 @@ fn perf_bench() {
 
     let uploader = new_vault(server.addr, &key);
     let started = Arc::new(AtomicUsize::new(0));
-    for name in ["big1.bin", "big2.bin"] {
+    for name in ["big1.bin", "big2.bin", "big3.bin"] {
         uploader
             .create_file_streaming(name, "application/octet-stream", BIG, None, || Ok(Box::new(PatternReader::new(BIG, Arc::clone(&started))) as Box<dyn Read>))
             .expect("upload big");
@@ -74,7 +74,7 @@ fn perf_bench() {
     fs::create_dir_all(&scratch_dir).unwrap();
     let vault = new_vault(server.addr, &key);
     let t = Instant::now();
-    let mut vfs = VaultFs::with_options(vault, FsOptions { scratch_dir: Some(scratch_dir.clone()), scratch_ram_bytes: 64 * MIB });
+    let mut vfs = VaultFs::with_options(vault, FsOptions { scratch_dir: Some(scratch_dir.clone()), scratch_ram_bytes: 64 * MIB, ..Default::default() });
     vfs.refresh().unwrap();
     let refresh_s = t.elapsed().as_secs_f64();
     let session = fuser::spawn_mount2(vfs, &mount_dir, &[fuser::MountOption::FSName("lethean-bench".into())]).expect("mount");
@@ -139,6 +139,18 @@ fn perf_bench() {
     report.push(("big file: 64 random 4 KiB reads".into(), format!("{:.0} ms", t.elapsed().as_secs_f64() * 1e3)));
     drop(f);
 
+    let served0 = server.bytes_served.load(Ordering::SeqCst);
+    let t = Instant::now();
+    let mut f = File::open(mount_dir.join("big3.bin")).unwrap();
+    for k in [5u64, 2, 7] {
+        let off = k * 32 * MIB + 9 * MIB;
+        f.seek(SeekFrom::Start(off)).unwrap();
+        f.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, expected(off, 4096));
+    }
+    report.push(("big file: 3 seeks (cold)".into(), format!("{:.0} ms, {} MiB fetched", t.elapsed().as_secs_f64() * 1e3, (server.bytes_served.load(Ordering::SeqCst) - served0) as u64 / MIB)));
+    drop(f);
+
     let t = Instant::now();
     let names: Vec<_> = fs::read_dir(mount_dir.join("many")).unwrap().map(|e| e.unwrap().file_name()).collect();
     report.push(("  readdir only, 20k names (cold)".into(), format!("{:.0} ms", t.elapsed().as_secs_f64() * 1e3)));
@@ -171,6 +183,12 @@ fn perf_bench() {
         let _ = fs::read(mount_dir.join("small").join(format!("f{i:05}.txt"))).unwrap();
     }
     report.push(("re-read 1000 small files (warm)".into(), format!("{:.0} ms", t.elapsed().as_secs_f64() * 1e3)));
+
+    let t = Instant::now();
+    for i in 0..100 {
+        fs::write(mount_dir.join("small").join(format!("f{i:05}.txt")), format!("saved {i}")).unwrap();
+    }
+    report.push(("save (overwrite) 100 small files".into(), format!("{:.0} ms", t.elapsed().as_secs_f64() * 1e3)));
 
     report.push(("RSS at end (incl. mock server blobs)".into(), format!("{} MiB", rss_kib() / 1024)));
 

@@ -25,6 +25,8 @@ pub struct FileMeta {
     pub pref: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<u64>,
 }
 
 impl FileMeta {
@@ -40,6 +42,7 @@ impl FileMeta {
             size: None,
             pref: None,
             from: None,
+            rev: None,
         };
         meta.set_parent(parent);
         meta
@@ -57,6 +60,7 @@ impl FileMeta {
             size: None,
             pref: None,
             from: None,
+            rev: None,
         };
         meta.set_parent(parent);
         meta
@@ -79,6 +83,7 @@ impl FileMeta {
             size: None,
             pref: None,
             from: None,
+            rev: None,
         }
     }
 }

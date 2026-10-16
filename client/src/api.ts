@@ -2,6 +2,8 @@ import type {
   ChunkedFilePayload, DuressConfig, EncryptedFilePayload, FileRecord, ProgressCallback, UsageResponse, ShareCreateResponse, ShareRecord,
 } from './types.js';
 import { isTauri, resolveBaseUrl, isLocalDevPage } from './platform.js';
+import { isSameUpload } from './dedupe-core.js';
+import type { UploadFields } from './dedupe-core.js';
 
 const isLocalDev = isLocalDevPage();
 const BASE_URL = resolveBaseUrl();
@@ -174,7 +176,83 @@ function sendXhr(o: XhrOptions): Promise<XMLHttpRequest> {
 const SINGLE_REQUEST_MAX_BYTES = 32 * 1024 * 1024 + 1024;
 const MULTIPART_PART_BYTES = 32 * 1024 * 1024 + 16;
 
+const attemptedUploads = new WeakSet<object>();
+
+const LANDED_SCAN_PAGE = 200;
+
+export async function findLandedUpload(fields: UploadFields, vaultIdOverride?: string): Promise<FileRecord | null> {
+  for (let offset = 0; ; offset += LANDED_SCAN_PAGE) {
+    const params = new URLSearchParams({ limit: String(LANDED_SCAN_PAGE) });
+    if (offset) params.set('offset', String(offset));
+    const res = await privateFetch(`${BASE_URL}/files?${params}`, { headers: authHeaders(vaultIdOverride), credentials: 'omit' });
+    await checkOk(res, 'Could not load files');
+    const page = (await res.json()) as FileRecord[];
+    const found = page.find((r) => isSameUpload(r, fields));
+    if (found) return found;
+    if (page.length < LANDED_SCAN_PAGE) return null;
+  }
+}
+
 export async function uploadFile(
+  encrypted: EncryptedFilePayload | ChunkedFilePayload,
+  onProgress?: ProgressCallback,
+  signal?: AbortSignal,
+  vaultIdOverride?: string,
+  accessTokenOverride?: string
+): Promise<FileRecord> {
+  if (attemptedUploads.has(encrypted)) {
+    let landed: FileRecord | null = null;
+    try {
+      landed = await findLandedUpload(encrypted, vaultIdOverride);
+    } catch {
+    }
+    if (landed) {
+      if (landed.id) assertSafeId(landed.id);
+      if ('uploadId' in encrypted) encrypted.uploadId = undefined;
+      onProgress?.(1);
+      return landed;
+    }
+  }
+  attemptedUploads.add(encrypted);
+  return uploadFileOnce(encrypted, onProgress, signal, vaultIdOverride, accessTokenOverride);
+}
+
+export async function removeRepeatedUploads(uploads: { fields: UploadFields; keepId: string }[], vaultIdOverride?: string): Promise<string[]> {
+  if (!uploads.length) return [];
+  const usage = await getUsage(vaultIdOverride);
+  const span = uploads.length * 2 + 50;
+  const params = new URLSearchParams({ limit: String(span + 50) });
+  const offset = Math.max(0, (usage.file_count ?? 0) - span);
+  if (offset) params.set('offset', String(offset));
+  const res = await privateFetch(`${BASE_URL}/files?${params}`, { headers: authHeaders(vaultIdOverride), credentials: 'omit' });
+  await checkOk(res, 'Could not load files');
+  const tail = (await res.json()) as FileRecord[];
+  const removed: string[] = [];
+  for (const u of uploads) {
+    for (const r of tail) {
+      if (r.id === u.keepId || removed.includes(r.id) || !isSameUpload(r, u.fields)) continue;
+      assertSafeId(r.id);
+      await deleteFileWithRetry(r.id);
+      removed.push(r.id);
+    }
+  }
+  return removed;
+}
+
+export async function deleteFileWithRetry(fileId: string, attempts = 4): Promise<void> {
+  for (let i = 1; ; i++) {
+    try {
+      await deleteFile(fileId);
+      return;
+    } catch (err) {
+      if ((err as { status?: number }).status === 404) return;
+      if (i >= attempts) throw err;
+      await new Promise((r) => setTimeout(r, 500 * 2 ** (i - 1)));
+    }
+  }
+}
+
+async function uploadFileOnce(
   encrypted: EncryptedFilePayload | ChunkedFilePayload,
   onProgress?: ProgressCallback,
   signal?: AbortSignal,

@@ -7,7 +7,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLock
 use anyhow::{bail, Context, Result};
 use zeroize::Zeroizing;
 
-use crate::api::{ApiClient, RewrapEntry};
+use crate::api::{ApiClient, HttpError, RewrapEntry};
+use crate::heal::{self, HealItem, HealKind};
 use crate::crypto::aead;
 use crate::crypto::chunked::{self, ChunkedEncryptReader, CHUNK_SIZE};
 use crate::crypto::format::{ContentKey, FileFormat, FileKey, ParentRef};
@@ -72,6 +73,17 @@ pub struct Entry {
     pub readable: bool,
     fs_name: Arc<str>,
     learned_size: Arc<AtomicU64>,
+    fingerprint: [u8; 32],
+}
+
+fn record_fingerprint(r: &FileRecord) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for field in [&r.content_iv, &r.encrypted_metadata, &r.metadata_iv, &r.wrapped_file_key, &r.wrap_iv] {
+        h.update((field.len() as u64).to_be_bytes());
+        h.update(field.as_bytes());
+    }
+    h.finalize().into()
 }
 
 impl Entry {
@@ -79,7 +91,12 @@ impl Entry {
         let content = file_key.as_ref().map(|k| k.content_key()).unwrap_or(ContentKey { key: Zeroizing::new(Vec::new()), format: FileFormat::Legacy });
         let node_ref = file_key.as_ref().map(|k| k.node_ref());
         let fs_name = Arc::from(kernel_safe_name(&meta.name).as_ref());
-        Self { record, meta, file_key, content, node_ref, readable: true, fs_name, learned_size: Arc::new(AtomicU64::new(SIZE_UNKNOWN)) }
+        Self { record, meta, file_key, content, node_ref, readable: true, fs_name, learned_size: Arc::new(AtomicU64::new(SIZE_UNKNOWN)), fingerprint: [0; 32] }
+    }
+
+    fn with_fingerprint(mut self, fingerprint: [u8; 32]) -> Self {
+        self.fingerprint = fingerprint;
+        self
     }
 
     pub fn fs_name(&self) -> &str {
@@ -176,6 +193,25 @@ struct VaultIndex {
     folders_by_ref: HashMap<String, BTreeSet<String>>,
     folders_by_from: HashMap<String, BTreeSet<String>>,
     dependents: HashMap<String, BTreeSet<String>>,
+    display: HashMap<String, (Arc<str>, usize)>,
+    aliased_in: HashMap<String, usize>,
+}
+
+fn split_ext(name: &str) -> (&str, &str) {
+    match name.rfind('.') {
+        Some(i) if i > 0 && i + 1 < name.len() => (&name[..i], &name[i..]),
+        _ => (name, ""),
+    }
+}
+
+fn numbered_name(base: &str, n: usize) -> String {
+    let (stem, ext) = split_ext(base);
+    let suffix = format!(" ({n}){ext}");
+    let mut cut = stem.len().min(FS_NAME_MAX.saturating_sub(suffix.len()));
+    while !stem.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}{suffix}", &stem[..cut])
 }
 
 impl VaultIndex {
@@ -188,6 +224,81 @@ impl VaultIndex {
             folders_by_ref: HashMap::new(),
             folders_by_from: HashMap::new(),
             dependents: HashMap::new(),
+            display: HashMap::new(),
+            aliased_in: HashMap::new(),
+        }
+    }
+
+    fn shown_name(&self, id: &str) -> Option<Arc<str>> {
+        if let Some((name, _)) = self.display.get(id) {
+            return Some(Arc::clone(name));
+        }
+        self.entries.get(id).map(|e| Arc::clone(&e.fs_name))
+    }
+
+    fn set_alias(&mut self, pk: &str, id: &str, alias: Option<(Arc<str>, usize)>) {
+        let had = match alias {
+            Some(a) => self.display.insert(id.to_string(), a).is_some(),
+            None => {
+                let had = self.display.remove(id).is_some();
+                if had {
+                    if let Some(n) = self.aliased_in.get_mut(pk) {
+                        *n = n.saturating_sub(1);
+                    }
+                }
+                return;
+            }
+        };
+        if !had {
+            *self.aliased_in.entry(pk.to_string()).or_default() += 1;
+        }
+    }
+
+    fn place_name(&mut self, pk: &str, id: &str) {
+        let Some(base) = self.entries.get(id).map(|e| Arc::clone(&e.fs_name)) else { return };
+        let holder = self.name_index.get(pk).and_then(|m| m.get(&*base)).cloned();
+        match holder {
+            None => {
+                self.name_index.entry(pk.to_string()).or_default().insert(base.to_string(), id.to_string());
+                self.set_alias(pk, id, None);
+            }
+            Some(h) if h != id && self.display.contains_key(&h) => {
+                self.name_index.entry(pk.to_string()).or_default().insert(base.to_string(), id.to_string());
+                self.set_alias(pk, id, None);
+                self.place_name(pk, &h);
+            }
+            Some(_) => {
+                let slots = self.name_index.entry(pk.to_string()).or_default();
+                let (name, n) = (2..).map(|n| (numbered_name(&base, n), n)).find(|(name, _)| !slots.contains_key(name)).expect("unbounded");
+                slots.insert(name.clone(), id.to_string());
+                self.set_alias(pk, id, Some((Arc::from(name.as_str()), n)));
+            }
+        }
+    }
+
+    fn compact(&mut self, pk: &str, base: &str) {
+        let Some(siblings) = self.children_by_parent.get(pk) else { return };
+        let mut members: Vec<(usize, String)> = siblings
+            .iter()
+            .filter(|sid| self.entries.get(*sid).map(|e| &*e.fs_name == base).unwrap_or(false))
+            .map(|sid| (self.display.get(sid).map(|(_, n)| *n).unwrap_or(1), sid.clone()))
+            .collect();
+        if members.is_empty() {
+            return;
+        }
+        members.sort();
+        for (_, sid) in &members {
+            if let Some(name) = self.shown_name(sid) {
+                if let Some(m) = self.name_index.get_mut(pk) {
+                    if m.get(&*name) == Some(sid) {
+                        m.remove(&*name);
+                    }
+                }
+            }
+            self.set_alias(pk, sid, None);
+        }
+        for (_, sid) in &members {
+            self.place_name(pk, sid);
         }
     }
 
@@ -216,28 +327,35 @@ impl VaultIndex {
     fn attach(&mut self, id: &str) {
         let Some(entry) = self.entries.get(id).cloned() else { return };
         let pk = self.resolve(&entry);
-        self.name_index.entry(pk.clone()).or_default().entry(entry.fs_name().to_string()).or_insert_with(|| id.to_string());
         self.children_by_parent.entry(pk.clone()).or_default().push(id.to_string());
-        self.placed.insert(id.to_string(), pk);
+        self.placed.insert(id.to_string(), pk.clone());
+        self.place_name(&pk, id);
     }
 
     fn detach(&mut self, id: &str) {
         let Some(pk) = self.placed.remove(id) else { return };
-        let name = self.entries.get(id).map(|e| e.fs_name().to_string()).unwrap_or_default();
+        let shown = self.shown_name(id);
+        let was_alias = self.display.contains_key(id);
+        self.set_alias(&pk, id, None);
         if let Some(v) = self.children_by_parent.get_mut(&pk) {
             if let Some(pos) = v.iter().position(|x| x == id) {
                 v.swap_remove(pos);
             }
         }
-        let owned_name_slot = self.name_index.get(&pk).and_then(|m| m.get(&name)).map(|cur| cur == id).unwrap_or(false);
-        if owned_name_slot {
-            if let Some(m) = self.name_index.get_mut(&pk) {
-                m.remove(&name);
+        let Some(shown) = shown else { return };
+        if let Some(m) = self.name_index.get_mut(&pk) {
+            if m.get(&*shown).map(|cur| cur == id).unwrap_or(false) {
+                m.remove(&*shown);
             }
-            let replacement = self.children_by_parent.get(&pk).and_then(|sibs| sibs.iter().find(|sid| self.entries.get(*sid).map(|e| e.fs_name() == name).unwrap_or(false)).cloned());
-            if let Some(rid) = replacement {
-                self.name_index.entry(pk).or_default().insert(name, rid);
-            }
+        }
+        if !was_alias && self.aliased_in.get(&pk).copied().unwrap_or(0) == 0 {
+            return;
+        }
+        if let Some(base) = self.entries.get(id).map(|e| Arc::clone(&e.fs_name)) {
+            self.compact(&pk, &base);
+        }
+        if self.name_index.get(&pk).map(|m| !m.contains_key(&*shown)).unwrap_or(true) {
+            self.compact(&pk, &shown);
         }
     }
 
@@ -320,6 +438,8 @@ impl VaultIndex {
 }
 
 type SharedPlaintext = Arc<Zeroizing<Vec<u8>>>;
+
+type PageMap<'a, T> = dyn Fn(Vec<FileRecord>) -> Vec<T> + Sync + 'a;
 
 struct ContentCache {
     entries: HashMap<String, (SharedPlaintext, u64)>,
@@ -443,7 +563,10 @@ struct ChunkedSource {
     changed: Condvar,
     resident: AtomicU64,
     slots: Arc<Slots>,
+    last_end: AtomicU64,
 }
+
+const SEQUENTIAL_WINDOW: u64 = 8 * 1024 * 1024;
 
 enum Backing {
     Whole(Mutex<Scratch>),
@@ -522,11 +645,13 @@ impl LargeFile {
             Backing::Chunked(c) => {
                 let first = offset / c.chunk_size;
                 let last = (offset + want as u64 - 1) / c.chunk_size;
+                let prev_end = c.last_end.swap(offset + want as u64, Ordering::Relaxed);
+                let sequential = offset.abs_diff(prev_end) <= SEQUENTIAL_WINDOW;
                 for i in first..=last {
                     c.ensure(i, self.len)?;
                 }
                 let end_in_chunk = (offset + want as u64 - 1) % c.chunk_size;
-                if end_in_chunk >= c.chunk_size / 8 {
+                if sequential && end_in_chunk >= c.chunk_size / 8 {
                     for next in last + 1..=(last + CHUNK_READAHEAD).min(c.count - 1) {
                         if c.try_claim(next) {
                             let me = Arc::clone(self);
@@ -821,6 +946,186 @@ pub struct Quarantined {
     pub file_key: FileKey,
 }
 
+#[derive(Default)]
+struct Journal {
+    seq: AtomicU64,
+    touched: Mutex<HashMap<String, u64>>,
+    hidden: Mutex<HashSet<String>>,
+}
+
+impl Journal {
+    fn now(&self) -> u64 {
+        self.seq.load(Ordering::SeqCst)
+    }
+
+    fn touch(&self, id: &str) {
+        let s = self.seq.fetch_add(1, Ordering::SeqCst) + 1;
+        lock_plain(&self.touched).insert(id.to_string(), s);
+    }
+
+    fn touched_after(&self, id: &str, seq0: u64) -> bool {
+        lock_plain(&self.touched).get(id).map(|s| *s > seq0).unwrap_or(false)
+    }
+
+    fn prune(&self, seq0: u64) {
+        lock_plain(&self.touched).retain(|_, s| *s > seq0);
+    }
+
+    fn is_hidden(&self, id: &str) -> bool {
+        lock_plain(&self.hidden).contains(id)
+    }
+}
+
+const DEFERRED_DELETE_ATTEMPTS: u32 = 4;
+const DELETE_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+#[derive(Default)]
+struct DeleteQueueState {
+    items: VecDeque<(String, u32)>,
+    running: bool,
+}
+
+#[derive(Default)]
+struct DeleteQueue {
+    state: Mutex<DeleteQueueState>,
+    idle: Condvar,
+}
+
+impl DeleteQueue {
+    fn enqueue(self: &Arc<Self>, api: &Arc<ApiClient>, journal: &Arc<Journal>, id: String) {
+        let mut st = lock_plain(&self.state);
+        st.items.push_back((id, 0));
+        if st.running {
+            return;
+        }
+        st.running = true;
+        drop(st);
+        let (queue, api, journal) = (Arc::clone(self), Arc::clone(api), Arc::clone(journal));
+        let spawned = std::thread::Builder::new().name("lethean-delete".into()).spawn(move || queue.work(&api, &journal));
+        if let Err(e) = spawned {
+            log::error!("[lethean-cli] could not start the background delete thread: {e}");
+            lock_plain(&self.state).running = false;
+        }
+    }
+
+    fn work(&self, api: &ApiClient, journal: &Journal) {
+        loop {
+            let next = {
+                let mut st = lock_plain(&self.state);
+                match st.items.pop_front() {
+                    Some(item) => item,
+                    None => {
+                        st.running = false;
+                        drop(st);
+                        self.idle.notify_all();
+                        return;
+                    }
+                }
+            };
+            let (id, attempts) = next;
+            match api.delete_file(&id, None) {
+                Ok(()) => {
+                    journal.touch(&id);
+                    lock_plain(&journal.hidden).remove(&id);
+                }
+                Err(e) if crate::api::is_missing_endpoint(&e) => {
+                    journal.touch(&id);
+                    lock_plain(&journal.hidden).remove(&id);
+                }
+                Err(e) if attempts + 1 < DEFERRED_DELETE_ATTEMPTS => {
+                    log::warn!("[lethean-cli] could not remove an old copy yet ({e:#}); will retry");
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                    lock_plain(&self.state).items.push_back((id, attempts + 1));
+                }
+                Err(e) => {
+                    log::warn!("[lethean-cli] an old copy of a saved file could not be removed from the server and stays hidden for this session: {e:#}");
+                }
+            }
+        }
+    }
+
+    fn drain(&self, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut st = lock_plain(&self.state);
+        while st.running || !st.items.is_empty() {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                log::warn!("[lethean-cli] {} old cop(ies) were not removed from the server before exit", st.items.len() + usize::from(st.running));
+                return;
+            }
+            st = self.idle.wait_timeout(st, deadline - now).map(|(g, _)| g).unwrap_or_else(|p| p.into_inner().0);
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct SyncReport {
+    pub removed: Vec<String>,
+    pub aliases: Vec<(String, String, bool)>,
+    pub modified: Vec<String>,
+    pub added: usize,
+    pub touched_names: Vec<(String, String)>,
+}
+
+impl SyncReport {
+    pub fn is_empty(&self) -> bool {
+        self.removed.is_empty() && self.aliases.is_empty() && self.modified.is_empty() && self.added == 0 && self.touched_names.is_empty()
+    }
+}
+
+struct StaleItem {
+    entry: Arc<Entry>,
+    successor: String,
+    kind: HealKind,
+    hidden: bool,
+}
+
+#[derive(Default)]
+struct HealState {
+    stale: HashMap<String, StaleItem>,
+    keep: HashSet<String>,
+    hashed: HashMap<String, [u8; 32]>,
+    hash_bytes_used: u64,
+}
+
+const HEAL_HASH_BUDGET: u64 = 256 * 1024 * 1024;
+
+fn is_retryable(e: &anyhow::Error) -> bool {
+    if is_transient_stream_error(e) {
+        return true;
+    }
+    e.chain().any(|c| {
+        if let Some(h) = c.downcast_ref::<HttpError>() {
+            return h.status >= 500 || h.status == 429 || h.status == 408;
+        }
+        let msg = c.to_string();
+        msg.contains("network error") || msg.contains("connection dropped")
+    })
+}
+
+fn is_not_found(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<HttpError>().map(|h| h.status == 404).unwrap_or(false))
+}
+
+fn index_snapshot(index: &VaultIndex) -> HashMap<String, (String, Arc<str>)> {
+    index.placed.iter().filter_map(|(id, pk)| index.shown_name(id).map(|name| (id.clone(), (pk.clone(), name)))).collect()
+}
+
+fn touched_between(before: &HashMap<String, (String, Arc<str>)>, after: &HashMap<String, (String, Arc<str>)>) -> Vec<(String, String)> {
+    let mut touched: HashSet<(String, String)> = HashSet::new();
+    for (id, v) in before {
+        if after.get(id) != Some(v) {
+            touched.insert((v.0.clone(), v.1.to_string()));
+        }
+    }
+    for (id, v) in after {
+        if before.get(id) != Some(v) {
+            touched.insert((v.0.clone(), v.1.to_string()));
+        }
+    }
+    touched.into_iter().filter(|(pk, _)| pk != UNRESOLVED_PARENT).collect()
+}
+
 pub struct Vault {
     pub api: Arc<ApiClient>,
     wrapping_key_raw: RwLock<Zeroizing<Vec<u8>>>,
@@ -833,6 +1138,13 @@ pub struct Vault {
     load_done: Condvar,
     pool: Arc<ScratchPool>,
     chunk_slots: Arc<Slots>,
+    journal: Arc<Journal>,
+    deletes: Arc<DeleteQueue>,
+    defer_deletes: std::sync::atomic::AtomicBool,
+    closed: std::sync::atomic::AtomicBool,
+    sync_lock: Mutex<()>,
+    last_listing_ms: AtomicU64,
+    heal: Mutex<HealState>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -861,7 +1173,22 @@ impl Vault {
             load_done: Condvar::new(),
             pool: ScratchPool::new(DEFAULT_POOL_BYTES, scratch::default_dir()),
             chunk_slots: Arc::new(Slots::new(MAX_CONCURRENT_CHUNK_FETCHES)),
+            journal: Arc::new(Journal::default()),
+            deletes: Arc::new(DeleteQueue::default()),
+            defer_deletes: std::sync::atomic::AtomicBool::new(false),
+            closed: std::sync::atomic::AtomicBool::new(false),
+            sync_lock: Mutex::new(()),
+            last_listing_ms: AtomicU64::new(0),
+            heal: Mutex::new(HealState::default()),
         }
+    }
+
+    pub fn set_deferred_deletes(&self, on: bool) {
+        self.defer_deletes.store(on, Ordering::Release);
+    }
+
+    pub fn flush_pending_deletes(&self) {
+        self.deletes.drain(DELETE_DRAIN_TIMEOUT);
     }
 
     pub fn set_scratch_pool(&mut self, pool: Arc<ScratchPool>) {
@@ -877,6 +1204,8 @@ impl Vault {
     }
 
     pub fn close(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        self.deletes.drain(DELETE_DRAIN_TIMEOUT);
         *write_lock(&self.wrapping_key_raw) = Zeroizing::new(Vec::new());
         write_lock(&self.index).clear();
         write_lock(&self.quarantined).clear();
@@ -893,9 +1222,10 @@ impl Vault {
     }
 
     fn decode_record(wrapping_key: &[u8], mut record: FileRecord, strict: bool) -> Decoded {
+        let fp = record_fingerprint(&record);
         let file_key = match aead::unwrap_file_key(wrapping_key, &record.wrapped_file_key, &record.wrap_iv) {
             Ok(k) => k,
-            Err(_) => return Decoded::Entry(Entry::unreadable(Self::scrub(record), None)),
+            Err(_) => return Decoded::Entry(Entry::unreadable(Self::scrub(record), None).with_fingerprint(fp)),
         };
         if strict && !file_key.is_v2() {
             return Decoded::Quarantined(Quarantined { record, file_key });
@@ -903,10 +1233,32 @@ impl Vault {
         match aead::decrypt_metadata(&file_key, &record.encrypted_metadata, &record.metadata_iv) {
             Ok(meta) => {
                 record = Self::scrub(record);
-                Decoded::Entry(Entry::new(record, meta, Some(file_key)))
+                Decoded::Entry(Entry::new(record, meta, Some(file_key)).with_fingerprint(fp))
             }
-            Err(_) => Decoded::Entry(Entry::unreadable(Self::scrub(record), Some(file_key))),
+            Err(_) => Decoded::Entry(Entry::unreadable(Self::scrub(record), Some(file_key)).with_fingerprint(fp)),
         }
+    }
+
+    fn decode_many(wrapping_key: &[u8], records: Vec<FileRecord>, strict: bool) -> Vec<Decoded> {
+        const PER_THREAD_MIN: usize = 256;
+        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(REFRESH_PARALLELISM).min(records.len().div_ceil(PER_THREAD_MIN)).max(1);
+        if threads <= 1 {
+            return records.into_iter().map(|r| Self::decode_record(wrapping_key, r, strict)).collect();
+        }
+        let per = records.len().div_ceil(threads);
+        let mut chunks: Vec<Vec<FileRecord>> = Vec::with_capacity(threads);
+        let mut it = records.into_iter();
+        loop {
+            let c: Vec<FileRecord> = it.by_ref().take(per).collect();
+            if c.is_empty() {
+                break;
+            }
+            chunks.push(c);
+        }
+        std::thread::scope(|s| {
+            let handles: Vec<_> = chunks.into_iter().map(|c| s.spawn(move || c.into_iter().map(|r| Self::decode_record(wrapping_key, r, strict)).collect::<Vec<_>>())).collect();
+            handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
+        })
     }
 
     fn scrub(mut record: FileRecord) -> FileRecord {
@@ -916,6 +1268,7 @@ impl Vault {
     }
 
     fn ingest_record(&self, record: FileRecord) -> Option<Arc<Entry>> {
+        self.journal.touch(&record.id);
         match Self::decode_record(&self.wrapping_key(), record, self.is_strict()) {
             Decoded::Entry(entry) => write_lock(&self.index).insert(entry),
             Decoded::Quarantined(q) => {
@@ -925,74 +1278,493 @@ impl Vault {
         }
     }
 
+    fn fetch_pages<T: Send>(&self, from: u64, count: u64, map: &PageMap<'_, T>) -> Result<Vec<(usize, Vec<T>)>> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+        let fetch = |page: u64| -> Result<(usize, Vec<T>)> {
+            let records = self.api.list_files(page * PAGE_SIZE, Some(PAGE_SIZE))?;
+            Ok((records.len(), map(records)))
+        };
+        if count == 1 {
+            return Ok(vec![fetch(from)?]);
+        }
+        let next = AtomicU64::new(0);
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        type Slot<T> = Mutex<Option<Result<(usize, Vec<T>)>>>;
+        let slots: Vec<Slot<T>> = (0..count).map(|_| Mutex::new(None)).collect();
+        std::thread::scope(|s| {
+            for _ in 0..REFRESH_PARALLELISM.min(count as usize) {
+                s.spawn(|| loop {
+                    if failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= count {
+                        break;
+                    }
+                    let result = fetch(from + i);
+                    if result.is_err() {
+                        failed.store(true, Ordering::Relaxed);
+                    }
+                    *lock_plain(&slots[i as usize]) = Some(result);
+                });
+            }
+        });
+        let mut out = Vec::with_capacity(count as usize);
+        for slot in slots {
+            match slot.into_inner().unwrap_or_else(|p| p.into_inner()) {
+                Some(r) => out.push(r?),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    fn fetch_all<T: Send>(&self, hint: u64, map: &PageMap<'_, T>) -> Result<Vec<T>> {
+        let started = std::time::Instant::now();
+        let mut out = Vec::new();
+        let mut next_page;
+        let mut batch;
+        if hint > 0 {
+            next_page = 0;
+            batch = (hint + 1).div_ceil(PAGE_SIZE).max(1);
+        } else {
+            let (n, first) = self.fetch_pages(0, 1, map)?.pop().unwrap_or_default();
+            out.extend(first);
+            if (n as u64) < PAGE_SIZE {
+                self.last_listing_ms.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                return Ok(out);
+            }
+            let expected = self.api.get_usage(None).ok().map(|u| u.file_count).unwrap_or(0);
+            next_page = 1;
+            batch = expected.div_ceil(PAGE_SIZE).saturating_sub(1).max(REFRESH_PARALLELISM as u64 / 2);
+        }
+        loop {
+            let pages = self.fetch_pages(next_page, batch, map)?;
+            next_page += batch;
+            let mut done = pages.len() < batch as usize;
+            for (n, page) in pages {
+                if (n as u64) < PAGE_SIZE {
+                    done = true;
+                }
+                out.extend(page);
+            }
+            if done {
+                self.last_listing_ms.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+                return Ok(out);
+            }
+            batch = REFRESH_PARALLELISM as u64;
+        }
+    }
+
+    pub fn last_listing_duration(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.last_listing_ms.load(Ordering::Relaxed))
+    }
+
     pub fn refresh_all(&self) -> Result<()> {
+        let _serial = lock_plain(&self.sync_lock);
         let wrapping_key = self.wrapping_key();
         let strict = self.is_strict();
+        let journal = &self.journal;
+        let decode = |page: Vec<FileRecord>| -> Vec<Decoded> { page.into_iter().filter(|r| !journal.is_hidden(&r.id)).map(|r| Self::decode_record(&wrapping_key, r, strict)).collect() };
+        let decoded = self.fetch_all(0, &decode)?;
         let mut fresh = VaultIndex::new();
-        let mut quarantined = Vec::new();
-        let mut offset = 0u64;
-        let mut add = |fresh: &mut VaultIndex, d: Decoded| match d {
-            Decoded::Entry(e) => {
-                fresh.insert(e);
-            }
-            Decoded::Quarantined(q) => quarantined.push(q),
-        };
-
-        let first = self.api.list_files(0, Some(PAGE_SIZE))?;
-        let mut last_page_full = first.len() as u64 >= PAGE_SIZE;
-        offset += first.len() as u64;
-        for record in first {
-            add(&mut fresh, Self::decode_record(&wrapping_key, record, strict));
-        }
-        let expected = if last_page_full { self.api.get_usage(None).ok().map(|u| u.file_count).unwrap_or(0) } else { 0 };
-        let pages = expected.div_ceil(PAGE_SIZE);
-        if pages > 1 {
-            let next_page = AtomicU64::new(1);
-            let results: Mutex<Vec<(u64, Result<Vec<Decoded>>)>> = Mutex::new(Vec::new());
-            std::thread::scope(|s| {
-                for _ in 0..REFRESH_PARALLELISM.min(pages as usize - 1) {
-                    s.spawn(|| loop {
-                        let page = next_page.fetch_add(1, Ordering::Relaxed);
-                        if page >= pages {
-                            break;
-                        }
-                        let result = self.api.list_files(page * PAGE_SIZE, Some(PAGE_SIZE)).map(|records| records.into_iter().map(|r| Self::decode_record(&wrapping_key, r, strict)).collect::<Vec<_>>());
-                        let failed = result.is_err();
-                        lock_plain(&results).push((page, result));
-                        if failed {
-                            break;
-                        }
-                    });
+        let mut quarantined: Vec<Quarantined> = Vec::new();
+        let mut seen_q = HashSet::new();
+        for d in decoded {
+            match d {
+                Decoded::Entry(e) => {
+                    fresh.insert(e);
                 }
-            });
-            let mut results = results.into_inner().unwrap_or_else(|p| p.into_inner());
-            results.sort_by_key(|(page, _)| *page);
-            for (_, result) in results {
-                let entries = result?;
-                last_page_full = entries.len() as u64 == PAGE_SIZE;
-                offset += entries.len() as u64;
-                for e in entries {
-                    add(&mut fresh, e);
-                }
-                if !last_page_full {
-                    break;
+                Decoded::Quarantined(q) => {
+                    if seen_q.insert(q.record.id.clone()) {
+                        quarantined.push(q);
+                    }
                 }
             }
         }
-
-        while last_page_full {
-            let page = self.api.list_files(offset, Some(PAGE_SIZE))?;
-            let got = page.len() as u64;
-            for record in page {
-                add(&mut fresh, Self::decode_record(&wrapping_key, record, strict));
-            }
-            last_page_full = got >= PAGE_SIZE;
-            offset += got;
-        }
-
+        lock_plain(&self.heal).stale.clear();
+        self.apply_heal(&mut fresh);
         *write_lock(&self.index) = fresh;
         *write_lock(&self.quarantined) = quarantined;
         Ok(())
+    }
+
+    fn list_for_sync(&self, hint: u64) -> Result<HashMap<String, ([u8; 32], Option<FileRecord>)>> {
+        let index = &self.index;
+        let map = |page: Vec<FileRecord>| -> Vec<(String, [u8; 32], Option<FileRecord>)> {
+            let index = read_lock(index);
+            page.into_iter()
+                .map(|r| {
+                    let fp = record_fingerprint(&r);
+                    let known = index.entries.get(&r.id).map(|e| e.fingerprint) == Some(fp);
+                    (r.id.clone(), fp, if known { None } else { Some(r) })
+                })
+                .collect()
+        };
+        let mut out = HashMap::new();
+        for (id, fp, r) in self.fetch_all(hint, &map)? {
+            out.entry(id).or_insert((fp, r));
+        }
+        Ok(out)
+    }
+
+    pub fn sync(&self) -> Result<SyncReport> {
+        let _serial = lock_plain(&self.sync_lock);
+        let mut report = SyncReport::default();
+        if self.closed.load(Ordering::SeqCst) {
+            return Ok(report);
+        }
+        let seq0 = self.journal.now();
+        let hint = (self.entry_count() + self.quarantined_count()) as u64;
+        let mut listed = self.list_for_sync(hint)?;
+
+        let mut gone: Vec<String> = {
+            let index = read_lock(&self.index);
+            index.entries.keys().filter(|id| !listed.contains_key(*id)).cloned().collect()
+        };
+        gone.retain(|id| !self.journal.touched_after(id, seq0));
+        if !gone.is_empty() {
+            let again = self.list_for_sync(hint)?;
+            gone.retain(|id| !again.contains_key(id));
+            for (id, v) in again {
+                if !matches!(listed.get(&id), Some((_, Some(_)))) {
+                    listed.insert(id, v);
+                }
+            }
+        }
+
+        let quarantined_ids: HashSet<String> = read_lock(&self.quarantined).iter().map(|q| q.record.id.clone()).collect();
+        let stale_ids: HashSet<String> = {
+            let mut st = lock_plain(&self.heal);
+            st.stale.retain(|id, _| listed.contains_key(id));
+            st.keep.retain(|id| listed.contains_key(id));
+            st.stale.iter().filter(|(_, it)| it.hidden).map(|(id, _)| id.clone()).collect()
+        };
+        let (fresh, modified): (Vec<FileRecord>, Vec<FileRecord>) = {
+            let index = read_lock(&self.index);
+            let mut fresh = Vec::new();
+            let mut modified = Vec::new();
+            for (id, (fp, r)) in listed.iter_mut() {
+                match index.entries.get(id.as_str()) {
+                    Some(e) if e.fingerprint != *fp => {
+                        if let Some(r) = r.take() {
+                            modified.push(r);
+                        }
+                    }
+                    Some(_) => {}
+                    None if quarantined_ids.contains(id) || stale_ids.contains(id) || self.journal.is_hidden(id) || self.journal.touched_after(id, seq0) => {}
+                    None => {
+                        if let Some(r) = r.take() {
+                            fresh.push(r);
+                        }
+                    }
+                }
+            }
+            (fresh, modified)
+        };
+        let dropped_quarantine = quarantined_ids.iter().any(|id| !listed.contains_key(id));
+        if gone.is_empty() && fresh.is_empty() && modified.is_empty() && !dropped_quarantine {
+            self.journal.prune(seq0);
+            return Ok(report);
+        }
+
+        let wrapping_key = self.wrapping_key();
+        let strict = self.is_strict();
+        let modified_ids: HashSet<String> = modified.iter().map(|r| r.id.clone()).collect();
+        let decoded = Self::decode_many(&wrapping_key, fresh.into_iter().chain(modified).collect(), strict);
+        drop(wrapping_key);
+
+        let mut new_quarantine = Vec::new();
+        let mut removed_entries: Vec<Arc<Entry>> = Vec::new();
+        let mut added_entries: Vec<Arc<Entry>> = Vec::new();
+        {
+            let mut index = write_lock(&self.index);
+            if self.closed.load(Ordering::SeqCst) {
+                return Ok(SyncReport::default());
+            }
+            let snapshot = |index: &VaultIndex| -> HashMap<String, (String, Arc<str>)> {
+                index.placed.iter().filter_map(|(id, pk)| index.shown_name(id).map(|name| (id.clone(), (pk.clone(), name)))).collect()
+            };
+            let before = snapshot(&index);
+            for id in &gone {
+                if self.journal.touched_after(id, seq0) {
+                    continue;
+                }
+                if let Some(e) = index.remove(id) {
+                    removed_entries.push(e);
+                }
+            }
+            for d in decoded {
+                match d {
+                    Decoded::Entry(e) => {
+                        let id = e.record.id.clone();
+                        if self.journal.touched_after(&id, seq0) || self.journal.is_hidden(&id) {
+                            continue;
+                        }
+                        if modified_ids.contains(&id) {
+                            if index.remove(&id).is_none() {
+                                continue;
+                            }
+                            report.modified.push(id.clone());
+                        } else if index.entries.contains_key(&id) {
+                            continue;
+                        }
+                        if let Some(e) = index.insert(e) {
+                            if !modified_ids.contains(&id) {
+                                added_entries.push(e);
+                            }
+                        }
+                    }
+                    Decoded::Quarantined(q) => {
+                        if !self.journal.touched_after(&q.record.id, seq0) {
+                            new_quarantine.push(q);
+                        }
+                    }
+                }
+            }
+            for id in self.apply_heal(&mut index) {
+                report.removed.push(id);
+            }
+            let after = snapshot(&index);
+            let mut touched: HashSet<(String, String)> = HashSet::new();
+            for (id, (pk, name)) in &before {
+                if after.get(id) != Some(&(pk.clone(), Arc::clone(name))) {
+                    touched.insert((pk.clone(), name.to_string()));
+                }
+            }
+            for (id, (pk, name)) in &after {
+                if before.get(id) != Some(&(pk.clone(), Arc::clone(name))) {
+                    touched.insert((pk.clone(), name.to_string()));
+                }
+            }
+            for id in &report.modified {
+                if let Some((pk, name)) = after.get(id) {
+                    touched.insert((pk.clone(), name.to_string()));
+                }
+            }
+            report.touched_names = touched.into_iter().filter(|(pk, _)| pk != UNRESOLVED_PARENT).collect();
+        }
+
+        {
+            let mut q = write_lock(&self.quarantined);
+            q.retain(|item| listed.contains_key(&item.record.id));
+            for item in new_quarantine {
+                if !q.iter().any(|x| x.record.id == item.record.id) {
+                    q.push(item);
+                }
+            }
+        }
+
+        let by_ref = |entries: &[Arc<Entry>]| -> HashMap<(String, bool), Vec<usize>> {
+            let mut m: HashMap<(String, bool), Vec<usize>> = HashMap::new();
+            for (i, e) in entries.iter().enumerate() {
+                if let Some(r) = &e.node_ref {
+                    m.entry((r.clone(), e.is_folder())).or_default().push(i);
+                }
+            }
+            m
+        };
+        let old_refs = by_ref(&removed_entries);
+        let new_refs = by_ref(&added_entries);
+        let mut aliased_old: HashSet<String> = HashSet::new();
+        for (key, olds) in &old_refs {
+            let Some(news) = new_refs.get(key) else { continue };
+            if olds.len() != 1 || news.len() != 1 {
+                continue;
+            }
+            let (old, new) = (&removed_entries[olds[0]], &added_entries[news[0]]);
+            let same_content = old.record.content_iv == new.record.content_iv && old.meta.unpadded_size == new.meta.unpadded_size && old.meta.size == new.meta.size;
+            report.aliases.push((old.record.id.clone(), new.record.id.clone(), same_content));
+            aliased_old.insert(old.record.id.clone());
+            if same_content {
+                if old.meta.compressed && old.size_is_exact() {
+                    new.learn_size(old.size());
+                }
+                lock_cache(&self.content_cache).rekey(&old.record.id, &new.record.id);
+                lock_large(&self.large_cache).rekey(&old.record.id, &new.record.id);
+            }
+        }
+        for e in &removed_entries {
+            let id = &e.record.id;
+            lock_cache(&self.content_cache).remove(id);
+            lock_large(&self.large_cache).remove(id);
+            if !aliased_old.contains(id) {
+                report.removed.push(id.clone());
+            }
+        }
+        for id in &report.modified {
+            lock_cache(&self.content_cache).remove(id);
+            lock_large(&self.large_cache).remove(id);
+        }
+        report.added = added_entries.len() - report.aliases.len();
+        self.journal.prune(seq0);
+        Ok(report)
+    }
+
+    fn apply_heal(&self, index: &mut VaultIndex) -> Vec<String> {
+        let (keep, known): (HashSet<String>, HashSet<String>) = {
+            let st = lock_plain(&self.heal);
+            (st.keep.clone(), st.stale.keys().cloned().collect())
+        };
+        let legacy_parents: HashSet<&str> = index.entries.values().filter(|e| !e.is_v2()).filter_map(|e| e.meta.parent_id.as_deref()).collect();
+        let items: Vec<HealItem> = index
+            .entries
+            .values()
+            .filter(|e| !keep.contains(&e.record.id))
+            .map(|e| HealItem {
+                id: e.record.id.clone(),
+                node_ref: e.node_ref.clone(),
+                from: if e.is_v2() { e.meta.from.clone() } else { None },
+                rev: e.meta.rev,
+                is_folder: e.is_folder(),
+                folder_movable: e.is_folder() && e.is_v2() && !legacy_parents.contains(e.record.id.as_str()),
+                fingerprint: e.fingerprint,
+            })
+            .collect();
+        let plan = heal::plan(&items);
+        if plan.hidden.is_empty() {
+            return Vec::new();
+        }
+        let mut removed = Vec::new();
+        let mut st = lock_plain(&self.heal);
+        for (id, successor, kind) in plan.hidden {
+            if known.contains(&id) {
+                continue;
+            }
+            let hidden = kind == HealKind::Identical;
+            let entry = if hidden { index.remove(&id) } else { index.entries.get(&id).cloned() };
+            if let Some(entry) = entry {
+                st.stale.insert(id.clone(), StaleItem { entry, successor, kind, hidden });
+                if hidden {
+                    removed.push(id);
+                }
+            }
+        }
+        removed
+    }
+
+    pub fn stale_count(&self) -> usize {
+        lock_plain(&self.heal).stale.len()
+    }
+
+    fn keep_after_all(&self, id: &str) {
+        let item = lock_plain(&self.heal).stale.remove(id);
+        let Some(item) = item else { return };
+        lock_plain(&self.heal).keep.insert(id.to_string());
+        if item.hidden {
+            write_lock(&self.index).insert((*item.entry).clone());
+        }
+    }
+
+    pub fn heal_pending(&self) -> SyncReport {
+        let mut report = SyncReport::default();
+        if self.closed.load(Ordering::SeqCst) {
+            return report;
+        }
+        let before = index_snapshot(&read_lock(&self.index));
+        let todo: Vec<(String, String, HealKind, bool)> = lock_plain(&self.heal).stale.iter().map(|(id, it)| (id.clone(), it.successor.clone(), it.kind, it.hidden)).collect();
+        let mut verified: HashSet<String> = HashSet::new();
+        for (id, successor, kind, hidden) in todo {
+            if self.closed.load(Ordering::SeqCst) {
+                return report;
+            }
+            if !verified.contains(&successor) {
+                if self.entry(&successor).is_none() {
+                    log::warn!("[lethean-cli] the copy that was to be kept disappeared; keeping the other copy");
+                    self.keep_after_all(&id);
+                    continue;
+                }
+                match self.verify_record(&successor) {
+                    Ok(()) => {
+                        verified.insert(successor.clone());
+                    }
+                    Err(e) if is_retryable(&e) => continue,
+                    Err(e) => {
+                        log::warn!("[lethean-cli] the copy that was to be kept couldn't be read back ({e:#}); keeping both");
+                        self.keep_after_all(&id);
+                        continue;
+                    }
+                }
+            }
+            match self.api.delete_file(&id, None) {
+                Ok(()) => {}
+                Err(e) if is_not_found(&e) => {}
+                Err(_) => continue,
+            }
+            if !hidden {
+                write_lock(&self.index).remove(&id);
+            }
+            let _ = kind;
+            self.journal.touch(&id);
+            lock_plain(&self.heal).stale.remove(&id);
+            lock_cache(&self.content_cache).remove(&id);
+            lock_large(&self.large_cache).remove(&id);
+            report.removed.push(id);
+        }
+        report.removed.extend(self.remove_identical_same_name_copies());
+        let after = index_snapshot(&read_lock(&self.index));
+        report.touched_names = touched_between(&before, &after);
+        report
+    }
+
+    fn remove_identical_same_name_copies(&self) -> Vec<String> {
+        let groups: Vec<Vec<(String, u64)>> = {
+            let index = read_lock(&self.index);
+            let mut m: HashMap<(String, Arc<str>, u64), Vec<(String, u64)>> = HashMap::new();
+            for (id, pk) in &index.placed {
+                let Some(e) = index.entries.get(id) else { continue };
+                if e.is_folder() || !e.readable || !e.size_is_exact() {
+                    continue;
+                }
+                m.entry((pk.clone(), Arc::clone(&e.fs_name), e.size())).or_default().push((id.clone(), e.size()));
+            }
+            m.into_values().filter(|g| g.len() > 1).collect()
+        };
+        let mut removed = Vec::new();
+        for mut group in groups {
+            group.sort();
+            let mut hashes: Vec<(String, [u8; 32])> = Vec::new();
+            for (id, size) in &group {
+                let known = lock_plain(&self.heal).hashed.get(id).copied();
+                let h = match known {
+                    Some(h) => h,
+                    None => {
+                        {
+                            let mut st = lock_plain(&self.heal);
+                            if st.hash_bytes_used + size > HEAL_HASH_BUDGET {
+                                continue;
+                            }
+                            st.hash_bytes_used += size;
+                        }
+                        use sha2::{Digest, Sha256};
+                        let mut hasher = Sha256::new();
+                        if self.stream_plaintext(id, &mut hasher).is_err() {
+                            continue;
+                        }
+                        let h: [u8; 32] = hasher.finalize().into();
+                        lock_plain(&self.heal).hashed.insert(id.clone(), h);
+                        h
+                    }
+                };
+                hashes.push((id.clone(), h));
+            }
+            let mut first_of: HashMap<[u8; 32], String> = HashMap::new();
+            for (id, h) in hashes {
+                match first_of.get(&h) {
+                    None => {
+                        first_of.insert(h, id);
+                    }
+                    Some(_) => {
+                        if self.delete_one(&id).is_ok() {
+                            removed.push(id);
+                        }
+                    }
+                }
+            }
+        }
+        removed
     }
 
     pub fn legacy_entries(&self) -> Vec<Entry> {
@@ -1007,10 +1779,12 @@ impl Vault {
         let items = std::mem::take(&mut *write_lock(&self.quarantined));
         let mut index = write_lock(&self.index);
         for q in items {
+            let fp = record_fingerprint(&q.record);
             let entry = match aead::decrypt_metadata(&q.file_key, &q.record.encrypted_metadata, &q.record.metadata_iv) {
                 Ok(meta) => Entry::new(Self::scrub(q.record), meta, Some(q.file_key)),
                 Err(_) => Entry::unreadable(Self::scrub(q.record), Some(q.file_key)),
-            };
+            }
+            .with_fingerprint(fp);
             index.insert(entry);
         }
     }
@@ -1108,7 +1882,7 @@ impl Vault {
     pub fn list_children(&self, parent_id: Option<&str>) -> Vec<ChildInfo> {
         let index = read_lock(&self.index);
         let mut kids: Vec<ChildInfo> = match index.children_by_parent.get(parent_key(parent_id)) {
-            Some(ids) => ids.iter().filter_map(|id| index.entries.get(id).map(|e| ChildInfo { id: id.clone(), name: e.fs_name().to_string(), is_folder: e.is_folder() })).collect(),
+            Some(ids) => ids.iter().filter_map(|id| Some(ChildInfo { id: id.clone(), name: index.shown_name(id)?.to_string(), is_folder: index.entries.get(id)?.is_folder() })).collect(),
             None => Vec::new(),
         };
         drop(index);
@@ -1251,10 +2025,29 @@ impl Vault {
     }
 
     pub fn delete_one(&self, id: &str) -> Result<()> {
-        self.api.delete_file(id, None)?;
+        match self.api.delete_file(id, None) {
+            Ok(()) => {}
+            Err(e) if is_not_found(&e) => {}
+            Err(e) => return Err(e),
+        }
+        self.forget_local(id);
+        Ok(())
+    }
+
+    fn forget_local(&self, id: &str) {
         write_lock(&self.index).remove(id);
+        self.journal.touch(id);
         lock_cache(&self.content_cache).remove(id);
         lock_large(&self.large_cache).remove(id);
+    }
+
+    fn delete_replaced(&self, id: &str) -> Result<()> {
+        if !self.defer_deletes.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire) {
+            return self.delete_one(id);
+        }
+        lock_plain(&self.journal.hidden).insert(id.to_string());
+        self.forget_local(id);
+        self.deletes.enqueue(&self.api, &self.journal, id.to_string());
         Ok(())
     }
 
@@ -1347,6 +2140,7 @@ impl Vault {
                 changed: Condvar::new(),
                 resident: AtomicU64::new(0),
                 slots: Arc::clone(&self.chunk_slots),
+                last_end: AtomicU64::new(0),
             }),
         }))
     }
@@ -1510,8 +2304,8 @@ impl Vault {
             Some(p) => p,
             None => bail!("unknown file"),
         };
-        let new_entry = self.create_file_streaming(old.name(), &old.meta.mime, size, parent.as_deref(), factory)?;
-        self.delete_one(id)?;
+        let new_entry = self.create_file_streaming_ext(old.name(), &old.meta.mime, size, parent.as_deref(), old.node_ref.as_deref(), factory)?;
+        self.delete_replaced(id)?;
         Ok(new_entry)
     }
 
@@ -1520,6 +2314,7 @@ impl Vault {
         let old_key = old.file_key.clone().with_context(|| format!("\"{}\" could not be decrypted, so it can't be moved", old.name()))?;
         let new_key = old_key.rebind();
         let mut new_meta = old.meta.clone();
+        new_meta.rev = Some(old.meta.rev.unwrap_or(0) + 1);
         if let Some(name) = new_name {
             new_meta.name = name.to_string();
         }
@@ -1553,11 +2348,11 @@ impl Vault {
             for child_id in legacy_children {
                 self.rename_or_move(&child_id, None, Some(Some(new_folder.record.id.as_str())))?;
             }
-            self.delete_one(id)?;
+            self.delete_replaced(id)?;
             Ok(self.get(&new_folder.record.id).unwrap_or(new_folder))
         } else {
             let new_file = self.reupload_with_metadata(&old, &new_key, &new_meta)?;
-            self.delete_one(id)?;
+            self.delete_replaced(id)?;
             Ok(new_file)
         }
     }
@@ -1635,7 +2430,8 @@ impl Vault {
     }
 
     pub fn rotate_password(&self, new_vault_id: &str, new_wrapping_key_raw: &[u8]) -> Result<u64> {
-        let entries = self.all_entries();
+        let mut entries = self.all_entries();
+        entries.extend(lock_plain(&self.heal).stale.values().filter(|s| s.hidden).map(|s| (*s.entry).clone()));
         let quarantined = read_lock(&self.quarantined).clone();
         let mut rewraps = Vec::with_capacity(entries.len() + quarantined.len());
         for entry in &entries {

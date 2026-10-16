@@ -27,6 +27,10 @@ export async function rememberFileKey(id: string, key: FileKey): Promise<void> {
   ids.add(id);
 }
 
+export function nodeRefOf(id: string): string | null {
+  return refById.get(id) ?? null;
+}
+
 export function forgetFileKey(id: string): void {
   fileKeyCache.delete(id);
   forgetRef(id);

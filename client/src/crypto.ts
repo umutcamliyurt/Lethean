@@ -1,4 +1,4 @@
-import { argon2id } from 'hash-wasm';
+import { argon2id, createSHA256 } from 'hash-wasm';
 import { AhoCorasick } from './ahocorasick.js';
 import type { DuressConfig, PasswordValidationResult, UnlockResult } from './types.js';
 import {
@@ -417,4 +417,16 @@ export async function validatePasswordStrength(password: string): Promise<Passwo
   }
 
   return { valid: errors.length === 0, score: Math.min(score, 4), errors };
+}
+
+export async function sha256OfStream(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const hasher = await createSHA256();
+  hasher.init();
+  const reader = stream.getReader();
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    hasher.update(value);
+  }
+  return hasher.digest('hex');
 }

@@ -6,10 +6,11 @@ import { newTextFileBtn } from './dom.js';
 import { getWrappingKeyRaw } from './state.js';
 import { encryptPool } from './encrypt-pool.js';
 import { escapeHtml, showToast, icon } from './utils.js';
-import { getCurrentFolderId, addUploadedRecord, removeRecordLocally, getDecryptedBytes } from './gallery.js';
+import { getCurrentFolderId, addUploadedRecord, removeRecordLocally, getDecryptedBytes, namesInFolder, settleUploads } from './gallery.js';
+import { freeName } from './dedupe-core.js';
 import { showLightbox, closeLightbox } from './lightbox.js';
 import type { FileMeta, FileRecord } from './types.js';
-import { effectiveParentId, parentRefFor, UNRESOLVED_PARENT } from './tree.js';
+import { effectiveParentId, parentRefFor, UNRESOLVED_PARENT, nodeRefOf } from './tree.js';
 
 const MAX_NAME_LENGTH = 255;
 const DEFAULT_NEW_FILE_NAME = 'Untitled.md';
@@ -426,14 +427,17 @@ function renderEditorPanel(opts: EditorPanelOptions): void {
   });
 }
 
-async function encryptAndUploadText(name: string, content: string, parentId: string | null): Promise<FileRecord> {
+async function encryptAndUploadText(name: string, content: string, parentId: string | null, replacesId?: string): Promise<FileRecord> {
   const wrappingKeyRaw = getWrappingKeyRaw();
   if (!wrappingKeyRaw) throw new Error('Vault is locked.');
   if (parentId === UNRESOLVED_PARENT) throw new Error("This file's folder couldn't be verified, so it can't be saved there.");
   const parent = parentRefFor(parentId);
   const file = new File([content], name, { type: mimeForFileName(name) });
-  const payload = await encryptPool.encryptFile(wrappingKeyRaw, file, parent);
-  return api.uploadFile(payload);
+  const from = replacesId ? nodeRefOf(replacesId) : null;
+  const payload = await encryptPool.encryptFile(wrappingKeyRaw, file, parent, from ? { from } : undefined);
+  const record = await api.uploadFile(payload);
+  await settleUploads([{ fields: payload, keepId: record.id }]);
+  return record;
 }
 
 export function openNewTextFileModal(): void {
@@ -443,7 +447,13 @@ export function openNewTextFileModal(): void {
     content: '',
     saveLabel: 'Create',
     onSave: async (name, content) => {
-      const record = await encryptAndUploadText(name, content, getCurrentFolderId());
+      const folderId = getCurrentFolderId();
+      const taken = namesInFolder(folderId);
+      if (taken.has(name)) {
+        if (name !== DEFAULT_NEW_FILE_NAME) throw new Error(`"${name}" already exists in this folder. Choose another name.`);
+        name = freeName(name, taken);
+      }
+      const record = await encryptAndUploadText(name, content, folderId);
       await addUploadedRecord(record);
       closeLightbox();
       showToast('Text file created.');
@@ -478,11 +488,18 @@ export function editTextFile(record: FileRecord, meta: FileMeta): void {
       content,
       saveLabel: 'Save',
       onSave: async (name, newContent) => {
-        const newRecord = await encryptAndUploadText(name, newContent, effectiveParentId(record.id));
+        const parentId = effectiveParentId(record.id);
+        if (name !== meta.name && namesInFolder(parentId, [record.id]).has(name)) {
+          throw new Error(`"${name}" already exists in this folder. Choose another name.`);
+        }
+        const newRecord = await encryptAndUploadText(name, newContent, parentId, record.id);
         await addUploadedRecord(newRecord);
         try {
-          await api.deleteFile(record.id);
-        } catch {
+          await api.deleteFileWithRetry(record.id);
+        } catch (err) {
+          closeLightbox();
+          showToast(`Saved, but the previous version couldn't be removed (${(err as Error).message}). Delete the older "${meta.name}" yourself.`, 'error');
+          return;
         }
         removeRecordLocally(record.id);
         closeLightbox();

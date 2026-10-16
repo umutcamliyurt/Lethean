@@ -357,7 +357,13 @@ impl ApiClient {
         let total_len = head.len() as u64 + body_len + tail.len() as u64;
         let content_type = format!("multipart/form-data; boundary={boundary}");
 
+        let mut attempted = false;
         retry::run("Upload failed", || {
+            if std::mem::replace(&mut attempted, true) {
+                if let Some(record) = self.find_landed_upload(header, vault_id_override) {
+                    return Ok(record);
+                }
+            }
             let body = make_body().map_err(AttemptError::from)?;
             let reader = Cursor::new(&head[..]).chain(body).chain(Cursor::new(&tail[..]));
             let mut req = self.stream_agent.post(&self.url("/files")).set("Content-Type", &content_type).set("Content-Length", &total_len.to_string());
@@ -368,6 +374,27 @@ impl ApiClient {
             let resp = req.send(reader).map_err(AttemptError::from)?;
             resp.into_json::<FileRecord>().map_err(AttemptError::from)
         })
+    }
+
+    fn find_landed_upload(&self, header: &EncryptedHeader, vault_id_override: Option<&str>) -> Option<FileRecord> {
+        const PAGE: u64 = 200;
+        let mut offset = 0u64;
+        loop {
+            let mut req = self.agent.get(&self.url("/files")).query("limit", &PAGE.to_string());
+            if offset != 0 {
+                req = req.query("offset", &offset.to_string());
+            }
+            let page: Vec<FileRecord> = self.with_auth(req, vault_id_override).call().ok()?.into_json().ok()?;
+            let n = page.len() as u64;
+            if let Some(found) = page.into_iter().find(|r| r.metadata_iv == header.metadata_iv && r.encrypted_metadata == header.encrypted_metadata && r.content_iv == header.content_iv && r.wrapped_file_key == header.wrapped_file_key && r.wrap_iv == header.wrap_iv) {
+                warn!("[lethean-cli] an upload that looked failed had reached the server; not sending it twice");
+                return Some(found);
+            }
+            if n < PAGE {
+                return None;
+            }
+            offset += n;
+        }
     }
 
     fn token_or(&self, token_override: Option<&str>) -> Option<String> {
@@ -431,7 +458,13 @@ impl ApiClient {
                 }
                 outcome
             })?;
+            let mut attempted = false;
             retry::run("Upload failed", || {
+                if std::mem::replace(&mut attempted, true) {
+                    if let Some(record) = self.find_landed_upload(header, vault_id_override) {
+                        return Ok(record);
+                    }
+                }
                 let mut req = self.with_auth(self.agent.post(&self.url(&format!("/files/uploads/{upload_id}/complete"))), vault_id_override);
                 if let Some(t) = &token {
                     req = req.set("X-Access-Token", t);

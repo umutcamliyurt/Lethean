@@ -12,6 +12,7 @@ export interface FileMeta {
   size?: number;
   pref?: string;
   from?: string;
+  rev?: number;
 }
 
 export interface FileRecord {

@@ -406,6 +406,7 @@ export function validateV2Meta(meta: FileMeta): void {
   }
 
   if (meta.from !== undefined && (typeof meta.from !== 'string' || !NODE_REF_RE.test(meta.from))) bad('from');
+  if (meta.rev !== undefined && (typeof meta.rev !== 'number' || !Number.isSafeInteger(meta.rev) || meta.rev < 0)) bad('rev');
 
   if (meta.isFolder) {
     if (meta.mime !== FOLDER_MIME) bad('folder mime');

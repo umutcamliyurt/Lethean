@@ -5,8 +5,12 @@ import { prepareChunkedFile, paddedSize, CHUNK_SIZE, GCM_TAG_BYTES } from './cry
 import { getWrappingKeyRaw } from './state.js';
 import { icon, showToast } from './utils.js';
 import type { ChunkedFilePayload, EncryptedFilePayload } from './types.js';
-import { addUploadedRecord, getCurrentFolderId, createFolder } from './gallery.js';
-import { parentRefFor } from './tree.js';
+import { addUploadedRecord, getCurrentFolderId, createFolder, getRecords, removeRecordLocally, settleUploads } from './gallery.js';
+import type { UploadFields } from './dedupe-core.js';
+import { parentRefFor, effectiveParentId, nodeRefOf } from './tree.js';
+import { metaCache } from './state.js';
+import { showLightbox, closeLightbox } from './lightbox.js';
+import { freeName } from './dedupe-core.js';
 
 chooseFilesBtn.addEventListener('click', () => fileInput.click());
 depositSlot.addEventListener('click', (e) => {
@@ -74,21 +78,172 @@ function syncUploadQueueView(): void {
   }
 }
 
-async function handleFiles(files: File[]): Promise<void> {
-  pendingRowCount += files.length;
-  syncUploadQueueView();
-
-  const queue: File[] = [...files];
-  const workerCount = Math.min(MAX_CONCURRENT_UPLOADS, queue.length);
-  await Promise.all(Array.from({ length: workerCount }, () => runUploadWorker(queue)));
+interface PlannedUpload {
+  file: File;
+  folderId: string | null;
+  replaceIds: string[];
 }
 
-async function runUploadWorker(queue: File[]): Promise<void> {
-  let file: File | undefined;
-  while ((file = queue.shift())) {
+type ConflictChoice = 'skip' | 'keep' | 'replace';
+
+const namesInFlight = new Map<string, Map<string, number>>();
+
+function flightKey(folderId: string | null): string {
+  return folderId ?? '';
+}
+
+function holdName(folderId: string | null, name: string): void {
+  const m = namesInFlight.get(flightKey(folderId)) ?? new Map<string, number>();
+  m.set(name, (m.get(name) ?? 0) + 1);
+  namesInFlight.set(flightKey(folderId), m);
+}
+
+function releaseName(folderId: string | null, name: string): void {
+  const m = namesInFlight.get(flightKey(folderId));
+  if (!m) return;
+  const n = (m.get(name) ?? 1) - 1;
+  if (n > 0) m.set(name, n); else m.delete(name);
+  if (!m.size) namesInFlight.delete(flightKey(folderId));
+}
+
+function existingByName(folderId: string | null): Map<string, { fileIds: string[]; hasFolder: boolean }> {
+  const out = new Map<string, { fileIds: string[]; hasFolder: boolean }>();
+  for (const r of getRecords()) {
+    if (effectiveParentId(r.id) !== folderId) continue;
+    const meta = metaCache.get(r.id);
+    if (!meta?.name) continue;
+    let e = out.get(meta.name);
+    if (!e) out.set(meta.name, (e = { fileIds: [], hasFolder: false }));
+    if (meta.isFolder) e.hasFolder = true; else e.fileIds.push(r.id);
+  }
+  return out;
+}
+
+function askAboutConflicts(names: string[], canReplace: boolean): Promise<ConflictChoice> {
+  return new Promise((resolve) => {
+    showLightbox(`
+      <div class="settings-panel">
+        <h2>Already in this folder</h2>
+        <p class="subtitle" id="conflict-text"></p>
+        <ul class="conflict-list" id="conflict-list"></ul>
+        <div class="panel-actions">
+          <button type="button" class="btn-primary" id="conflict-skip">Skip</button>
+          <button type="button" id="conflict-keep">Keep both</button>
+          ${canReplace ? '<button type="button" id="conflict-replace">Replace</button>' : ''}
+        </div>
+      </div>
+    `);
+    const n = names.length;
+    document.getElementById('conflict-text')!.textContent = n === 1
+      ? 'A file with this name is already here. Skip it, keep both (the new one gets a number), or replace the existing one?'
+      : `${n} files have names that are already here. Skip them, keep both (the new ones get a number), or replace the existing ones?`;
+    const list = document.getElementById('conflict-list')!;
+    for (const name of names.slice(0, 8)) {
+      const li = document.createElement('li');
+      li.textContent = name;
+      list.appendChild(li);
+    }
+    if (n > 8) {
+      const li = document.createElement('li');
+      li.textContent = `\u2026 and ${n - 8} more`;
+      list.appendChild(li);
+    }
+
+    const lightboxEl = document.getElementById('lightbox')!;
+    let settled = false;
+    const finish = (choice: ConflictChoice) => {
+      if (settled) return;
+      settled = true;
+      watcher.disconnect();
+      if (!lightboxEl.classList.contains('hidden')) closeLightbox();
+      resolve(choice);
+    };
+    const watcher = new MutationObserver(() => {
+      if (lightboxEl.classList.contains('hidden') || !document.getElementById('conflict-list')) finish('skip');
+    });
+    watcher.observe(lightboxEl, { attributes: true, attributeFilter: ['class'], childList: true });
+    document.getElementById('conflict-skip')!.addEventListener('click', () => finish('skip'));
+    document.getElementById('conflict-keep')!.addEventListener('click', () => finish('keep'));
+    document.getElementById('conflict-replace')?.addEventListener('click', () => finish('replace'));
+    (document.getElementById('conflict-skip') as HTMLButtonElement).focus();
+  });
+}
+
+async function planUploads(files: File[], folderId: string | null): Promise<PlannedUpload[]> {
+  const existing = existingByName(folderId);
+  const inFlight = namesInFlight.get(flightKey(folderId)) ?? new Map<string, number>();
+  const seenInBatch = new Set<string>();
+  const clashes: File[] = [];
+  for (const f of files) {
+    if (existing.has(f.name) || inFlight.has(f.name) || seenInBatch.has(f.name)) clashes.push(f);
+    seenInBatch.add(f.name);
+  }
+  let choice: ConflictChoice = 'keep';
+  if (clashes.length) {
+    const canReplace = clashes.some((f) => (existing.get(f.name)?.fileIds.length ?? 0) > 0);
+    choice = await askAboutConflicts([...new Set(clashes.map((f) => f.name))], canReplace);
+  }
+
+  const taken = new Set<string>([...existing.keys(), ...inFlight.keys()]);
+  const replaced = new Set<string>();
+  const plan: PlannedUpload[] = [];
+  for (const f of files) {
+    if (!clashes.includes(f)) {
+      taken.add(f.name);
+      plan.push({ file: f, folderId, replaceIds: [] });
+      continue;
+    }
+    if (choice === 'skip') continue;
+    const prior = existing.get(f.name);
+    if (choice === 'replace' && prior && prior.fileIds.length && !prior.hasFolder && !inFlight.has(f.name) && !replaced.has(f.name)) {
+      replaced.add(f.name);
+      plan.push({ file: f, folderId, replaceIds: prior.fileIds.slice() });
+      continue;
+    }
+    const name = freeName(f.name, taken);
+    taken.add(name);
+    plan.push({ file: name === f.name ? f : new File([f], name, { type: f.type, lastModified: f.lastModified }), folderId, replaceIds: [] });
+  }
+  return plan;
+}
+
+async function handleFiles(files: File[]): Promise<void> {
+  const folderId = getCurrentFolderId();
+  const plan = await planUploads(files, folderId);
+  if (!plan.length) return;
+  for (const p of plan) holdName(p.folderId, p.file.name);
+  pendingRowCount += plan.length;
+  syncUploadQueueView();
+
+  const queue: PlannedUpload[] = [...plan];
+  const finished: { fields: UploadFields; keepId: string }[] = [];
+  const workerCount = Math.min(MAX_CONCURRENT_UPLOADS, queue.length);
+  await Promise.all(Array.from({ length: workerCount }, () => runUploadWorker(queue, finished)));
+  await settleUploads(finished);
+}
+
+async function runUploadWorker(queue: PlannedUpload[], finished: { fields: UploadFields; keepId: string }[]): Promise<void> {
+  let item: PlannedUpload | undefined;
+  while ((item = queue.shift())) {
     pendingRowCount--;
-    const rowItem = createUploadRow(file);
-    await uploadOne(file, rowItem);
+    const rowItem = createUploadRow(item.file);
+    try {
+      const done = await uploadOne(item, rowItem);
+      if (done) finished.push(done);
+    } finally {
+      releaseName(item.folderId, item.file.name);
+    }
+  }
+}
+
+async function removeReplaced(item: PlannedUpload): Promise<void> {
+  for (const id of item.replaceIds) {
+    try {
+      await api.deleteFileWithRetry(id);
+      removeRecordLocally(id);
+    } catch (err) {
+      showToast(`"${item.file.name}" was uploaded, but the old one couldn't be removed (${(err as Error).message}). Delete it yourself.`, 'error');
+    }
   }
 }
 
@@ -199,16 +354,17 @@ function uploadWorkingSet(file: File): number {
   return isChunkedUpload(file) ? 2 * (CHUNK_SIZE + GCM_TAG_BYTES) : paddedSize(file.size);
 }
 
-async function uploadOne(file: File, rowItem: UploadRowItem): Promise<void> {
-  const reservation = await reserveUploadMemory(encryptWorkingSet(file));
+async function uploadOne(item: PlannedUpload, rowItem: UploadRowItem): Promise<{ fields: UploadFields; keepId: string } | null> {
+  const reservation = await reserveUploadMemory(encryptWorkingSet(item.file));
   try {
-    await uploadOneWithinBudget(file, rowItem, reservation);
+    return await uploadOneWithinBudget(item, rowItem, reservation);
   } finally {
     reservation.release();
   }
 }
 
-async function uploadOneWithinBudget(file: File, rowItem: UploadRowItem, reservation: MemoryReservation): Promise<void> {
+async function uploadOneWithinBudget(item: PlannedUpload, rowItem: UploadRowItem, reservation: MemoryReservation): Promise<{ fields: UploadFields; keepId: string } | null> {
+  const file = item.file;
   const row = rowItem.el;
   const statusEl = row.querySelector('.status') as HTMLElement;
   const barEl = row.querySelector('.bar-fill') as HTMLElement;
@@ -238,20 +394,22 @@ async function uploadOneWithinBudget(file: File, rowItem: UploadRowItem, reserva
 
   statusEl.textContent = 'Encrypting\u2026';
   try {
-    const parent = parentRefFor(getCurrentFolderId());
+    const parent = parentRefFor(item.folderId);
+    const from = item.replaceIds.length ? nodeRefOf(item.replaceIds[0]!) : null;
+    const opts = from ? { from } : undefined;
     encrypted = isChunkedUpload(file)
-      ? await prepareChunkedFile(getWrappingKeyRaw()!, file, parent)
-      : await encryptPool.encryptFile(getWrappingKeyRaw()!, file, parent);
+      ? await prepareChunkedFile(getWrappingKeyRaw()!, file, parent, opts)
+      : await encryptPool.encryptFile(getWrappingKeyRaw()!, file, parent, opts);
     reservation.shrinkTo(uploadWorkingSet(file));
   } catch (err) {
     row.classList.add('error');
     statusEl.textContent = 'Failed';
     cancelBtn.classList.add('hidden');
     showToast(`Couldn't encrypt "${file.name}". ${(err as Error).message}`, 'error');
-    return;
+    return null;
   }
 
-  if (cancelled) { finishCancelled(); return; }
+  if (cancelled) { finishCancelled(); return null; }
 
   let attempt = 0;
   for (;;) {
@@ -270,10 +428,11 @@ async function uploadOneWithinBudget(file: File, rowItem: UploadRowItem, reserva
       setTimeout(removeRow, 1800);
 
       await addUploadedRecord(created);
-      return;
+      await removeReplaced(item);
+      return { fields: encrypted!, keepId: created.id };
     } catch (err) {
       const error = err as Error;
-      if (cancelled || error.name === 'AbortError') { finishCancelled(); return; }
+      if (cancelled || error.name === 'AbortError') { finishCancelled(); return null; }
 
       attempt++;
       row.classList.add('error');
@@ -281,7 +440,7 @@ async function uploadOneWithinBudget(file: File, rowItem: UploadRowItem, reserva
         showToast(`Upload of "${file.name}" failed. Retrying automatically\u2026`, 'error');
       }
       await waitWithCountdown(retryDelay(attempt), statusEl, () => cancelled, error.message);
-      if (cancelled) { finishCancelled(); return; }
+      if (cancelled) { finishCancelled(); return null; }
       row.classList.remove('error');
     }
   }
